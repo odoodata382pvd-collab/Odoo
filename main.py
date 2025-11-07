@@ -6,9 +6,13 @@ import logging
 import pandas as pd
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-# Thay đổi quan trọng: Sử dụng cách import an toàn hơn cho thư viện odoorpc
-from odoorpc import Odoo 
-ODOO = Odoo # Đổi tên Odoo thành ODOO để khớp với phần còn lại của code
+# Thay đổi quan trọng: Sử dụng cách import tương thích với phiên bản odoorpc 0.10.1
+try:
+    # Thử import theo cấu trúc cũ (thường là cấu trúc của các phiên bản 0.x)
+    from odoorpc.odoo import Odoo as ODOO
+except ImportError:
+    # Nếu không được (vì cấu trúc module có thể khác), thử cách import trực tiếp
+    from odoorpc import Odoo as ODOO 
 
 # --- 1. Cấu hình & Biến môi trường (LẤY TỪ RENDER) ---
 # Tự động lấy các giá trị nhạy cảm từ biến môi trường của Render
@@ -36,6 +40,7 @@ logger = logging.getLogger(__name__)
 def connect_odoo():
     """Thiết lập kết nối với Odoo bằng ODOO_URL, ODOO_DB, USERNAME và PASSWORD."""
     try:
+        # Trong OdooRPC 0.10.1, cú pháp khởi tạo vẫn là ODOO(URL)
         odoo_instance = ODOO(ODOO_URL, timeout=30)
         odoo_instance.login(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD)
         return odoo_instance
