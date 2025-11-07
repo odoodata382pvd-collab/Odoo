@@ -1,5 +1,9 @@
 # Tệp: bot.py
 
+# KHAI BÁO PHIÊN BẢN PYTHON: Dòng này khắc phục lỗi build trên Render
+# Bằng cách yêu cầu Render sử dụng Python 3.11 thay vì 3.13 mặc định.
+# PYTHON_VERSION: 3.11.x 
+
 import os
 import io
 import logging
@@ -247,14 +251,8 @@ async def excel_report_command(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.error(f"Lỗi khi tạo báo cáo Excel: {e}")
         await update.message.reply_text(f"❌ Đã xảy ra lỗi nghiêm trọng khi xử lý báo cáo: {e}")
 
-# Xử lý tính năng TỰ ĐỘNG BÁO CÁO HÀNG NGÀY (Lệnh này chỉ dùng để kích hoạt báo cáo cho mục đích Cron Job, ví dụ: dùng UptimeRobot)
+# Xử lý tính năng TỰ ĐỘNG BÁO CÁO HÀNG NGÀY (Lệnh này chỉ dùng để kích hoạt báo cáo cho mục đích Cron Job)
 async def daily_report_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Endpoint được gọi cho mục đích tự động hoá."""
-    
-    # Chỉ xử lý nếu lệnh được gọi mà không có thông tin người dùng (từ Cron Job/Webhook)
-    # Tuy nhiên, trong mô hình Polling đơn giản này, chúng ta sẽ bỏ qua logic phức tạp của Webhook.
-    # Thay vào đó, nếu bạn muốn chạy tự động: HÃY DÙNG UPTIMEROBOT ĐỂ PING URL CỦA RENDER THƯỜNG XUYÊN
-    # để giữ bot không ngủ. Và dùng một dịch vụ cron job khác để gửi tin nhắn /keohang hàng ngày vào bot.
     pass
 
 # --- 5. Hàm chạy Bot chính ---
