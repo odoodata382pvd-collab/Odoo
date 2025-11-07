@@ -1,4 +1,4 @@
-# Tệp: main.py (bot.py) - Phiên bản Nâng cấp và Ổn định
+# Tệp: main.py (bot.py) - Phiên bản KHẮC PHỤC LỖI IMPORT VÀ SSL
 
 import os
 import io
@@ -7,9 +7,19 @@ import pandas as pd
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# **SỬA LỖI IMPORT: Dùng Class Odoo viết hoa (Sau khi nâng cấp odoorpc)**
-# Giả định đã nâng cấp odoorpc trong requirements.txt
-from odoorpc import Odoo as ODOO 
+# **KHẮC PHỤC LỖI IMPORT CUỐI CÙNG (Lỗi do thư viện cũ/mới)**
+# **Chúng ta thử gọi ODOO là Class viết thường, vì phiên bản 0.10.1 yêu cầu**
+try:
+    # 1. Thử Class odoo viết thường (Phù hợp với 0.10.1)
+    from odoorpc import odoo as ODOO 
+except ImportError:
+    try:
+        # 2. Thử Class Odoo viết hoa (Phù hợp với phiên bản mới)
+        from odoorpc import Odoo as ODOO
+    except ImportError:
+        # 3. Thử OdooRPC (Backup)
+        from odoorpc import OdooRPC as ODOO
+
 # ---------------------------------------------------------------------
 
 # --- 1. Cấu hình & Biến môi trường (LẤY TỪ RENDER) ---
@@ -38,6 +48,7 @@ def connect_odoo():
     """Thiết lập kết nối với Odoo bằng ODOO_URL, ODOO_DB, USERNAME và PASSWORD."""
     try:
         # Thêm tham số verify_ssl=False để bỏ qua lỗi SSL Handshake
+        # Dùng ODOO (Class đã import) để khởi tạo kết nối
         odoo_instance = ODOO(ODOO_URL, timeout=30, verify_ssl=False) 
         odoo_instance.login(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD)
         return odoo_instance
