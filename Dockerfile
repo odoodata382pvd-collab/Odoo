@@ -12,4 +12,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . /app
 
 # Định nghĩa lệnh mặc định khi container khởi động
-CMD ["python", "bot.py"]
+CMD ["python", "main.py"]
