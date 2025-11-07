@@ -1,4 +1,4 @@
-python-telegram-bot==20.8
-odoorpc
-pandas==2.1.4
+python-telegram-bot
+odoorpc==0.10.1
+pandas
 openpyxl
