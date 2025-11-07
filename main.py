@@ -14,7 +14,6 @@ from odoorpc import Odoo as ODOO
 
 # --- 1. Cấu hình & Biến môi trường (LẤY TỪ RENDER) ---
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
-# ODOO_URL PHẢI LÀ 'https://erp.nguonsongviet.vn/odoo'
 ODOO_URL = os.environ.get('ODOO_URL') 
 ODOO_DB = os.environ.get('ODOO_DB')
 ODOO_USERNAME = os.environ.get('ODOO_USERNAME')
@@ -39,7 +38,6 @@ def connect_odoo():
     """Thiết lập kết nối với Odoo bằng ODOO_URL, ODOO_DB, USERNAME và PASSWORD."""
     try:
         # Thêm tham số verify_ssl=False để bỏ qua lỗi SSL Handshake
-        # Dùng ODOO (Class đã import) để khởi tạo kết nối
         odoo_instance = ODOO(ODOO_URL, timeout=30, verify_ssl=False) 
         odoo_instance.login(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD)
         return odoo_instance
