@@ -1,4 +1,4 @@
 python-telegram-bot
-odoorpc==0.10.1
+odoorpc  # <-- Nâng cấp lên phiên bản mới nhất
 pandas
-openpyxl
+openpyxl # <-- Thư viện cần thiết để pandas xuất file Excel
