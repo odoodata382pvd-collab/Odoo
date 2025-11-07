@@ -9,14 +9,14 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 # **KHẮC PHỤC LỖI IMPORT CUỐI CÙNG (DÙNG TRY-EXCEPT AN TOÀN):**
 try:
-    # 1. Thử cách import phổ biến cho các phiên bản cũ (Class Odoo nằm trong odoorpc.odoo)
-    from odoorpc.odoo import Odoo as ODOO
+    # 1. Thử Class Odoo viết thường (Rất phổ biến trong odoorpc < 1.0)
+    from odoorpc import odoo as ODOO 
 except ImportError:
     try:
-        # 2. Thử cách import cho các phiên bản rất cũ (Class OdooRPC)
+        # 2. Thử cách gọi Class OdooRPC (Backup 1)
         from odoorpc import OdooRPC as ODOO
     except ImportError:
-        # 3. Thử cách import trực tiếp nhất (Class Odoo nằm ngay trong __init__.py)
+        # 3. Thử Class Odoo viết hoa (Backup 2)
         from odoorpc import Odoo as ODOO 
 # ---------------------------------------------------------------------
 
