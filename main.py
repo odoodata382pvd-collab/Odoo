@@ -1,9 +1,5 @@
 # Tệp: bot.py
 
-# KHAI BÁO PHIÊN BẢN PYTHON: Dòng này khắc phục lỗi build trên Render
-# Bằng cách yêu cầu Render sử dụng Python 3.11 thay vì 3.13 mặc định.
-# PYTHON_VERSION: 3.11.x 
-
 import os
 import io
 import logging
