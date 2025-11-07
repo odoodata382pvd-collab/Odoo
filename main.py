@@ -1,4 +1,4 @@
-# Tệp: main.py (bot.py)
+# Tệp: main.py (bot.py) - Phiên bản Nâng cấp và Ổn định
 
 import os
 import io
@@ -7,30 +7,23 @@ import pandas as pd
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# **KHẮC PHỤC LỖI IMPORT CUỐI CÙNG: DÙNG CLASS VIẾT THƯỜNG (PHÙ HỢP 0.10.1)**
+# **SỬA LỖI IMPORT: Dùng Class Odoo viết hoa (Sau khi nâng cấp odoorpc)**
 try:
-    # 1. Thử Class Odoo viết thường (Khả năng cao nhất cho 0.10.1)
-    from odoorpc import odoo as ODOO 
+    from odoorpc import Odoo as ODOO 
 except ImportError:
-    try:
-        # 2. Thử Class OdooRPC (Backup 1)
-        from odoorpc import OdooRPC as ODOO
-    except ImportError:
-        # 3. Thử Class Odoo viết hoa (Backup 2)
-        from odoorpc import Odoo as ODOO
+    # Nếu việc nâng cấp bị lỗi, quay về cách gọi Class odoo cũ (viết thường)
+    from odoorpc import odoo as ODOO 
 # ---------------------------------------------------------------------
 
 # --- 1. Cấu hình & Biến môi trường (LẤY TỪ RENDER) ---
-# Tự động lấy các giá trị nhạy cảm từ biến môi trường của Render
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
-# ODOO_URL PHẢI LÀ 'https://erp.nguonsongviet.vn/odoo'
 ODOO_URL = os.environ.get('ODOO_URL') 
 ODOO_DB = os.environ.get('ODOO_DB')
 ODOO_USERNAME = os.environ.get('ODOO_USERNAME')
 ODOO_PASSWORD = os.environ.get('ODOO_PASSWORD')
 USER_ID_TO_SEND_REPORT = os.environ.get('USER_ID_TO_SEND_REPORT')
 
-# Cấu hình nghiệp vụ (Sử dụng mã kho bạn cung cấp)
+# Cấu hình nghiệp vụ 
 TARGET_MIN_QTY = 50
 LOCATION_MAP = {
     'HN_STOCK': '201/201', # Kho Hà Nội (Tồn kho thực tế)
@@ -47,7 +40,7 @@ logger = logging.getLogger(__name__)
 def connect_odoo():
     """Thiết lập kết nối với Odoo bằng ODOO_URL, ODOO_DB, USERNAME và PASSWORD."""
     try:
-        # Thêm tham số verify_ssl=False để bỏ qua lỗi SSL Handshake do thư viện cũ
+        # Thêm tham số verify_ssl=False để bỏ qua lỗi SSL Handshake
         odoo_instance = ODOO(ODOO_URL, timeout=30, verify_ssl=False) 
         odoo_instance.login(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD)
         return odoo_instance
@@ -76,18 +69,15 @@ def get_stock_data(odoo_instance):
             
         loc = stock_location.search_read(domain, fields=['id', 'name'])
         if loc:
-            # Lấy ID của Location đầu tiên tìm được
             location_ids[key] = loc[0]['id']
         else:
             logger.warning(f"Không tìm thấy Location Code/Name: {code}")
-            # Bỏ qua để hàm tiếp tục kiểm tra các kho khác
     
     if len(location_ids) < 3:
         logger.error("Không tìm thấy đủ 3 kho (HN, HCM, Nhập HN) trong Odoo.")
-        return None, 0 # Trả về None nếu không tìm thấy đủ 3 kho quan trọng
+        return None, 0 
 
     # 2. Lấy danh sách tồn kho (Quant) cho các kho quan trọng
-    # Lấy tồn kho cho tất cả các sản phẩm có số lượng > 0 tại 3 kho
     all_locations_ids = list(location_ids.values())
     quant_domain = [
         ('location_id', 'in', all_locations_ids),
@@ -125,7 +115,6 @@ def get_stock_data(odoo_instance):
                 'Số Lượng Đề Xuất': 0
             }
 
-        # Cập nhật số lượng cho từng kho
         for key, loc_id_check in location_ids.items():
             if loc_id == loc_id_check:
                 if key == 'HN_STOCK':
@@ -138,28 +127,21 @@ def get_stock_data(odoo_instance):
     # 5. Tính toán đề xuất kéo hàng
     report_data = []
     for prod_id, info in data.items():
-        # Tổng Tồn HN = Tồn Kho HN (Thực tế) + Kho Nhập HN (Hàng đi đường)
         info['Tổng Tồn HN'] = info['Tồn Kho HN'] + info['Kho Nhập HN']
         
         if info['Tổng Tồn HN'] < TARGET_MIN_QTY:
-            # Số lượng cần kéo để đạt MIN QTY
             qty_needed = TARGET_MIN_QTY - info['Tổng Tồn HN']
-            
-            # Số lượng đề xuất = MIN(Số lượng cần, Tồn kho HCM)
             info['Số Lượng Đề Xuất'] = min(qty_needed, info['Tồn Kho HCM'])
             
-            # Chỉ thêm vào báo cáo nếu có đề xuất > 0
             if info['Số Lượng Đề Xuất'] > 0:
                 report_data.append(info)
                 
     # 6. Tạo DataFrame và xuất file Excel
     df = pd.DataFrame(report_data)
     
-    # Sắp xếp lại cột theo đúng thứ tự yêu cầu
     COLUMNS_ORDER = ['Mã SP', 'Tên SP', 'Tồn Kho HN', 'Tồn Kho HCM', 'Kho Nhập HN', 'Số Lượng Đề Xuất']
     df = df[COLUMNS_ORDER]
     
-    # Sử dụng io.BytesIO để tạo file Excel trong bộ nhớ (không cần lưu ra đĩa)
     excel_buffer = io.BytesIO()
     df.to_excel(excel_buffer, index=False, sheet_name='DeXuatKeoHang')
     excel_buffer.seek(0)
@@ -167,8 +149,9 @@ def get_stock_data(odoo_instance):
     return excel_buffer, len(report_data)
 
 # --- 4. Các hàm xử lý Bot Telegram ---
+
+# (Các hàm Telegram giữ nguyên)
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gửi tin nhắn chào mừng và hướng dẫn."""
     user_name = update.message.from_user.first_name
     welcome_message = (
         f"Chào mừng **{user_name}** đến với Odoo Stock Bot! 🤖\n\n"
@@ -180,7 +163,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(welcome_message, parse_mode='Markdown')
 
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Kiểm tra kết nối tới Odoo."""
     await update.message.reply_text("Đang kiểm tra kết nối Odoo, xin chờ...")
     odoo = connect_odoo()
     if odoo:
@@ -190,7 +172,6 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ **Lỗi!** Không thể kết nối hoặc đăng nhập Odoo. Vui lòng kiểm tra lại 4 biến môi trường (URL, DB, Username, Password).")
 
 async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Tra cứu nhanh tồn kho theo Mã sản phẩm (default_code)."""
     product_code = update.message.text.strip().upper()
     
     odoo = connect_odoo()
@@ -226,7 +207,6 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ Có lỗi xảy ra khi truy vấn Odoo. Vui lòng kiểm tra log.")
 
 async def excel_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Tạo và gửi báo cáo Excel đề xuất kéo hàng."""
     
     await update.message.reply_text("⌛️ Đang xử lý dữ liệu và tạo báo cáo Excel. Tác vụ này có thể mất vài giây. Vui lòng chờ...")
     
@@ -243,7 +223,6 @@ async def excel_report_command(update: Update, context: ContextTypes.DEFAULT_TYP
              return
         
         if item_count > 0:
-            # Gửi file Excel
             await update.message.reply_document(
                 document=excel_buffer,
                 filename='De_Xuat_Keo_Hang.xlsx',
@@ -266,19 +245,15 @@ def main():
         logger.error("Vui lòng thiết lập TẤT CẢ các biến môi trường cần thiết (TOKEN, URL, DB, USER, PASS).")
         return
         
-    # Xây dựng ứng dụng bot Telegram
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Thêm các Handler cho các lệnh
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", start_command))
     application.add_handler(CommandHandler("ping", ping_command))
     application.add_handler(CommandHandler("keohang", excel_report_command))
 
-    # Handler cho tin nhắn (dùng để tra cứu mã sản phẩm)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_product_code))
     
-    # Khởi chạy bot (polling mode)
     logger.info("Bot đang khởi chạy ở chế độ Polling (Render Free Tier).")
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
