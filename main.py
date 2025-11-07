@@ -7,23 +7,24 @@ import pandas as pd
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# **KHẮC PHỤC LỖI PYTHON CUỐI CÙNG: Đảm bảo ODOO là một CLASS (callable)**
+# **KHẮC PHỤC LỖI IMPORT CUỐI CÙNG (DÙNG TRY-EXCEPT BẮT ĐÚNG CLASS VIẾT THƯỜNG):**
 try:
-    # 1. Thử cách gọi Class OdooRPC (Class chính trong odoorpc phiên bản cũ)
-    from odoorpc import OdooRPC as ODOO
+    # 1. Thử gọi module OdooRPC, Class chính xác thường là 'odoo' (viết thường) trong phiên bản 0.10.1
+    from odoorpc import odoo as ODOO # Đây là tên module, sẽ được gọi là Class trong hàm connect_odoo()
 except ImportError:
     try:
-        # 2. Thử Class Odoo viết hoa (Phổ biến trong các phiên bản mới hơn)
-        from odoorpc import Odoo as ODOO
+        # 2. Thử Class OdooRPC (Backup 1)
+        from odoorpc import OdooRPC as ODOO
     except ImportError:
-        # 3. Thử Class Odoo từ module con (Backup cuối)
-        from odoorpc.odoo import Odoo as ODOO 
+        # 3. Thử Class Odoo viết hoa (Backup 2)
+        from odoorpc import Odoo as ODOO
 # ---------------------------------------------------------------------
 
 # --- 1. Cấu hình & Biến môi trường (LẤY TỪ RENDER) ---
 # Tự động lấy các giá trị nhạy cảm từ biến môi trường của Render
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
-ODOO_URL = os.environ.get('ODOO_URL')
+# *ĐÃ SỬA* URL này phải là https://erp.nguonsongviet.vn/odoo
+ODOO_URL = os.environ.get('ODOO_URL') 
 ODOO_DB = os.environ.get('ODOO_DB')
 ODOO_USERNAME = os.environ.get('ODOO_USERNAME')
 ODOO_PASSWORD = os.environ.get('ODOO_PASSWORD')
@@ -188,7 +189,6 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if odoo:
         await update.message.reply_text(f"✅ **Thành công!** Kết nối Odoo DB: `{ODOO_DB}` tại `{ODOO_URL}`.", parse_mode='Markdown')
     else:
-        # Log lỗi chi tiết để dễ debug hơn
         logger.error("Lỗi kết nối Odoo hoặc đăng nhập. Vui lòng kiểm tra 4 biến môi trường (URL, DB, Username, Password).")
         await update.message.reply_text("❌ **Lỗi!** Không thể kết nối hoặc đăng nhập Odoo. Vui lòng kiểm tra lại 4 biến môi trường (URL, DB, Username, Password).")
 
