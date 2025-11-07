@@ -1,4 +1,4 @@
-# Tệp: bot.py (main.py)
+# Tệp: main.py (bot.py)
 
 import os
 import io
@@ -7,10 +7,10 @@ import pandas as pd
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# **KHẮC PHỤC LỖI IMPORT CUỐI CÙNG (DÙNG TRY-EXCEPT BẮT ĐÚNG CLASS VIẾT THƯỜNG):**
+# **KHẮC PHỤC LỖI IMPORT CUỐI CÙNG: DÙNG CLASS VIẾT THƯỜNG (PHÙ HỢP 0.10.1)**
 try:
-    # 1. Thử gọi module OdooRPC, Class chính xác thường là 'odoo' (viết thường) trong phiên bản 0.10.1
-    from odoorpc import odoo as ODOO # Đây là tên module, sẽ được gọi là Class trong hàm connect_odoo()
+    # 1. Thử Class Odoo viết thường (Khả năng cao nhất cho 0.10.1)
+    from odoorpc import odoo as ODOO 
 except ImportError:
     try:
         # 2. Thử Class OdooRPC (Backup 1)
@@ -23,12 +23,12 @@ except ImportError:
 # --- 1. Cấu hình & Biến môi trường (LẤY TỪ RENDER) ---
 # Tự động lấy các giá trị nhạy cảm từ biến môi trường của Render
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
-# *ĐÃ SỬA* URL này phải là https://erp.nguonsongviet.vn/odoo
+# ODOO_URL PHẢI LÀ 'https://erp.nguonsongviet.vn/odoo'
 ODOO_URL = os.environ.get('ODOO_URL') 
 ODOO_DB = os.environ.get('ODOO_DB')
 ODOO_USERNAME = os.environ.get('ODOO_USERNAME')
 ODOO_PASSWORD = os.environ.get('ODOO_PASSWORD')
-USER_ID_TO_SEND_REPORT = os.environ.get('USER_ID_TO_SEND_REPORT') # ID Telegram của bạn để nhận báo cáo tự động
+USER_ID_TO_SEND_REPORT = os.environ.get('USER_ID_TO_SEND_REPORT')
 
 # Cấu hình nghiệp vụ (Sử dụng mã kho bạn cung cấp)
 TARGET_MIN_QTY = 50
@@ -43,12 +43,12 @@ PRODUCT_CODE_FIELD = 'default_code' # Trường mã sản phẩm dùng để tra
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- 2. Hàm kết nối Odoo ---
+# --- 2. Hàm kết nối Odoo (GIẢI PHÁP SSL: THÊM verify_ssl=False) ---
 def connect_odoo():
     """Thiết lập kết nối với Odoo bằng ODOO_URL, ODOO_DB, USERNAME và PASSWORD."""
     try:
-        # Sử dụng ODOO (đã được gán đúng Class từ khối try-except) để khởi tạo kết nối
-        odoo_instance = ODOO(ODOO_URL, timeout=30)
+        # Thêm tham số verify_ssl=False để bỏ qua lỗi SSL Handshake do thư viện cũ
+        odoo_instance = ODOO(ODOO_URL, timeout=30, verify_ssl=False) 
         odoo_instance.login(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD)
         return odoo_instance
     except Exception as e:
@@ -167,8 +167,6 @@ def get_stock_data(odoo_instance):
     return excel_buffer, len(report_data)
 
 # --- 4. Các hàm xử lý Bot Telegram ---
-
-# Xử lý lệnh /start và /help
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Gửi tin nhắn chào mừng và hướng dẫn."""
     user_name = update.message.from_user.first_name
@@ -181,7 +179,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(welcome_message, parse_mode='Markdown')
 
-# Xử lý lệnh /ping
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Kiểm tra kết nối tới Odoo."""
     await update.message.reply_text("Đang kiểm tra kết nối Odoo, xin chờ...")
@@ -192,7 +189,6 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error("Lỗi kết nối Odoo hoặc đăng nhập. Vui lòng kiểm tra 4 biến môi trường (URL, DB, Username, Password).")
         await update.message.reply_text("❌ **Lỗi!** Không thể kết nối hoặc đăng nhập Odoo. Vui lòng kiểm tra lại 4 biến môi trường (URL, DB, Username, Password).")
 
-# Xử lý tính năng tra cứu nhanh (Mã sản phẩm)
 async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Tra cứu nhanh tồn kho theo Mã sản phẩm (default_code)."""
     product_code = update.message.text.strip().upper()
@@ -203,7 +199,6 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     product_model = odoo.env['product.product']
-    # Tìm sản phẩm theo trường default_code
     domain = [(PRODUCT_CODE_FIELD, '=', product_code)]
     
     try:
@@ -230,7 +225,6 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.error(f"Lỗi khi tra cứu sản phẩm: {e}")
         await update.message.reply_text("❌ Có lỗi xảy ra khi truy vấn Odoo. Vui lòng kiểm tra log.")
 
-# Xử lý lệnh /keohang (Xuất báo cáo Excel)
 async def excel_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Tạo và gửi báo cáo Excel đề xuất kéo hàng."""
     
@@ -262,7 +256,6 @@ async def excel_report_command(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.error(f"Lỗi khi tạo báo cáo Excel: {e}")
         await update.message.reply_text(f"❌ Đã xảy ra lỗi nghiêm trọng khi xử lý báo cáo: {e}")
 
-# Xử lý tính năng TỰ ĐỘNG BÁO CÁO HÀNG NGÀY (Lệnh này chỉ dùng để kích hoạt báo cáo cho mục đích Cron Job)
 async def daily_report_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pass
 
@@ -287,7 +280,6 @@ def main():
     
     # Khởi chạy bot (polling mode)
     logger.info("Bot đang khởi chạy ở chế độ Polling (Render Free Tier).")
-    # Tắt tính năng tự động cập nhật URL Webhook vì chúng ta dùng Polling (đơn giản hơn)
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == '__main__':
