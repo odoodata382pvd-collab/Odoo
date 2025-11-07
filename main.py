@@ -1,4 +1,4 @@
-# Tệp: bot.py
+# Tệp: bot.py (main.py)
 
 import os
 import io
@@ -6,9 +6,11 @@ import logging
 import pandas as pd
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
 # **KHẮC PHỤC LỖI IMPORT CUỐI CÙNG:**
-from odoorpc import Odoo 
-ODOO = Odoo 
+# Class kết nối trong odoorpc phiên bản 0.10.1 là OdooRPC
+from odoorpc import OdooRPC 
+ODOO = OdooRPC # Gán Class OdooRPC vào biến ODOO để khớp với phần code còn lại
 # ------------------------------------
 
 # --- 1. Cấu hình & Biến môi trường (LẤY TỪ RENDER) ---
@@ -37,6 +39,7 @@ logger = logging.getLogger(__name__)
 def connect_odoo():
     """Thiết lập kết nối với Odoo bằng ODOO_URL, ODOO_DB, USERNAME và PASSWORD."""
     try:
+        # Sử dụng ODOO (đã gán là OdooRPC) để khởi tạo kết nối
         odoo_instance = ODOO(ODOO_URL, timeout=30)
         odoo_instance.login(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD)
         return odoo_instance
