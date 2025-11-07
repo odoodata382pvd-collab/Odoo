@@ -1,0 +1,6 @@
+version: '3.8'
+services:
+  telegram-bot:
+    build: .
+    command: python main.py
+    restart: always
