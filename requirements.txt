@@ -1,0 +1,4 @@
+python-telegram-bot==20.8
+xmlrpc-client-odoo==1.0.6
+pandas==2.1.4
+openpyxl==3.1.2
