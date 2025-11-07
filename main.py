@@ -6,7 +6,7 @@ import logging
 import pandas as pd
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from odoorpc.odoo import ODOO
+from odoorpc import Odoo as ODOO
 
 # --- 1. Cấu hình & Biến môi trường (LẤY TỪ RENDER) ---
 # Tự động lấy các giá trị nhạy cảm từ biến môi trường của Render
