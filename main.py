@@ -8,22 +8,20 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # **SỬA LỖI IMPORT: Dùng Class Odoo viết hoa (Sau khi nâng cấp odoorpc)**
-try:
-    from odoorpc import Odoo as ODOO 
-except ImportError:
-    # Nếu việc nâng cấp bị lỗi, quay về cách gọi Class odoo cũ (viết thường)
-    from odoorpc import odoo as ODOO 
+# Giả định đã nâng cấp odoorpc trong requirements.txt
+from odoorpc import Odoo as ODOO 
 # ---------------------------------------------------------------------
 
 # --- 1. Cấu hình & Biến môi trường (LẤY TỪ RENDER) ---
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
+# ODOO_URL PHẢI LÀ 'https://erp.nguonsongviet.vn/odoo'
 ODOO_URL = os.environ.get('ODOO_URL') 
 ODOO_DB = os.environ.get('ODOO_DB')
 ODOO_USERNAME = os.environ.get('ODOO_USERNAME')
 ODOO_PASSWORD = os.environ.get('ODOO_PASSWORD')
 USER_ID_TO_SEND_REPORT = os.environ.get('USER_ID_TO_SEND_REPORT')
 
-# Cấu hình nghiệp vụ 
+# Cấu hình nghiệp vụ (Đã rà soát)
 TARGET_MIN_QTY = 50
 LOCATION_MAP = {
     'HN_STOCK': '201/201', # Kho Hà Nội (Tồn kho thực tế)
@@ -41,6 +39,7 @@ def connect_odoo():
     """Thiết lập kết nối với Odoo bằng ODOO_URL, ODOO_DB, USERNAME và PASSWORD."""
     try:
         # Thêm tham số verify_ssl=False để bỏ qua lỗi SSL Handshake
+        # Dùng ODOO (Class đã import) để khởi tạo kết nối
         odoo_instance = ODOO(ODOO_URL, timeout=30, verify_ssl=False) 
         odoo_instance.login(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD)
         return odoo_instance
@@ -149,9 +148,8 @@ def get_stock_data(odoo_instance):
     return excel_buffer, len(report_data)
 
 # --- 4. Các hàm xử lý Bot Telegram ---
-
-# (Các hàm Telegram giữ nguyên)
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gửi tin nhắn chào mừng và hướng dẫn."""
     user_name = update.message.from_user.first_name
     welcome_message = (
         f"Chào mừng **{user_name}** đến với Odoo Stock Bot! 🤖\n\n"
@@ -163,6 +161,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(welcome_message, parse_mode='Markdown')
 
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kiểm tra kết nối tới Odoo."""
     await update.message.reply_text("Đang kiểm tra kết nối Odoo, xin chờ...")
     odoo = connect_odoo()
     if odoo:
@@ -172,6 +171,7 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ **Lỗi!** Không thể kết nối hoặc đăng nhập Odoo. Vui lòng kiểm tra lại 4 biến môi trường (URL, DB, Username, Password).")
 
 async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tra cứu nhanh tồn kho theo Mã sản phẩm (default_code)."""
     product_code = update.message.text.strip().upper()
     
     odoo = connect_odoo()
@@ -207,6 +207,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ Có lỗi xảy ra khi truy vấn Odoo. Vui lòng kiểm tra log.")
 
 async def excel_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tạo và gửi báo cáo Excel đề xuất kéo hàng."""
     
     await update.message.reply_text("⌛️ Đang xử lý dữ liệu và tạo báo cáo Excel. Tác vụ này có thể mất vài giây. Vui lòng chờ...")
     
