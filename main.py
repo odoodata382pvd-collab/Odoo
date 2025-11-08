@@ -1,4 +1,4 @@
-# Tệp: main.py (bot.py) - Phiên bản HOÀN CHỈNH (XML-RPC Tối ưu)
+# Tệp: main.py - Phiên bản HOÀN CHỈNH: Sửa lỗi thiếu kho và Cập nhật Định dạng Tra cứu SP
 
 import os
 import io
@@ -20,12 +20,11 @@ USER_ID_TO_SEND_REPORT = os.environ.get('USER_ID_TO_SEND_REPORT')
 
 # Cấu hình nghiệp vụ
 TARGET_MIN_QTY = 50
-# NOTE: Đã chuyển sang tìm kiếm theo TÊN ĐẦY ĐỦ (complete_name)
+# NOTE: Chỉ dùng các mã này để xác định kho nào là kho nào.
 LOCATION_MAP = {
-    'HN_STOCK_NAME': '201/201', 
-    'HCM_STOCK_NAME': '124/124', 
-    # Kho nhập HN thường có tên đầy đủ là 'WH/Stock/201' hoặc tương tự
-    'HN_TRANSIT_NAME': 'Kho nhập Hà Nội', # Đã sửa, tìm theo tên hiển thị
+    'HN_STOCK_CODE': '201/201', 
+    'HCM_STOCK_CODE': '124/124', 
+    'HN_TRANSIT_NAME': 'Kho nhập Hà Nội', # Vẫn giữ tìm theo tên này
 }
 PRODUCT_CODE_FIELD = 'default_code'
 
@@ -33,32 +32,25 @@ PRODUCT_CODE_FIELD = 'default_code'
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- 2. Hàm kết nối Odoo (Tách URL + XML-RPC) ---
+# --- 2. Hàm kết nối Odoo (Đã Sửa lỗi 400 và SSL) ---
 def connect_odoo():
     """Thiết lập kết nối với Odoo bằng XML-RPC, xử lý proxy URL."""
     try:
         parsed_url = urlparse(ODOO_URL)
-        # Sửa lỗi 400: Dùng base_url_for_rpc để loại bỏ path /odoo trong XML-RPC
         base_url_for_rpc = f"{parsed_url.scheme}://{parsed_url.netloc}" 
     except Exception as e:
         error_message = f"Lỗi phân tích cú pháp ODOO_URL: {e}"
-        logger.error(error_message)
         return None, None, error_message
     
     common_url = '{}/xmlrpc/2/common'.format(base_url_for_rpc)
     try:
-        # 1. Kết nối Common Service (dùng để login)
         common = xmlrpc.client.ServerProxy(common_url, context=ssl._create_unverified_context())
-        
-        # 2. Login và lấy UID
         uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
         
         if not uid:
-             error_message = f"Đăng nhập thất bại (UID=0). User: {ODOO_USERNAME}, DB: {ODOO_DB}."
-             logger.error(error_message)
+             error_message = f"Đăng nhập thất bại (UID=0). Kiểm tra lại User/Pass/DB: {ODOO_USERNAME} / {ODOO_DB}."
              return None, None, error_message
         
-        # 3. Kết nối Object Service (dùng để CRUD dữ liệu)
         models = xmlrpc.client.ServerProxy('{}/xmlrpc/2/object'.format(base_url_for_rpc), 
                                             context=ssl._create_unverified_context())
 
@@ -66,60 +58,58 @@ def connect_odoo():
     
     except xmlrpc.client.ProtocolError as pe:
         error_message = f"Lỗi Giao thức Odoo (400 Bad Request?): {pe}. URL: {common_url}"
-        logger.error(error_message)
         return None, None, error_message
     except Exception as e:
         error_message = f"Lỗi Kết nối Odoo XML-RPC: {e}. URL: {common_url}"
-        logger.error(error_message)
         return None, None, error_message
 
 # --- 3. Hàm chính (Logic nghiệp vụ Odoo) ---
 def get_stock_data():
-    """Lấy dữ liệu tồn kho từ Odoo bằng XML-RPC."""
-    # ⚠️ Sửa lỗi: Nhận 3 giá trị trả về
+    """
+    Lấy dữ liệu tồn kho từ Odoo bằng XML-RPC.
+    SỬA LỖI: Tìm kiếm kho linh hoạt hơn.
+    """
     uid, models, error_msg = connect_odoo()
     if not uid:
-        return None, 0, error_msg # ⚠️ Trả về lỗi chi tiết
+        return None, 0, error_msg 
 
     try:
         # Lấy Location IDs
         location_ids = {}
         
-        # ⚠️ Sửa lỗi: Tìm kiếm theo 'complete_name' cho kho chính
+        # SỬA LỖI TÌM KHO: Dùng 'name' (201/201) kết hợp 'ilike' nếu 'name' không hoạt động
         
-        # Lấy HN_STOCK
+        # Lấy HN_STOCK (201/201)
         loc_data = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, 'stock.location', 'search_read', 
-            [[('complete_name', 'ilike', LOCATION_MAP['HN_STOCK_NAME'])]], 
-            {'fields': ['id']}
+            [[('name', 'ilike', LOCATION_MAP['HN_STOCK_CODE'])]], # Tìm theo name LIKE
+            {'fields': ['id', 'display_name']}
         )
-        if loc_data: location_ids['HN_STOCK'] = loc_data[0]['id']
+        if loc_data: location_ids['HN_STOCK'] = {'id': loc_data[0]['id'], 'name': loc_data[0]['display_name']}
 
-        # Lấy HCM_STOCK
+        # Lấy HCM_STOCK (124/124)
         loc_data = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, 'stock.location', 'search_read', 
-            [[('complete_name', 'ilike', LOCATION_MAP['HCM_STOCK_NAME'])]], 
-            {'fields': ['id']}
+            [[('name', 'ilike', LOCATION_MAP['HCM_STOCK_CODE'])]], # Tìm theo name LIKE
+            {'fields': ['id', 'display_name']}
         )
-        if loc_data: location_ids['HCM_STOCK'] = loc_data[0]['id']
+        if loc_data: location_ids['HCM_STOCK'] = {'id': loc_data[0]['id'], 'name': loc_data[0]['display_name']}
 
         # Lấy Kho nhập HN (Tìm theo tên hiển thị 'Kho nhập Hà Nội')
         loc_data = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, 'stock.location', 'search_read', 
             [[('name', '=', LOCATION_MAP['HN_TRANSIT_NAME'])]], 
-            {'fields': ['id']}
+            {'fields': ['id', 'display_name']}
         )
-        if loc_data: location_ids['HN_TRANSIT'] = loc_data[0]['id']
+        if loc_data: location_ids['HN_TRANSIT'] = {'id': loc_data[0]['id'], 'name': loc_data[0]['display_name']}
             
         if len(location_ids) < 3:
-            error_msg = f"Không tìm thấy đủ 3 kho trong Odoo. Đã tìm thấy: {location_ids}"
+            error_msg = f"Không tìm thấy đủ 3 kho cần thiết. Đã tìm thấy: {list(location_ids.keys())}"
             logger.error(error_msg)
-            return None, 0, error_msg # ⚠️ Trả về lỗi chi tiết
+            return None, 0, error_msg 
 
-        # (Phần truy vấn Quant và tính toán logic nghiệp vụ được giữ nguyên)
-        
         # Lấy danh sách tồn kho (Quant)
-        all_locations_ids = list(location_ids.values())
+        all_locations_ids = [v['id'] for v in location_ids.values()]
         quant_domain = [('location_id', 'in', all_locations_ids), ('quantity', '>', 0)]
         
         quant_data = models.execute_kw(
@@ -136,6 +126,9 @@ def get_stock_data():
             {'fields': ['display_name', PRODUCT_CODE_FIELD]}
         )
         product_map = {p['id']: p for p in product_info}
+        
+        # Lấy bản đồ ID Location
+        location_id_to_name = {v['id']: v['name'] for v in location_ids.values()}
 
         # Xử lý logic nghiệp vụ và tính toán
         data = {}
@@ -151,11 +144,13 @@ def get_stock_data():
                     'Tồn Kho HN': 0, 'Tồn Kho HCM': 0, 'Kho Nhập HN': 0, 'Tổng Tồn HN': 0, 'Số Lượng Đề Xuất': 0
                 }
 
-            for key, loc_id_check in location_ids.items():
-                if loc_id == loc_id_check:
-                    if key == 'HN_STOCK': data[prod_id]['Tồn Kho HN'] += qty
-                    elif key == 'HCM_STOCK': data[prod_id]['Tồn Kho HCM'] += qty
-                    elif key == 'HN_TRANSIT': data[prod_id]['Kho Nhập HN'] += qty
+            # Map quantity to correct key
+            if loc_id == location_ids.get('HN_STOCK', {}).get('id'):
+                data[prod_id]['Tồn Kho HN'] += qty
+            elif loc_id == location_ids.get('HCM_STOCK', {}).get('id'):
+                data[prod_id]['Tồn Kho HCM'] += qty
+            elif loc_id == location_ids.get('HN_TRANSIT', {}).get('id'):
+                data[prod_id]['Kho Nhập HN'] += qty
                         
         report_data = []
         for prod_id, info in data.items():
@@ -179,16 +174,117 @@ def get_stock_data():
 
     except Exception as e:
         error_msg = f"Lỗi khi truy vấn dữ liệu Odoo XML-RPC: {e}"
-        logger.error(error_msg)
         return None, 0, error_msg
 
-# --- 4. Các hàm xử lý Bot Telegram (Đã sửa lỗi hiển thị) ---
+# --- 4. CẬP NHẬT: Định dạng lại tin nhắn tra cứu sản phẩm ---
+async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Tra cứu nhanh tồn kho theo Mã sản phẩm (default_code).
+    Định dạng lại theo yêu cầu mới.
+    """
+    product_code = update.message.text.strip().upper()
+    await update.message.reply_text(f"Đang tra tồn cho sản phẩm `{product_code}`...", parse_mode='Markdown')
 
+    uid, models, error_msg = connect_odoo()
+    if not uid:
+        await update.message.reply_text(f"❌ Lỗi kết nối Odoo. Chi tiết: `{error_msg}`", parse_mode='Markdown')
+        return
+
+    try:
+        # Lấy thông tin sản phẩm và tồn kho tổng
+        product_domain = [(PRODUCT_CODE_FIELD, '=', product_code)]
+        products = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'search_read',
+            [product_domain],
+            {'fields': ['display_name', 'qty_available', 'virtual_available', 'id']}
+        )
+        
+        if not products:
+            await update.message.reply_text(f"❌ Không tìm thấy sản phẩm nào có mã `{product_code}`.")
+            return
+
+        product = products[0]
+        product_id = product['id']
+        product_name = product['display_name']
+        
+        # Lấy TỒN KHO CHI TIẾT (stock.quant)
+        quant_domain = [('product_id', '=', product_id), ('quantity', '>', 0)]
+        quant_data = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, 'stock.quant', 'search_read',
+            [quant_domain],
+            {'fields': ['location_id', 'quantity']}
+        )
+        
+        # Lấy tên các kho liên quan
+        location_ids = list(set([q['location_id'][0] for q in quant_data]))
+        location_info = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, 'stock.location', 'search_read',
+            [[('id', 'in', location_ids)]],
+            {'fields': ['id', 'display_name']}
+        )
+        location_map = {loc['id']: loc['display_name'] for loc in location_info}
+        
+        # Tính toán tồn kho chi tiết theo yêu cầu
+        hn_stock_qty = 0
+        hn_transit_qty = 0
+        hcm_stock_qty = 0
+        
+        # Danh sách tồn kho chi tiết (Quant)
+        detail_stock_list = []
+        
+        # Map IDs và tính toán
+        for q in quant_data:
+            loc_id = q['location_id'][0]
+            qty = q['quantity']
+            loc_name = location_map.get(loc_id, "N/A")
+            
+            detail_stock_list.append(f"* {loc_name}: `{int(qty)}`")
+            
+            # Tính toán cho Khuyến nghị
+            if LOCATION_MAP['HN_STOCK_CODE'] in loc_name:
+                hn_stock_qty += qty
+            elif LOCATION_MAP['HCM_STOCK_CODE'] in loc_name:
+                hcm_stock_qty += qty
+            elif LOCATION_MAP['HN_TRANSIT_NAME'] in loc_name:
+                hn_transit_qty += qty
+                
+        total_hn_stock = hn_stock_qty + hn_transit_qty
+        
+        # Tính Khuyến nghị
+        recommendation_qty = 0
+        if total_hn_stock < TARGET_MIN_QTY:
+            qty_needed = TARGET_MIN_QTY - total_hn_stock
+            recommendation_qty = min(qty_needed, hcm_stock_qty)
+        
+        recommendation_text = ""
+        if recommendation_qty > 0:
+            recommendation_text = f"🚨 **Khuyến nghị đặt thêm:** `{int(recommendation_qty)}` SP (tồn kho HCM) để HN đủ tồn min `{TARGET_MIN_QTY}` SP/mã."
+        else:
+            recommendation_text = f"✅ Tồn kho HN đã đủ (`{int(total_hn_stock)}`/{TARGET_MIN_QTY} SP)."
+
+        # Định dạng tin nhắn trả về
+        message = (
+            f"**1/ {product_code} - {product_name}**\n"
+            f"Tồn kho HN: `{int(hn_stock_qty)}`\n"
+            f"Tồn kho nhập HN: `{int(hn_transit_qty)}`\n"
+            f"Tồn kho HCM: `{int(hcm_stock_qty)}`\n"
+            f"{recommendation_text}\n"
+            f"\n"
+            f"**2/ TỒN KHO CHI TIẾT (Theo kho)**\n"
+            f"{'\n'.join(detail_stock_list) if detail_stock_list else 'Không có tồn kho chi tiết lớn hơn 0.'}"
+        )
+        
+        await update.message.reply_text(message, parse_mode='Markdown')
+        
+    except Exception as e:
+        logger.error(f"Lỗi khi tra cứu sản phẩm XML-RPC: {e}")
+        await update.message.reply_text(f"❌ Có lỗi xảy ra khi truy vấn Odoo: {e}")
+
+# --- 5. Các hàm khác (Đã sửa lỗi hiển thị) ---
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Kiểm tra kết nối tới Odoo."""
     await update.message.reply_text("Đang kiểm tra kết nối Odoo, xin chờ...")
     
-    # ⚠️ Sửa lỗi: Nhận 3 giá trị trả về
     uid, _, error_msg = connect_odoo() 
     
     if uid:
@@ -197,7 +293,6 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
     else:
-        # Nếu login thất bại, dùng chính error_msg để báo cáo
         final_error = f"❌ **Lỗi!** Không thể kết nối hoặc đăng nhập Odoo.\n\nChi tiết lỗi: `{error_msg}`"
         await update.message.reply_text(final_error, parse_mode='Markdown')
 
@@ -206,7 +301,6 @@ async def excel_report_command(update: Update, context: ContextTypes.DEFAULT_TYP
     
     await update.message.reply_text("⌛️ Đang xử lý dữ liệu và tạo báo cáo Excel. Tác vụ này có thể mất vài giây. Vui lòng chờ...")
     
-    # ⚠️ Sửa lỗi: Nhận 3 giá trị trả về
     excel_buffer, item_count, error_msg = get_stock_data() 
     
     if excel_buffer is None:
@@ -222,55 +316,18 @@ async def excel_report_command(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         await update.message.reply_text(f"✅ Tuyệt vời! Tất cả sản phẩm hiện tại đã đạt hoặc vượt mức tồn kho tối thiểu {TARGET_MIN_QTY} tại kho HN (bao gồm cả hàng đi đường). Không cần kéo thêm hàng.")
 
-# (Giữ nguyên các hàm còn lại)
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Gửi tin nhắn chào mừng và hướng dẫn."""
     user_name = update.message.from_user.first_name
     welcome_message = (
         f"Chào mừng **{user_name}** đến với Odoo Stock Bot! 🤖\n\n"
         "Tôi có thể thực hiện 3 tác vụ sau:\n"
-        "1. **Tra cứu nhanh:** Gõ bất kỳ mã sản phẩm nào (ví dụ: `I-78`). Tôi sẽ trả về tồn kho nhanh (Tổng).\n"
+        "1. **Tra cứu nhanh:** Gõ bất kỳ mã sản phẩm nào (ví dụ: `I-78`). Tôi sẽ trả về tồn kho chi tiết.\n"
         "2. **Báo cáo kéo hàng (Excel):** Dùng lệnh `/keohang` để nhận file Excel thống kê các sản phẩm cần kéo từ HCM về HN.\n"
         "3. **Kiểm tra kết nối:** Dùng lệnh `/ping` để kiểm tra kết nối Odoo."
     )
     await update.message.reply_text(welcome_message, parse_mode='Markdown')
-
-async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Tra cứu nhanh tồn kho theo Mã sản phẩm (default_code)."""
-    product_code = update.message.text.strip().upper()
-    
-    # ⚠️ Sửa lỗi: Nhận 3 giá trị trả về
-    uid, models, error_msg = connect_odoo()
-    if not uid:
-        await update.message.reply_text(f"❌ Lỗi kết nối Odoo. Chi tiết: `{error_msg}`", parse_mode='Markdown')
-        return
-
-    domain = [(PRODUCT_CODE_FIELD, '=', product_code)]
-    
-    try:
-        products = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'search_read',
-            [domain],
-            {'fields': ['display_name', 'qty_available', 'virtual_available']}
-        )
-        
-        if products:
-            product = products[0]
-            message = (
-                f"🔎 **Thông tin sản phẩm:**\n"
-                f"- **Tên SP:** {product['display_name']}\n"
-                f"- **Mã SP:** `{product_code}`\n"
-                f"- **Tồn Kho Thực Tế (Tổng):** `{int(product.get('qty_available', 0))}`\n"
-                f"- **Tồn Kho Dự Báo (Tổng):** `{int(product.get('virtual_available', 0))}`\n\n"
-                f"_(Sử dụng lệnh /keohang để xem tồn kho chi tiết theo từng kho và đề xuất kéo hàng.)_"
-            )
-            await update.message.reply_text(message, parse_mode='Markdown')
-        else:
-            await update.message.reply_text(f"❌ Không tìm thấy sản phẩm nào có mã `{product_code}`.")
-    
-    except Exception as e:
-        logger.error(f"Lỗi khi tra cứu sản phẩm XML-RPC: {e}")
-        await update.message.reply_text(f"❌ Có lỗi xảy ra khi truy vấn Odoo: {e}")
 
 def main():
     """Chạy bot."""
