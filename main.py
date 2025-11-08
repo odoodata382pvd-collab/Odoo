@@ -1,4 +1,4 @@
-# Tệp: main.py - Phiên bản DỨT ĐIỂM HOÀN TOÀN: Fix lỗi cộng dồn tồn kho chi tiết
+# Tệp: main.py - Phiên bản DỨT ĐIỂM HOÀN TOÀN: Fix lỗi cộng dồn tồn kho chi tiết bằng cách dùng ID
 
 import os
 import io
@@ -190,7 +190,7 @@ def get_stock_data():
         error_msg = f"lỗi khi truy vấn dữ liệu odoo xml-rpc: {e}"
         return None, 0, error_msg
 
-# --- 4. Hàm xử lý Tra Cứu Sản Phẩm (FIX LỖI CỘNG DỒN TỒN KHO CHI TIẾT) ---
+# --- 4. Hàm xử lý Tra Cứu Sản Phẩm (FIX LỖI CỘNG DỒN DÙNG ID) ---
 async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Tra cứu nhanh tồn kho theo Mã sản phẩm (default_code).
@@ -262,20 +262,26 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             [[('id', 'in', location_ids_all)]],
             {'fields': ['id', 'display_name', 'usage']} 
         )
+        # Tạo map từ ID sang Tên (display_name)
         location_map = {loc['id']: loc for loc in location_info}
         
-        all_stock_details = {} 
+        # BƯỚC FIX: Cộng dồn số lượng theo ID (đảm bảo tính chính xác)
+        stock_by_loc_id = {}
         for q in quant_data_all:
             loc_id = q['location_id'][0]
             qty = q['quantity']
             loc_data = location_map.get(loc_id, {})
-            loc_name = loc_data.get('display_name', "n/a")
             loc_usage = loc_data.get('usage', 'internal')
             
-            # Chỉ hiển thị các kho Internal và Transit
+            # Chỉ tính các kho Internal và Transit
             if loc_usage in ['internal', 'transit']:
-                # FIX: CỘNG DỒN số lượng vào cùng một tên kho
-                all_stock_details[loc_name] = all_stock_details.get(loc_name, 0) + int(qty)
+                stock_by_loc_id[loc_id] = stock_by_loc_id.get(loc_id, 0) + int(qty)
+                
+        # BƯỚC CUỐI: Chuyển đổi từ ID sang Tên để hiển thị
+        all_stock_details = {} 
+        for loc_id, qty in stock_by_loc_id.items():
+            loc_name = location_map.get(loc_id, {}).get('display_name', "n/a")
+            all_stock_details[loc_name] = qty
 
 
         # 4. TÍNH TOÁN KHUYẾN NGHỊ VÀ FORMAT TIN NHẮN
