@@ -1,4 +1,4 @@
-# Tệp: main.py (bot.py) - Sử dụng XML-RPC CHÍNH THỨC của Python
+# Tệp: main.py (bot.py) - KHẮC PHỤC LỖI 400 BAD REQUEST
 
 import os
 import io
@@ -6,12 +6,12 @@ import logging
 import pandas as pd
 import ssl
 import xmlrpc.client
+from urllib.parse import urlparse # Import thư viện xử lý URL
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # --- 1. Cấu hình & Biến môi trường (LẤY TỪ RENDER) ---
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
-# ODOO_URL phải là 'https://erp.nguonsongviet.vn/odoo'
 ODOO_URL = os.environ.get('ODOO_URL') 
 ODOO_DB = os.environ.get('ODOO_DB')
 ODOO_USERNAME = os.environ.get('ODOO_USERNAME')
@@ -31,38 +31,45 @@ PRODUCT_CODE_FIELD = 'default_code'
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- 2. Hàm kết nối Odoo (GIẢI PHÁP TỐI ƯU: XML-RPC) ---
+# --- 2. Hàm kết nối Odoo (GIẢI PHÁP CUỐI CÙNG: TÁCH URL) ---
 def connect_odoo():
     """Thiết lập kết nối với Odoo bằng XML-RPC."""
+    
+    # 🚨 Xử lý URL để loại bỏ '/odoo' khỏi XML-RPC endpoint
+    parsed_url = urlparse(ODOO_URL)
+    # Base URL chỉ còn scheme và netloc (ví dụ: https://erp.nguonsongviet.vn)
+    base_url_for_rpc = f"{parsed_url.scheme}://{parsed_url.netloc}" 
+    
+    # Nếu có path (như /odoo) thì cần phải truyền nó vào trong DB name, nhưng với Odoo 10+ thì không cần.
+    # Chúng ta vẫn dùng ODOO_DB và ODOO_URL như cũ, nhưng gọi ServerProxy bằng base_url_for_rpc
+    
     try:
-        # **Xử lý SSL/Proxy:** Dùng ssl._create_unverified_context để bỏ qua lỗi SSL
+        # Xử lý SSL/Proxy: Dùng ssl._create_unverified_context để bỏ qua lỗi SSL
         # URL dịch vụ common (dùng để login)
-        common = xmlrpc.client.ServerProxy('{}/xmlrpc/2/common'.format(ODOO_URL), 
+        common = xmlrpc.client.ServerProxy('{}/xmlrpc/2/common'.format(base_url_for_rpc), 
                                            context=ssl._create_unverified_context())
         
         # Gọi login để lấy UID (User ID)
         uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
         
         if not uid:
-             logger.error("Đăng nhập thất bại: Tên đăng nhập/Mật khẩu/DB không đúng.")
+             logger.error(f"Đăng nhập thất bại (UID=0). Kiểm tra lại User/Pass/DB: {ODOO_USERNAME} / {ODOO_DB}.")
              return None, None
         
         # URL dịch vụ object (dùng để CRUD dữ liệu)
-        models = xmlrpc.client.ServerProxy('{}/xmlrpc/2/object'.format(ODOO_URL), 
+        models = xmlrpc.client.ServerProxy('{}/xmlrpc/2/object'.format(base_url_for_rpc), 
                                             context=ssl._create_unverified_context())
 
         # Trả về các thông số cần thiết để gọi các method Odoo
         return uid, models
     
     except Exception as e:
-        logger.error(f"Lỗi kết nối Odoo XML-RPC: {e}")
+        logger.error(f"Lỗi kết nối Odoo XML-RPC: {e}. URL thử nghiệm: {base_url_for_rpc}/xmlrpc/2/common")
         return None, None
 
-# --- 3. Hàm chính (Logic nghiệp vụ Odoo) ---
+# --- 3. Các hàm truy vấn Odoo (Không thay đổi) ---
 def get_stock_data():
-    """
-    Lấy dữ liệu tồn kho từ Odoo bằng XML-RPC.
-    """
+    """Lấy dữ liệu tồn kho từ Odoo bằng XML-RPC."""
     uid, models = connect_odoo()
     if not uid:
         return None, 0
@@ -70,37 +77,34 @@ def get_stock_data():
     try:
         # Lấy Location IDs
         location_ids = {}
-        stock_location_id = models.execute_kw(
+        # NOTE: Các lệnh search_read phải sử dụng 'execute_kw' với 4 tham số (DB, uid, pass, model) và 2 lists (domain, kwargs)
+        
+        # Lấy HN_STOCK
+        loc_data = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, 'stock.location', 'search_read', 
-            [
-                [('name', '=', LOCATION_MAP['HN_STOCK'])]
-            ], 
-            {'fields': ['id', 'name']}
+            [[('name', '=', LOCATION_MAP['HN_STOCK'])]], 
+            {'fields': ['id']}
         )
-        if stock_location_id:
-            location_ids['HN_STOCK'] = stock_location_id[0]['id']
+        if loc_data:
+            location_ids['HN_STOCK'] = loc_data[0]['id']
 
-        # Tương tự cho HCM_STOCK
-        stock_location_id = models.execute_kw(
+        # Lấy HCM_STOCK
+        loc_data = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, 'stock.location', 'search_read', 
-            [
-                [('name', '=', LOCATION_MAP['HCM_STOCK'])]
-            ], 
-            {'fields': ['id', 'name']}
+            [[('name', '=', LOCATION_MAP['HCM_STOCK'])]], 
+            {'fields': ['id']}
         )
-        if stock_location_id:
-            location_ids['HCM_STOCK'] = stock_location_id[0]['id']
+        if loc_data:
+            location_ids['HCM_STOCK'] = loc_data[0]['id']
 
-        # Tương tự cho Kho nhập HN (Tìm theo tên "Kho nhập Hà Nội")
-        stock_location_id = models.execute_kw(
+        # Lấy Kho nhập HN (Tìm theo tên "Kho nhập Hà Nội")
+        loc_data = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, 'stock.location', 'search_read', 
-            [
-                [('name', '=', 'Kho nhập Hà Nội')]
-            ], 
-            {'fields': ['id', 'name']}
+            [[('name', '=', 'Kho nhập Hà Nội')]], 
+            {'fields': ['id']}
         )
-        if stock_location_id:
-            location_ids['HN_TRANSIT'] = stock_location_id[0]['id']
+        if loc_data:
+            location_ids['HN_TRANSIT'] = loc_data[0]['id']
             
         if len(location_ids) < 3:
             logger.error("Không tìm thấy đủ 3 kho (HN, HCM, Nhập HN) trong Odoo.")
@@ -108,10 +112,7 @@ def get_stock_data():
 
         # Lấy danh sách tồn kho (Quant)
         all_locations_ids = list(location_ids.values())
-        quant_domain = [
-            ('location_id', 'in', all_locations_ids),
-            ('quantity', '>', 0)
-        ]
+        quant_domain = [('location_id', 'in', all_locations_ids), ('quantity', '>', 0)]
         
         quant_data = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, 'stock.quant', 'search_read',
@@ -128,7 +129,7 @@ def get_stock_data():
         )
         product_map = {p['id']: p for p in product_info}
 
-        # Xử lý logic nghiệp vụ và tính toán (Giống logic cũ)
+        # Xử lý logic nghiệp vụ và tính toán
         data = {}
         for q in quant_data:
             prod_id = q['product_id'][0]
@@ -139,21 +140,14 @@ def get_stock_data():
                 data[prod_id] = {
                     'Mã SP': product_map[prod_id].get(PRODUCT_CODE_FIELD, 'N/A'),
                     'Tên SP': product_map[prod_id]['display_name'],
-                    'Tồn Kho HN': 0,
-                    'Tồn Kho HCM': 0,
-                    'Kho Nhập HN': 0,
-                    'Tổng Tồn HN': 0,
-                    'Số Lượng Đề Xuất': 0
+                    'Tồn Kho HN': 0, 'Tồn Kho HCM': 0, 'Kho Nhập HN': 0, 'Tổng Tồn HN': 0, 'Số Lượng Đề Xuất': 0
                 }
 
             for key, loc_id_check in location_ids.items():
                 if loc_id == loc_id_check:
-                    if key == 'HN_STOCK':
-                        data[prod_id]['Tồn Kho HN'] += qty
-                    elif key == 'HCM_STOCK':
-                        data[prod_id]['Tồn Kho HCM'] += qty
-                    elif key == 'HN_TRANSIT':
-                        data[prod_id]['Kho Nhập HN'] += qty
+                    if key == 'HN_STOCK': data[prod_id]['Tồn Kho HN'] += qty
+                    elif key == 'HCM_STOCK': data[prod_id]['Tồn Kho HCM'] += qty
+                    elif key == 'HN_TRANSIT': data[prod_id]['Kho Nhập HN'] += qty
                         
         report_data = []
         for prod_id, info in data.items():
@@ -180,7 +174,7 @@ def get_stock_data():
         logger.error(f"Lỗi khi truy vấn dữ liệu Odoo XML-RPC: {e}")
         return None, 0
 
-# --- 4. Các hàm xử lý Bot Telegram ---
+# --- 4. Các hàm xử lý Bot Telegram (Không thay đổi) ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Gửi tin nhắn chào mừng và hướng dẫn."""
     user_name = update.message.from_user.first_name
