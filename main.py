@@ -1,4 +1,4 @@
-# Tệp: main.py - Phiên bản HOÀN CHỈNH: Sửa lỗi cú pháp f-string và cập nhật định dạng tra cứu
+# Tệp: main.py - Phiên bản HOÀN CHỈNH: Sửa lỗi thiếu kho và Cập nhật Định dạng Tra cứu SP
 
 import os
 import io
@@ -20,10 +20,13 @@ USER_ID_TO_SEND_REPORT = os.environ.get('USER_ID_TO_SEND_REPORT')
 
 # Cấu hình nghiệp vụ
 TARGET_MIN_QTY = 50
-# NOTE: Đã chuyển sang tìm kiếm theo tên/mã code để bắt tên đầy đủ trong Odoo.
+# CẬP NHẬT TÌM KIẾM KHO: Sử dụng tên đầy đủ (complete name) và tìm kiếm linh hoạt (ilike)
 LOCATION_MAP = {
+    # Dùng ilike '201/201' để bắt 'WH/Stock/201/201 HA NOI' hoặc '201/201 HA NOI'
     'HN_STOCK_CODE': '201/201', 
+    # Dùng ilike '124/124' để bắt 'WH/Stock/124/124 HCM' hoặc '124/124 HCM'
     'HCM_STOCK_CODE': '124/124', 
+    # Dùng ilike 'Kho nhập Hà Nội' để bắt tên đầy đủ của kho nhập hàng
     'HN_TRANSIT_NAME': 'Kho nhập Hà Nội', 
 }
 PRODUCT_CODE_FIELD = 'default_code'
@@ -65,46 +68,59 @@ def connect_odoo():
 
 # --- 3. Hàm chính (Logic nghiệp vụ Odoo) ---
 def get_stock_data():
-    """Lấy dữ liệu tồn kho từ Odoo bằng XML-RPC."""
+    """
+    Lấy dữ liệu tồn kho từ Odoo bằng XML-RPC.
+    SỬA LỖI: Tìm kiếm kho linh hoạt hơn bằng 'ilike' trên 'name' (hoặc 'complete_name').
+    """
     uid, models, error_msg = connect_odoo()
     if not uid:
         return None, 0, error_msg 
 
     try:
+        # Lấy Location IDs
         location_ids = {}
         
-        # Lấy HN_STOCK (201/201) - Dùng ILIKE để tìm kiếm linh hoạt hơn
+        # -----------------------------------------------------
+        # TÌM KIẾM CÁC KHO BẰNG ILIKE TRÊN DISPLAY_NAME/NAME
+        # -----------------------------------------------------
+
+        # Lấy HN_STOCK (201/201)
         loc_data = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, 'stock.location', 'search_read', 
-            [[('name', 'ilike', LOCATION_MAP['HN_STOCK_CODE'])]], 
+            [[('display_name', 'ilike', LOCATION_MAP['HN_STOCK_CODE'])]], # Tìm theo display_name LIKE
             {'fields': ['id', 'display_name']}
         )
         if loc_data: location_ids['HN_STOCK'] = {'id': loc_data[0]['id'], 'name': loc_data[0]['display_name']}
 
-        # Lấy HCM_STOCK (124/124) - Dùng ILIKE
+        # Lấy HCM_STOCK (124/124)
         loc_data = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, 'stock.location', 'search_read', 
-            [[('name', 'ilike', LOCATION_MAP['HCM_STOCK_CODE'])]], 
+            [[('display_name', 'ilike', LOCATION_MAP['HCM_STOCK_CODE'])]], # Tìm theo display_name LIKE
             {'fields': ['id', 'display_name']}
         )
         if loc_data: location_ids['HCM_STOCK'] = {'id': loc_data[0]['id'], 'name': loc_data[0]['display_name']}
 
-        # Lấy Kho nhập HN (Tìm chính xác theo tên)
+        # Lấy Kho nhập HN (Tìm theo tên hiển thị 'Kho nhập Hà Nội')
         loc_data = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, 'stock.location', 'search_read', 
-            [[('name', '=', LOCATION_MAP['HN_TRANSIT_NAME'])]], 
+            [[('display_name', 'ilike', LOCATION_MAP['HN_TRANSIT_NAME'])]], 
             {'fields': ['id', 'display_name']}
         )
-        if loc_data: location_ids['HN_TRANSIT'] = {'id': loc_data[0]['id'], 'name': loc_data[0]['display_name']}
+        # Vì có thể có nhiều kho nhập, ta ưu tiên kho có tên ngắn nhất/chính xác nhất (location.name = 'Kho nhập Hà Nội')
+        if loc_data: 
+            # Lọc ưu tiên:
+            preferred_loc = next((l for l in loc_data if l['display_name'].endswith(LOCATION_MAP['HN_TRANSIT_NAME'])), loc_data[0])
+            location_ids['HN_TRANSIT'] = {'id': preferred_loc['id'], 'name': preferred_loc['display_name']}
             
         if len(location_ids) < 3:
-            error_msg = f"Không tìm thấy đủ 3 kho cần thiết. Đã tìm thấy: {list(location_ids.keys())} - ID: {location_ids}"
+            # Sửa lỗi hiển thị chi tiết kho đã tìm thấy
+            found_keys = list(location_ids.keys())
+            found_ids = {k: v['id'] for k, v in location_ids.items()}
+            error_msg = f"Không tìm thấy đủ 3 kho cần thiết. Đã tìm thấy: {found_keys} - ID: {found_ids}"
             logger.error(error_msg)
             return None, 0, error_msg 
 
-        # ... (Phần còn lại của logic nghiệp vụ không thay đổi) ...
-
-        # Lấy danh sách tồn kho (Quant)
+        # Lấy danh sách tồn kho (Quant - Cột "Có hàng")
         all_locations_ids = [v['id'] for v in location_ids.values()]
         quant_domain = [('location_id', 'in', all_locations_ids), ('quantity', '>', 0)]
         
@@ -114,6 +130,8 @@ def get_stock_data():
             {'fields': ['product_id', 'location_id', 'quantity']}
         )
         
+        # ... (Phần còn lại của logic nghiệp vụ không thay đổi) ...
+
         # Lấy thông tin sản phẩm (Tên và Mã SP)
         product_ids = list(set([q['product_id'][0] for q in quant_data]))
         product_info = models.execute_kw(
@@ -176,7 +194,7 @@ def get_stock_data():
 async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Tra cứu nhanh tồn kho theo Mã sản phẩm (default_code).
-    Định dạng lại theo yêu cầu mới.
+    Định dạng lại theo yêu cầu mới, lấy tồn kho từ stock.quant (Có hàng).
     """
     product_code = update.message.text.strip().upper()
     await update.message.reply_text(f"Đang tra tồn cho sản phẩm `{product_code}`...", parse_mode='Markdown')
@@ -187,12 +205,12 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     try:
-        # Lấy thông tin sản phẩm và tồn kho tổng
+        # Lấy thông tin sản phẩm
         product_domain = [(PRODUCT_CODE_FIELD, '=', product_code)]
         products = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'search_read',
             [product_domain],
-            {'fields': ['display_name', 'qty_available', 'virtual_available', 'id']}
+            {'fields': ['display_name', 'id']}
         )
         
         if not products:
@@ -203,7 +221,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         product_id = product['id']
         product_name = product['display_name']
         
-        # Lấy TỒN KHO CHI TIẾT (stock.quant)
+        # Lấy TỒN KHO CHI TIẾT (stock.quant - Cột Có hàng)
         quant_domain = [('product_id', '=', product_id), ('quantity', '>', 0)]
         quant_data = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, 'stock.quant', 'search_read',
@@ -236,11 +254,14 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             
             detail_stock_list.append(f"* {loc_name}: `{int(qty)}`")
             
-            # Tính toán cho Khuyến nghị
+            # Tính toán cho Khuyến nghị (Dựa trên tên kho và ilike)
+            # HN STOCK: 201/201
             if LOCATION_MAP['HN_STOCK_CODE'] in loc_name:
                 hn_stock_qty += qty
+            # HCM STOCK: 124/124
             elif LOCATION_MAP['HCM_STOCK_CODE'] in loc_name:
                 hcm_stock_qty += qty
+            # HN TRANSIT: Kho nhập Hà Nội
             elif LOCATION_MAP['HN_TRANSIT_NAME'] in loc_name:
                 hn_transit_qty += qty
                 
@@ -260,7 +281,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         detail_stock_content = '\n'.join(detail_stock_list) if detail_stock_list else 'Không có tồn kho chi tiết lớn hơn 0.'
 
-        # Định dạng tin nhắn trả về (SỬ DỤNG TRIPLE QUOTES ĐỂ KHẮC PHỤC LỖI SYNTAX)
+        # Định dạng tin nhắn trả về
         message = f"""
 **1/ {product_code} - {product_name}**
 Tồn kho HN: `{int(hn_stock_qty)}`
@@ -268,10 +289,9 @@ Tồn kho nhập HN: `{int(hn_transit_qty)}`
 Tồn kho HCM: `{int(hcm_stock_qty)}`
 {recommendation_text}
 
-**2/ TỒN KHO CHI TIẾT (Theo kho)**
+**2/ TỒN KHO CHI TIẾT (Có hàng)**
 {detail_stock_content}
 """
-        # message = message.strip() # Giữ nguyên format trên telegram
 
         await update.message.reply_text(message, parse_mode='Markdown')
         
@@ -280,7 +300,6 @@ Tồn kho HCM: `{int(hcm_stock_qty)}`
         await update.message.reply_text(f"❌ Có lỗi xảy ra khi truy vấn Odoo: {e}")
 
 # --- 5. Các hàm khác (Không đổi) ---
-
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Kiểm tra kết nối tới Odoo."""
     await update.message.reply_text("Đang kiểm tra kết nối Odoo, xin chờ...")
