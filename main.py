@@ -1,4 +1,4 @@
-# Tệp: main.py - Phiên bản HOÀN CHỈNH: Sửa lỗi Markdown, Lọc kho không cần thiết & Định dạng TRA TỒN
+# Tệp: main.py - Phiên bản HOÀN CHỈNH: Sửa lỗi TỒN KHO HN THÔ (Lấy từ Hiện Có)
 
 import os
 import io
@@ -103,7 +103,7 @@ def find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD):
     
     return location_ids
 
-# --- 3. Hàm chính (Logic nghiệp vụ Odoo) ---
+# --- 3. Hàm chính (Logic nghiệp vụ Odoo cho /keohang) ---
 def get_stock_data():
     """Lấy dữ liệu tồn kho từ Odoo bằng XML-RPC (cho lệnh /keohang)."""
     uid, models, error_msg = connect_odoo()
@@ -123,8 +123,6 @@ def get_stock_data():
 
         # LẤY DANH SÁCH TỒN KHO (Quant - Cột "Có hàng")
         # Logic /keohang cần tồn kho tổng (HN Stock + HN Transit) để tính đề xuất
-        # Ta phải dùng stock.quant cho cả 3 kho vì đây là báo cáo tổng hợp.
-        # Lưu ý: Logic /keohang không yêu cầu tách biệt "Hiện có" hay "Có hàng", nên ta dùng chung source stock.quant cho đơn giản.
         
         all_locations_ids = [v['id'] for v in location_ids.values()]
         quant_domain = [('location_id', 'in', all_locations_ids), ('quantity', '>', 0)]
@@ -135,7 +133,7 @@ def get_stock_data():
             {'fields': ['product_id', 'location_id', 'quantity']}
         )
         
-        # ... (Phần còn lại của logic nghiệp vụ không thay đổi) ...
+        # ... (Logic còn lại giữ nguyên cho /keohang) ...
         product_ids = list(set([q['product_id'][0] for q in quant_data]))
         product_info = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'search_read',
@@ -197,11 +195,12 @@ def escape_markdown(text):
         text = text.replace(char, f'\\{char}')
     return text
 
-# --- 4. Hàm xử lý Tra Cứu Sản Phẩm (ĐÃ SỬA LOGIC TỒN KHO NHẬP HN) ---
+# --- 4. Hàm xử lý Tra Cứu Sản Phẩm (ĐÃ SỬA LOGIC TỒN KHO HN THÔ) ---
 async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Tra cứu nhanh tồn kho theo Mã sản phẩm (default_code).
-    Sử dụng Hiện có cho Kho nhập HN, Có hàng cho các kho khác.
+    Sử dụng Hiện có (qty_available) cho HN Stock và HN Transit (Mục 1).
+    Sử dụng Có hàng (quantity) cho tất cả các kho chi tiết (Mục 2).
     """
     product_code = update.message.text.strip().upper()
     await update.message.reply_text(f"đang tra tồn cho `{product_code}`, vui lòng chờ!", parse_mode='Markdown')
@@ -212,14 +211,14 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     try:
-        # TÌM LOCATION IDs CẦN THIẾT
+        # 1. TÌM LOCATION IDs CẦN THIẾT
         location_ids = find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD)
         
         hn_transit_id = location_ids.get('HN_TRANSIT', {}).get('id')
         hn_stock_id = location_ids.get('HN_STOCK', {}).get('id')
         hcm_stock_id = location_ids.get('HCM_STOCK', {}).get('id')
         
-        # 1. Lấy thông tin sản phẩm
+        # Lấy thông tin sản phẩm
         product_domain = [(PRODUCT_CODE_FIELD, '=', product_code)]
         products = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'search_read',
@@ -235,9 +234,21 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         product_id = product['id']
         product_name = product['display_name']
         
-        # 2. LẤY TỒN KHO SUMMARY (Mục 1)
+        # 2. LẤY TỒN KHO SUMMARY (Mục 1) TỪ 'qty_available' (Hiện có)
         
-        # 2a. LẤY TỒN KHO NHẬP HN (Hiện có - product.product context)
+        # 2a. LẤY TỒN KHO HN STOCK (201/201)
+        hn_stock_qty = 0
+        if hn_stock_id:
+            # Truy vấn 'qty_available' (Hiện có) cho vị trí kho 201/201
+            stock_product_info = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'read',
+                [[product_id]],
+                {'fields': ['qty_available'], 'context': {'location': hn_stock_id}}
+            )
+            if stock_product_info:
+                hn_stock_qty = stock_product_info[0].get('qty_available', 0)
+        
+        # 2b. LẤY TỒN KHO NHẬP HN (HN TRANSIT)
         hn_transit_qty = 0
         if hn_transit_id:
             # Truy vấn 'qty_available' (Hiện có) cho vị trí kho nhập
@@ -249,26 +260,17 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             if transit_product_info:
                 hn_transit_qty = transit_product_info[0].get('qty_available', 0)
 
-        # 2b. LẤY TỒN KHO HN/HCM (Có hàng - stock.quant)
-        hn_stock_qty = 0
+        # 2c. LẤY TỒN KHO HCM (124/124) (Vẫn dùng stock.quant Có hàng cho HCM)
         hcm_stock_qty = 0
+        if hcm_stock_id:
+            quant_domain_hcm = [('product_id', '=', product_id), ('quantity', '>', 0), ('location_id', '=', hcm_stock_id)]
+            quant_data_hcm = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, 'stock.quant', 'search_read',
+                [quant_domain_hcm],
+                {'fields': ['quantity']}
+            )
+            hcm_stock_qty = sum(q['quantity'] for q in quant_data_hcm)
 
-        quant_loc_ids = [lid for lid in [hn_stock_id, hcm_stock_id] if lid]
-        quant_domain = [('product_id', '=', product_id), ('quantity', '>', 0), ('location_id', 'in', quant_loc_ids)]
-        quant_data = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD, 'stock.quant', 'search_read',
-            [quant_domain],
-            {'fields': ['location_id', 'quantity']}
-        )
-        
-        for q in quant_data:
-            loc_id = q['location_id'][0]
-            qty = q['quantity']
-            
-            if loc_id == hn_stock_id:
-                hn_stock_qty += qty
-            elif loc_id == hcm_stock_id:
-                hcm_stock_qty += qty
 
         # 3. LẤY TỒN KHO CHI TIẾT (Mục 2 - Có hàng - stock.quant)
         
@@ -357,14 +359,13 @@ tồn kho nhập hà nội: `{int(hn_transit_qty)}`
 2/ tồn kho chi tiết (có hàng):
 {detail_stock_content}
 """
-        # SỬ DỤNG PARSE_MODE='MARKDOWN' ĐÃ ĐƯỢC CẬP NHẬT VÀ SỬ DỤNG ESCAPE_MARKDOWN
         await update.message.reply_text(message.strip(), parse_mode='Markdown')
         
     except Exception as e:
         logger.error(f"lỗi khi tra cứu sản phẩm xml-rpc: {e}")
         await update.message.reply_text(f"❌ có lỗi xảy ra khi truy vấn odoo: {e}.\n\n_(lỗi này có thể do ký tự đặc biệt trong tên kho hoặc truy vấn không hợp lệ)_", parse_mode='Markdown')
 
-# --- 5. Các hàm khác (Đã chuyển sang chữ thường cho tin nhắn) ---
+# --- 5. Các hàm khác (Giữ nguyên) ---
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Kiểm tra kết nối tới Odoo."""
     await update.message.reply_text("đang kiểm tra kết nối odoo, xin chờ...")
