@@ -1,4 +1,4 @@
-# Tệp: main.py - Phiên bản DỨT ĐIỂM HOÀN TOÀN: Fix lỗi cộng dồn tồn kho chi tiết bằng cách dùng ID
+# Tệp: main.py - Phiên bản CUỐI CÙNG: Fix lỗi cộng dồn tồn kho chi tiết bằng TÊN KHO ĐẦY ĐỦ
 
 import os
 import io
@@ -158,7 +158,6 @@ def get_stock_data():
                     'Tồn Kho HN': 0, 'Tồn Kho HCM': 0, 'Kho Nhập HN': 0, 'Tổng Tồn HN': 0, 'Số Lượng Đề Xuất': 0
                 }
             
-            # FIX: CỘNG DỒN SỐ LƯỢNG KHI XỬ LÝ QUANTS CHO BÁO CÁO KÉO HÀNG
             if loc_id == location_ids.get('HN_STOCK', {}).get('id'):
                 data[prod_id]['Tồn Kho HN'] += qty
             elif loc_id == location_ids.get('HCM_STOCK', {}).get('id'):
@@ -190,7 +189,7 @@ def get_stock_data():
         error_msg = f"lỗi khi truy vấn dữ liệu odoo xml-rpc: {e}"
         return None, 0, error_msg
 
-# --- 4. Hàm xử lý Tra Cứu Sản Phẩm (FIX LỖI CỘNG DỒN DÙNG ID) ---
+# --- 4. Hàm xử lý Tra Cứu Sản Phẩm (FIX TỒN KHO CHI TIẾT) ---
 async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Tra cứu nhanh tồn kho theo Mã sản phẩm (default_code).
@@ -247,7 +246,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         hcm_stock_qty = get_qty_available(hcm_stock_id)   
 
 
-        # 3. LẤY TỒN KHO CHI TIẾT (Mục 2 - Có hàng - stock.quant)
+        # 3. LẤY TỒN KHO CHI TIẾT (Mục 2 - Có hàng - stock.quant) - FIX CUỐI CÙNG
         
         quant_domain_all = [('product_id', '=', product_id), ('quantity', '>', 0)]
         quant_data_all = models.execute_kw(
@@ -262,26 +261,24 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             [[('id', 'in', location_ids_all)]],
             {'fields': ['id', 'display_name', 'usage']} 
         )
-        # Tạo map từ ID sang Tên (display_name)
+        # Tạo map từ ID sang object kho
         location_map = {loc['id']: loc for loc in location_info}
         
-        # BƯỚC FIX: Cộng dồn số lượng theo ID (đảm bảo tính chính xác)
-        stock_by_loc_id = {}
+        # FIX: Cộng dồn số lượng theo TÊN KHO (display_name)
+        # Dùng tên kho làm khóa để gom nhóm, loại bỏ sự phụ thuộc vào ID nếu Odoo trả về nhiều Quants
+        # cho cùng một kho, cùng một sản phẩm.
+        all_stock_details = {} 
         for q in quant_data_all:
             loc_id = q['location_id'][0]
             qty = q['quantity']
             loc_data = location_map.get(loc_id, {})
+            loc_name = loc_data.get('display_name', f"n/a (ID: {loc_id})")
             loc_usage = loc_data.get('usage', 'internal')
             
             # Chỉ tính các kho Internal và Transit
             if loc_usage in ['internal', 'transit']:
-                stock_by_loc_id[loc_id] = stock_by_loc_id.get(loc_id, 0) + int(qty)
-                
-        # BƯỚC CUỐI: Chuyển đổi từ ID sang Tên để hiển thị
-        all_stock_details = {} 
-        for loc_id, qty in stock_by_loc_id.items():
-            loc_name = location_map.get(loc_id, {}).get('display_name', "n/a")
-            all_stock_details[loc_name] = qty
+                # Cộng dồn số lượng dựa trên TÊN KHO
+                all_stock_details[loc_name] = all_stock_details.get(loc_name, 0) + int(qty)
 
 
         # 4. TÍNH TOÁN KHUYẾN NGHỊ VÀ FORMAT TIN NHẮN
