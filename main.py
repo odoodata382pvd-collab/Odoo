@@ -1,4 +1,4 @@
-# Tệp: main.py - Phiên bản CUỐI CÙNG: Fix lỗi cộng dồn tồn kho chi tiết bằng TÊN KHO ĐẦY ĐỦ
+# Tệp: main.py - Phiên bản DỨT ĐIỂM HOÀN TOÀN: Fix lỗi cộng dồn tồn kho chi tiết bằng ID và xử lý FLOAT
 
 import os
 import io
@@ -149,15 +149,17 @@ def get_stock_data():
         for q in quant_data:
             prod_id = q['product_id'][0]
             loc_id = q['location_id'][0]
-            qty = q['quantity']
+            # SỬ DỤNG FLOAT TRONG TÍNH TOÁN
+            qty = float(q['quantity'])
             
             if prod_id not in data and prod_id in product_map:
                 data[prod_id] = {
                     'Mã SP': product_map[prod_id].get(PRODUCT_CODE_FIELD, 'N/A'),
                     'Tên SP': product_map[prod_id]['display_name'],
-                    'Tồn Kho HN': 0, 'Tồn Kho HCM': 0, 'Kho Nhập HN': 0, 'Tổng Tồn HN': 0, 'Số Lượng Đề Xuất': 0
+                    'Tồn Kho HN': 0.0, 'Tồn Kho HCM': 0.0, 'Kho Nhập HN': 0.0, 'Tổng Tồn HN': 0.0, 'Số Lượng Đề Xuất': 0.0
                 }
             
+            # CỘNG DỒN DƯỚI DẠNG FLOAT
             if loc_id == location_ids.get('HN_STOCK', {}).get('id'):
                 data[prod_id]['Tồn Kho HN'] += qty
             elif loc_id == location_ids.get('HCM_STOCK', {}).get('id'):
@@ -179,6 +181,10 @@ def get_stock_data():
         COLUMNS_ORDER = ['Mã SP', 'Tên SP', 'Tồn Kho HN', 'Tồn Kho HCM', 'Kho Nhập HN', 'Số Lượng Đề Xuất']
         df = df[COLUMNS_ORDER]
         
+        # LÀM TRÒN KẾT QUẢ CUỐI CÙNG TRÊN DATAFRAME
+        for col in ['Tồn Kho HN', 'Tồn Kho HCM', 'Kho Nhập HN', 'Số Lượng Đề Xuất']:
+            df[col] = df[col].apply(lambda x: int(round(x)))
+
         excel_buffer = io.BytesIO()
         df.to_excel(excel_buffer, index=False, sheet_name='DeXuatKeoHang')
         excel_buffer.seek(0)
@@ -189,7 +195,7 @@ def get_stock_data():
         error_msg = f"lỗi khi truy vấn dữ liệu odoo xml-rpc: {e}"
         return None, 0, error_msg
 
-# --- 4. Hàm xử lý Tra Cứu Sản Phẩm (FIX TỒN KHO CHI TIẾT) ---
+# --- 4. Hàm xử lý Tra Cứu Sản Phẩm (FIX LỖI CỘNG DỒN FLOAT/ID) ---
 async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Tra cứu nhanh tồn kho theo Mã sản phẩm (default_code).
@@ -205,7 +211,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     try:
-        # 1. TÌM LOCATION IDs CẦN THIẾT
+        # 1. LẤY LOCATION IDs CẦN THIẾT (cho Mục 1)
         location_ids = find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD)
         
         hn_transit_id = location_ids.get('HN_TRANSIT', {}).get('id')
@@ -238,9 +244,9 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
                 [[product_id]],
                 {'fields': ['qty_available'], 'context': {'location': location_id}}
             )
-            return stock_product_info[0].get('qty_available', 0) if stock_product_info and stock_product_info[0] else 0
+            # DÙNG INT(ROUND(X)) CHO TẤT CẢ TỒN KHO
+            return int(round(stock_product_info[0].get('qty_available', 0.0))) if stock_product_info and stock_product_info[0] else 0
 
-        # Lấy số lượng "Hiện có" cho từng kho
         hn_stock_qty = get_qty_available(hn_stock_id)   
         hn_transit_qty = get_qty_available(hn_transit_id)
         hcm_stock_qty = get_qty_available(hcm_stock_id)   
@@ -261,24 +267,29 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             [[('id', 'in', location_ids_all)]],
             {'fields': ['id', 'display_name', 'usage']} 
         )
-        # Tạo map từ ID sang object kho
         location_map = {loc['id']: loc for loc in location_info}
         
-        # FIX: Cộng dồn số lượng theo TÊN KHO (display_name)
-        # Dùng tên kho làm khóa để gom nhóm, loại bỏ sự phụ thuộc vào ID nếu Odoo trả về nhiều Quants
-        # cho cùng một kho, cùng một sản phẩm.
-        all_stock_details = {} 
+        # BƯỚC FIX: Cộng dồn số lượng theo ID KHO (SỬ DỤNG FLOAT)
+        stock_by_loc_id = {}
         for q in quant_data_all:
             loc_id = q['location_id'][0]
-            qty = q['quantity']
+            # Đảm bảo dùng float
+            qty = float(q['quantity'])
             loc_data = location_map.get(loc_id, {})
-            loc_name = loc_data.get('display_name', f"n/a (ID: {loc_id})")
             loc_usage = loc_data.get('usage', 'internal')
             
             # Chỉ tính các kho Internal và Transit
             if loc_usage in ['internal', 'transit']:
-                # Cộng dồn số lượng dựa trên TÊN KHO
-                all_stock_details[loc_name] = all_stock_details.get(loc_name, 0) + int(qty)
+                stock_by_loc_id[loc_id] = stock_by_loc_id.get(loc_id, 0.0) + qty 
+                
+        # BƯỚC CUỐI: Chuyển đổi từ ID sang Tên để hiển thị (LÀM TRÒN VỀ INT)
+        all_stock_details = {} 
+        for loc_id, qty in stock_by_loc_id.items():
+            # Chỉ thêm vào nếu số lượng sau khi cộng dồn và làm tròn > 0
+            rounded_qty = int(round(qty))
+            if rounded_qty > 0:
+                loc_name = location_map.get(loc_id, {}).get('display_name', f"n/a (ID: {loc_id})")
+                all_stock_details[loc_name] = rounded_qty
 
 
         # 4. TÍNH TOÁN KHUYẾN NGHỊ VÀ FORMAT TIN NHẮN
