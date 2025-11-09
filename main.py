@@ -60,6 +60,7 @@ def keep_port_open():
         pass
 
 threading.Thread(target=keep_port_open, daemon=True).start()
+threading.Thread(target=auto_move_alert_task, daemon=True).start()
 
 # ---------------- Odoo connect ----------------
 def connect_odoo():
@@ -383,6 +384,87 @@ def main():
 
     logger.info("bot đang khởi chạy ở chế độ polling.")
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    # ====================== AUTO MOVE ALERT START ======================
+import datetime
+
+def auto_move_alert_task():
+    """Theo dõi phiếu chuyển hàng có mã 201/IN hoặc 201/OUT liên quan kho Hà Nội"""
+    logger.info("🔁 Bắt đầu theo dõi phiếu chuyển kho 201/201 Hà Nội (5 phút/lần)")
+    last_check = datetime.datetime.utcnow() - datetime.timedelta(minutes=5)
+    bot = Bot(token=TELEGRAM_TOKEN)
+    notified = set()
+
+    while True:
+        try:
+            uid, models, msg = connect_odoo()
+            if not uid:
+                logger.error(f"[MOVE ALERT] Không kết nối được Odoo: {msg}")
+                time.sleep(300)
+                continue
+
+            now = datetime.datetime.utcnow()
+            domain = [
+                ("state", "=", "done"),
+                ("write_date", ">=", (last_check - datetime.timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")),
+            ]
+            pickings = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD,
+                "stock.picking", "search_read",
+                [domain],
+                {"fields": ["name", "location_id", "location_dest_id", "move_ids_without_package", "write_date"]}
+            )
+
+            for picking in pickings:
+                name = picking.get("name", "")
+                if not name.startswith("201/OUT") and not name.startswith("201/IN"):
+                    continue
+
+                if name in notified:
+                    continue
+                notified.add(name)
+
+                source = picking.get("location_id", ["", ""])[1]
+                dest = picking.get("location_dest_id", ["", ""])[1]
+                moves = models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD,
+                    "stock.move", "read",
+                    [picking["move_ids_without_package"]],
+                    {"fields": ["product_id", "product_uom_qty"]}
+                )
+
+                for mv in moves:
+                    product_name = mv.get("product_id", ["", ""])[1]
+                    qty = mv.get("product_uom_qty", 0)
+                    if name.startswith("201/OUT"):
+                        direction = f"🔻 *Xuất khỏi kho 201/201 Kho Hà Nội*"
+                        to_loc = dest
+                    else:
+                        direction = f"🔺 *Nhập vào kho 201/201 Kho Hà Nội*"
+                        to_loc = source
+
+                    text = (
+                        f"📦 *Cập nhật chuyển kho*\n"
+                        f"Phiếu: `{name}`\n"
+                        f"{direction}\n\n"
+                        f"*Tên SP:* {product_name}\n"
+                        f"*Số lượng:* {qty}\n"
+                        f"*Địa điểm đích:* {to_loc}"
+                    )
+
+                    try:
+                        for chat_id in active_users:
+                            bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+                    except Exception as e:
+                        logger.error(f"[MOVE ALERT] Gửi cảnh báo lỗi: {e}")
+
+            last_check = now
+            time.sleep(300)  # 5 phút
+
+        except Exception as e:
+            logger.error(f"[MOVE ALERT] Lỗi vòng lặp: {e}")
+            time.sleep(300)
+# ====================== AUTO MOVE ALERT END ======================
+
 
 if __name__ == '__main__':
     main()
