@@ -392,6 +392,20 @@ def main():
 
     logger.info("bot đang khởi chạy ở chế độ polling.")
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    # Giữ Render Web Service luôn "live" mà không ảnh hưởng đến bot
+import socket
+import threading
+
+def keep_port_open():
+    s = socket.socket()
+    s.bind(("0.0.0.0", 10000))  # Render sẽ phát hiện port 10000 mở
+    s.listen(1)
+    while True:
+        conn, _ = s.accept()
+        conn.close()
+
+threading.Thread(target=keep_port_open, daemon=True).start()
+
 
 if __name__ == '__main__':
     main()
