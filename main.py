@@ -239,18 +239,18 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             {'fields': ['id', 'display_name', 'usage']}
         )
         location_map = {loc['id']: loc for loc in location_info}
+                # ✅ FIX CHUẨN: Cộng dồn đúng cột "Có hàng" (stock.quant.quantity)
+        stock_by_loc_id = {}
+        for q in quant_data_all:
+            qty = float(q.get('quantity', 0.0))
+            loc_id = q['location_id'][0]
+            loc_data = location_map.get(loc_id, {})
+            loc_usage = loc_data.get('usage', 'internal')
 
-       # ✅ FIX CHUẨN: Cộng dồn đúng cột "Có hàng" (stock.quant.quantity)
-stock_by_loc_id = {}
-for q in quant_data_all:
-    qty = float(q.get('quantity', 0.0))
-    loc_id = q['location_id'][0]
-    loc_data = location_map.get(loc_id, {})
-    loc_usage = loc_data.get('usage', 'internal')
+            # Chỉ tính kho nội bộ (internal), không cộng kho transit/ảo
+            if qty > 0 and loc_usage == 'internal':
+                stock_by_loc_id[loc_id] = stock_by_loc_id.get(loc_id, 0.0) + qty
 
-    # Chỉ tính kho nội bộ (internal), không cộng kho transit/ảo
-    if qty > 0 and loc_usage == 'internal':
-        stock_by_loc_id[loc_id] = stock_by_loc_id.get(loc_id, 0.0) + qty
 
         all_stock_details = {}
         for loc_id, qty in stock_by_loc_id.items():
