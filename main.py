@@ -5,6 +5,15 @@ from telegram import Bot
 from telegram.ext import CommandHandler, MessageHandler, filters, Application
 import logging
 
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+ODOO_URL = os.getenv("ODOO_URL")
+ODOO_DB = os.getenv("ODOO_DB")
+ODOO_USERNAME = os.getenv("ODOO_USERNAME")
+ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
+
+# Tập người dùng đã tương tác
+active_users = set()
+
 # Giữ nguyên toàn bộ phần cấu hình Odoo, token Telegram và các hàm connect_odoo() của bạn.
 
 # ===== THÊM LOGGING (nếu chưa có) =====
