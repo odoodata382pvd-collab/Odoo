@@ -71,7 +71,7 @@ def connect_odoo():
         common = xmlrpc.client.ServerProxy(common_url, context=context)
         uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
         if not uid:
-            error_message = f"đăng nhập thất bại (uid=0). kiểm tra lại user/pass/db."
+            error_message = f"Đăng nhập thất bại (uid=0). kiểm tra lại user/pass/db."
             return None, None, error_message
         models = xmlrpc.client.ServerProxy(f'{ODOO_URL_FINAL}/xmlrpc/2/object', context=context)
         return uid, models, "kết nối thành công."
@@ -210,7 +210,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             {'fields': ['display_name', 'id']}
         )
         if not products:
-            await update.message.reply_text(f"❌ không tìm thấy sản phẩm nào có mã `{product_code}`.")
+            await update.message.reply_text(f"❌ Không tìm thấy sản phẩm nào có mã `{product_code}`, ĐỒ NGOO")
             return
         product = products[0]
         product_id = product['id']
@@ -308,7 +308,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         for name, qty in priority_items + other_items:
             detail_lines.append(f"{name}: {qty}")
 
-        detail_content = "\n".join(detail_lines) if detail_lines else "không có tồn kho chi tiết lớn hơn 0."
+        detail_content = "\n".join(detail_lines) if detail_lines else "Không có tồn kho chi tiết lớn hơn 0."
 
         message = f"""{header_line}
 {summary_lines[0]}
@@ -316,42 +316,43 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
 {summary_lines[2]}
 {summary_lines[3]}
 
-2/ tồn kho chi tiết (có hàng):
+2/ Tồn kho chi tiết(Có hàng):
 {detail_content}
 """
         await update.message.reply_text(message.strip())
 
     except Exception as e:
-        logger.error(f"lỗi khi tra cứu sản phẩm xml-rpc: {e}")
-        await update.message.reply_text(f"❌ có lỗi xảy ra khi truy vấn odoo: {str(e)}")
+        logger.error(f"Lỗi khi tra cứu sản phẩm xml-rpc: {e}")
+        await update.message.reply_text(f"❌ Có lỗi xảy ra khi truy vấn odoo: {str(e)}")
 
 # ---------------- Telegram Handlers ----------------
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("đang kiểm tra kết nối odoo, xin chờ...")
+    await update.message.reply_text("Đang kiểm tra kết nối odoo, xin chờ...")
     uid, _, error_msg = connect_odoo()
     if uid:
-        await update.message.reply_text(f"✅ thành công! kết nối odoo db: {ODOO_DB} tại {ODOO_URL_RAW}. user id: {uid}")
+        await update.message.reply_text(f"✅ Thành công! kết nối odoo db: {ODOO_DB} tại {ODOO_URL_RAW}. user id: {uid}")
     else:
-        await update.message.reply_text(f"❌ lỗi! chi tiết: {error_msg}")
+        await update.message.reply_text(f"❌ Lỗi! chi tiết: {error_msg}")
 
 async def excel_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⌛️ đang xử lý dữ liệu và tạo báo cáo excel. vui lòng chờ...")
+    await update.message.reply_text("⌛️ Iem đang xử lý dữ liệu và tạo báo cáo Excel. Chờ em xíu xìu xiu nhá...")
     excel_buffer, item_count, error_msg = get_stock_data()
     if excel_buffer is None:
-        await update.message.reply_text(f"❌ lỗi kết nối odoo hoặc lỗi nghiệp vụ. chi tiết: {error_msg}")
+        await update.message.reply_text(f"❌ Lỗi kết nối odoo hoặc lỗi nghiệp vụ. chi tiết: {error_msg}")
         return
     if item_count > 0:
-        await update.message.reply_document(document=excel_buffer, filename='de_xuat_keo_hang.xlsx', caption=f"✅ hoàn thành! đã tìm thấy {item_count} sản phẩm cần kéo hàng.")
+        await update.message.reply_document(document=excel_buffer, filename='de_xuat_keo_hang.xlsx', caption=f"✅ iem đây! đã tìm thấy {item_count} sản phẩm cần kéo hàng.")
     else:
-        await update.message.reply_text(f"✅ tất cả sản phẩm đã đạt mức tồn kho tối thiểu {TARGET_MIN_QTY} tại kho hn.")
+        await update.message.reply_text(f"✅ Tất cả sản phẩm đã đạt mức tồn kho tối thiểu {TARGET_MIN_QTY} tại kho hn.")
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = update.message.from_user.first_name
     welcome_message = (
-        f"chào mừng {user_name} đến với odoo stock bot!\n\n"
-        "1. gõ mã sp (vd: i-78) để tra tồn.\n"
-        "2. dùng lệnh /keohang để tạo báo cáo excel.\n"
-        "3. dùng lệnh /ping để kiểm tra kết nối."
+        f"Chào mừng {user_name} đến với cuộc đời iem!\n\n"
+        "1. Gõ mã sp (vd: I-78) để tra tồn.\n"
+        "2. Dùng lệnh /keohang để tạo báo cáo excel.\n"
+        "3. Dùng lệnh /ping để kiểm tra kết nối."
+        "4. Không có nhu cầu thì đừng phiền iem!"
     )
     await update.message.reply_text(welcome_message)
 
