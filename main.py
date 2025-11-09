@@ -206,4 +206,13 @@ threading.Thread(target=auto_move_alert_task, daemon=True).start()
 # Giữ tiến trình chính chạy mãi để Render không kill
 while True:
     time.sleep(600)
+if __name__ == "__main__":
+    # Các thread tự động khác
+    threading.Thread(target=auto_alert_task, daemon=True).start()
+    threading.Thread(target=auto_move_alert_task, daemon=True).start()
+    threading.Thread(target=keep_port_open, daemon=True).start()
+
+    # ✅ Chạy bot Telegram chính
+    asyncio.run(main())
+
 
