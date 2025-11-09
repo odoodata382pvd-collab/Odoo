@@ -354,16 +354,42 @@ async def main():
 # ==========================================================
 # =============== CHẠY SONG SONG CÁC TÁC VỤ =================
 # ==========================================================
+# ==============================
+# 🚀 CHẠY CHƯƠNG TRÌNH CHÍNH
+# ==============================
 if __name__ == "__main__":
     logger.info("🚀 Khởi động hệ thống BOT kiểm tra tồn kho Odoo...")
 
-    # Luồng cảnh báo tồn kho sáng
-    threading.Thread(target=auto_alert_task, daemon=True).start()
+    # 🔁 Khởi chạy các luồng nền
+    threading.Thread(target=auto_alert_task, daemon=True).start()          # Cảnh báo tồn kho lúc 8h sáng
     logger.info("✅ Đã khởi chạy auto_alert_task (cảnh báo tồn kho 8h sáng).")
 
-    # Luồng cảnh báo nhập/xuất kho 201/201 mỗi 5 phút
-    threading.Thread(target=auto_move_alert_task, daemon=True).start()
+    threading.Thread(target=auto_move_alert_task, daemon=True).start()     # Theo dõi chuyển kho 201/201 mỗi 5 phút
     logger.info("✅ Đã khởi chạy auto_move_alert_task (cảnh báo chuyển kho 201/201).")
+
+    threading.Thread(target=keep_port_open, daemon=True).start()           # Giữ tiến trình Render luôn sống
+    logger.info("✅ Đã khởi chạy keep_port_open (giữ kết nối Render).")
+
+    # ✅ KHỞI CHẠY BOT TELEGRAM CHÍNH
+    try:
+        application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+        # Các lệnh điều khiển BOT
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("ping", ping))
+        application.add_handler(CommandHandler("keohang", keohang))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_stock))
+
+        # Xóa webhook cũ trước khi chạy polling
+        bot = Bot(token=TELEGRAM_TOKEN)
+        bot.delete_webhook(drop_pending_updates=True)
+        logger.info("✅ Đã xóa webhook cũ (nếu có).")
+
+        logger.info("🚀 Bot khởi động ở chế độ polling...")
+        application.run_polling(stop_signals=None)
+
+    except Exception as e:
+        logger.error(f"Lỗi khi chạy bot Telegram: {e}")
 
     # Giữ port mở cho Render
     threading.Thread(target=keep_port_open, daemon=True).start()
