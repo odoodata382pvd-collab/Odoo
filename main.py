@@ -385,6 +385,8 @@ def main():
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     # ====================== AUTO MOVE ALERT START ======================
 threading.Thread(target=auto_move_alert_task, daemon=True).start()
+
+# ====================== AUTO MOVE ALERT START ======================
 import datetime
 
 def auto_move_alert_task():
@@ -434,7 +436,25 @@ def auto_move_alert_task():
 
                 for mv in moves:
                     product_name = mv.get("product_id", ["", ""])[1]
+                    product_id = mv.get("product_id", ["", ""])[0]
                     qty = mv.get("product_uom_qty", 0)
+
+                    # 🔹 Lấy tồn kho "Có hàng" của sản phẩm tại kho 201/201
+                    try:
+                        stock_data = models.execute_kw(
+                            ODOO_DB, uid, ODOO_PASSWORD,
+                            "stock.quant", "search_read",
+                            [[
+                                ("product_id", "=", product_id),
+                                ("location_id.complete_name", "ilike", "201/201")
+                            ]],
+                            {"fields": ["available_quantity"]}
+                        )
+                        current_stock = sum(q["available_quantity"] for q in stock_data)
+                    except Exception as e:
+                        logger.error(f"[MOVE ALERT] Không lấy được tồn kho hiện tại: {e}")
+                        current_stock = 0
+
                     if name.startswith("201/OUT"):
                         direction = f"🔻 *Xuất khỏi kho 201/201 Kho Hà Nội*"
                         to_loc = dest
@@ -442,13 +462,15 @@ def auto_move_alert_task():
                         direction = f"🔺 *Nhập vào kho 201/201 Kho Hà Nội*"
                         to_loc = source
 
+                    # ✅ Nội dung tin nhắn đầy đủ
                     text = (
                         f"📦 *Cập nhật chuyển kho*\n"
                         f"Phiếu: `{name}`\n"
                         f"{direction}\n\n"
                         f"*Tên SP:* {product_name}\n"
                         f"*Số lượng:* {qty}\n"
-                        f"*Địa điểm đích:* {to_loc}"
+                        f"*Địa điểm đích:* {to_loc}\n"
+                        f"*Tồn còn lại tại kho 201/201:* {current_stock}"
                     )
 
                     try:
@@ -464,7 +486,6 @@ def auto_move_alert_task():
             logger.error(f"[MOVE ALERT] Lỗi vòng lặp: {e}")
             time.sleep(300)
 # ====================== AUTO MOVE ALERT END ======================
-
 
 if __name__ == '__main__':
     main()
