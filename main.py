@@ -60,7 +60,6 @@ def keep_port_open():
         pass
 
 threading.Thread(target=keep_port_open, daemon=True).start()
-threading.Thread(target=auto_move_alert_task, daemon=True).start()
 
 # ---------------- Odoo connect ----------------
 def connect_odoo():
@@ -385,6 +384,7 @@ def main():
     logger.info("bot đang khởi chạy ở chế độ polling.")
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     # ====================== AUTO MOVE ALERT START ======================
+threading.Thread(target=auto_move_alert_task, daemon=True).start()
 import datetime
 
 def auto_move_alert_task():
