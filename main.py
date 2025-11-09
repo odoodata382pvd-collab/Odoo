@@ -203,3 +203,7 @@ def auto_move_alert_task():
 # Bắt đầu luồng theo dõi nhập/xuất kho 201/201 mỗi 5 phút
 threading.Thread(target=auto_move_alert_task, daemon=True).start()
 # ==============================================================
+# Giữ tiến trình chính chạy mãi để Render không kill
+while True:
+    time.sleep(600)
+
