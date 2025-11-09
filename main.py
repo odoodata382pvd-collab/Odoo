@@ -28,15 +28,6 @@ active_users = set()  # danh sách các user đã tương tác, giữ nguyên lo
 # === HÀM MỚI: CẢNH BÁO PHIẾU NHẬP/XUẤT KHO 201/201 =======
 # ==========================================================
 
-def auto_move_alert_task():
-    """
-    Theo dõi các phiếu nhập hoặc xuất liên quan đến kho '201/201 Kho Hà Nội'
-    Cứ mỗi 5 phút sẽ kiểm tra lại và gửi cảnh báo nếu phát sinh phiếu mới.
-    """
-    bot = Bot(token=TELEGRAM_TOKEN)
-    logger.info("🔁 Bắt đầu theo dõi phiếu chuyển kho 201/201 Kho Hà Nội (5 phút/lần)")
-    last_check = datetime.datetime.utcnow() - datetime.timedelta(minutes=5)
-    notified = set()
 
     while True:
         try:
@@ -129,6 +120,16 @@ def auto_move_alert_task():
 # ==========================================================
 # 🚀 KHỞI ĐỘNG CHƯƠNG TRÌNH CHÍNH
 # ==========================================================
+def auto_move_alert_task():
+    """
+    Theo dõi các phiếu nhập hoặc xuất liên quan đến kho '201/201 Kho Hà Nội'
+    Cứ mỗi 5 phút sẽ kiểm tra lại và gửi cảnh báo nếu phát sinh phiếu mới.
+    """
+    bot = Bot(token=TELEGRAM_TOKEN)
+    logger.info("🔁 Bắt đầu theo dõi phiếu chuyển kho 201/201 Kho Hà Nội (5 phút/lần)")
+    last_check = datetime.datetime.utcnow() - datetime.timedelta(minutes=5)
+    notified = set()
+
 if __name__ == "__main__":
     logger.info("🚀 Khởi động hệ thống BOT kiểm tra tồn kho Odoo...")
 
