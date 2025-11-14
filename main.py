@@ -1,4 +1,4 @@
-# main.py - Phiên bản phục hồi đầy đủ + sửa đúng 2 dòng cho "tồn kho chi tiết (có hàng)"
+# main.py - Phiên bản hoàn chỉnh (gốc + tính năng kiểm tra đơn hàng .xlsx, giữ nguyên mọi logic cũ)
 import os
 import io
 import logging
@@ -325,6 +325,191 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.error(f"Lỗi khi tra cứu sản phẩm xml-rpc: {e}")
         await update.message.reply_text(f"❌ Có lỗi xảy ra khi truy vấn odoo: {str(e)}")
 
+# ---------------- New: Handle Excel order files (.xlsx) ----------------
+# Logic (Phương án B + sequential allocation per user's spec):
+# - Bot nhận file .xlsx
+# - Tự nhận diện cột mã sản phẩm và cột số lượng (từ tập tên phổ biến)
+# - Lấy tồn thực tế tại kho 201/201 (HN) cho mỗi mã (qty_available)
+# - Duyệt từng dòng theo thứ tự file: nếu tồn còn >= yêu cầu -> trừ tồn và đánh "Đủ (còn X)"
+#   nếu tồn còn < yêu cầu -> không trừ tồn, ghi "Thiếu Y, cần kéo thêm từ HCM"
+# - Trả về file y nguyên + thêm 1 cột ghi trạng thái theo Phương án B
+
+async def handle_order_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        doc = update.message.document
+        # chỉ chấp nhận xlsx
+        if not doc or not doc.file_name.lower().endswith('.xlsx'):
+            await update.message.reply_text("Vui lòng gửi file Excel định dạng .xlsx (file đơn hàng).")
+            return
+
+        await update.message.reply_text("Đã nhận file. Bắt đầu xử lý — bot đang đọc và kiểm tra tồn tại 201/201...")
+
+        # tải file về memory
+        file = await doc.get_file()
+        raw = await file.download_as_bytearray()
+        df = pd.read_excel(io.BytesIO(raw), dtype=object)  # đọc mọi cột như object để tránh lỗi
+
+        # Các tên cột ứng viên
+        code_candidates = ["Mã SP", "Ma SP", "Mã", "Ma", "Code", "code", "SKU", "Sku", "Mã_sản_phẩm", "Mã sản phẩm"]
+        qty_candidates = ["SL", "Số lượng", "So luong", "Qty", "qty", "Quantity", "Số lượng đặt"]
+
+        # tìm cột mã và cột số lượng - chọn cột đầu tiên phù hợp
+        df_columns = list(df.columns)
+        CODE_COL = None
+        QTY_COL = None
+        for c in df_columns:
+            if not CODE_COL and str(c).strip() in code_candidates:
+                CODE_COL = c
+            if not QTY_COL and str(c).strip() in qty_candidates:
+                QTY_COL = c
+            if CODE_COL and QTY_COL:
+                break
+
+        # nếu không tìm thấy bằng so khớp chính xác tên, dò theo chứa substring (case-insensitive)
+        if not CODE_COL:
+            for c in df_columns:
+                if any(k.lower() in str(c).lower() for k in code_candidates):
+                    CODE_COL = c
+                    break
+        if not QTY_COL:
+            for c in df_columns:
+                if any(k.lower() in str(c).lower() for k in qty_candidates):
+                    QTY_COL = c
+                    break
+
+        if not CODE_COL or not QTY_COL:
+            await update.message.reply_text(
+                "Bot không tự nhận diện được cột mã SP hoặc cột số lượng.\n"
+                f"Các cột hiện có: {', '.join(map(str, df_columns))}\n"
+                "Vui lòng gửi lại file với tên cột rõ ràng (ví dụ: 'Mã SP' và 'SL')."
+            )
+            return
+
+        # chuẩn hóa: thay thế NaN, chuyển qty sang số
+        df = df.fillna('')
+        # đảm bảo cột qty số
+        def parse_qty(v):
+            try:
+                if v is None or v == '':
+                    return 0.0
+                # loại bỏ các ký tự không phải số (ví dụ dấu phẩy, khoảng trắng)
+                s = str(v).replace(',', '').strip()
+                return float(s)
+            except Exception:
+                return 0.0
+
+        # danh sách mã theo thứ tự file (giữ theo từng dòng)
+        codes_list = [str(x).strip() for x in df[CODE_COL].astype(str).tolist()]
+
+        # kết nối odoo
+        uid, models, err = connect_odoo()
+        if not uid:
+            await update.message.reply_text(f"❌ Lỗi kết nối Odoo: {err}")
+            return
+
+        # tìm location ids cần thiết
+        location_ids = find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD)
+        hn_loc_id = location_ids.get('HN_STOCK', {}).get('id')
+        hcm_loc_id = location_ids.get('HCM_STOCK', {}).get('id')
+
+        if not hn_loc_id:
+            await update.message.reply_text("❌ Không tìm thấy kho 201/201 (HN) trong Odoo. Hủy thao tác.")
+            return
+
+        # Lấy danh sách mã duy nhất (giữ thứ tự xuất hiện để tối ưu truy vấn)
+        unique_codes = []
+        seen = set()
+        for c in codes_list:
+            if c and c not in seen:
+                seen.add(c)
+                unique_codes.append(c)
+
+        # Lấy tồn kho ban đầu cho từng mã (qty_available tại location HN)
+        initial_stock = {}
+        for code in unique_codes:
+            try:
+                # tìm product theo mã (default_code)
+                prod_ids = models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'search',
+                    [[(PRODUCT_CODE_FIELD, '=', code)]], {'limit': 1}
+                )
+                if not prod_ids:
+                    # không tìm thấy product -> ghi 0
+                    initial_stock[code] = 0
+                    continue
+                prod_id = prod_ids[0]
+                prod_info = models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'read',
+                    [[prod_id]],
+                    {'fields': ['qty_available'], 'context': {'location': hn_loc_id}}
+                )
+                qty = 0.0
+                if prod_info and isinstance(prod_info, list) and len(prod_info) > 0:
+                    qty = float(prod_info[0].get('qty_available', 0.0) or 0.0)
+                initial_stock[code] = int(qty)
+            except Exception as e:
+                logger.exception(f"Lỗi khi lấy tồn cho mã {code}: {e}")
+                initial_stock[code] = 0
+
+        # Tạo bản tồn tạm để phân bổ (chỉ trừ khi đủ)
+        current_stock = initial_stock.copy()
+
+        # Danh sách kết quả theo thứ tự dòng
+        result_status = []
+        # Xử lý từng dòng theo thứ tự file
+        for idx, row in df.iterrows():
+            raw_code = str(row[CODE_COL]).strip()
+            code = raw_code
+            qty_need = parse_qty(row[QTY_COL])
+
+            if not code:
+                result_status.append("Không có mã SP")
+                continue
+
+            # nếu không có product trong initial_stock (tức không tìm thấy trong Odoo)
+            if code not in initial_stock:
+                # có thể là mã rỗng hoặc lạ
+                result_status.append("Không tìm thấy SP")
+                continue
+
+            stock_before = current_stock.get(code, 0)
+
+            # Nếu đủ (stock_before >= qty_need) -> trừ và đánh 'Đủ (còn X)'
+            if stock_before >= qty_need and qty_need > 0:
+                current_stock[code] = stock_before - int(qty_need)
+                stock_after = current_stock[code]
+                result_status.append(f"Đủ (còn {int(stock_after)})")
+            elif qty_need == 0:
+                # nếu qty đặt 0 -> coi như không cần cấp
+                result_status.append("SL đặt = 0")
+            else:
+                # thiếu -> không trừ tồn, ghi note theo yêu cầu
+                missing = int(qty_need - stock_before) if qty_need > stock_before else 0
+                if stock_before <= 0:
+                    result_status.append(f"Thiếu {int(qty_need)} , cần kéo thêm từ HCM")
+                else:
+                    result_status.append(f"Thiếu {missing} , cần kéo thêm từ HCM")
+
+        # Thêm 1 cột vào DataFrame (Phương án B)
+        new_col_name = "Đi HN"  # tên cột mới tùy chỉnh theo yêu cầu
+        df[new_col_name] = result_status
+
+        # Xuất file trả lại (giữ nguyên cấu trúc + thêm cột)
+        output = io.BytesIO()
+        # giữ sheet name mặc định
+        df.to_excel(output, index=False)
+        output.seek(0)
+
+        await update.message.reply_document(
+            document=output,
+            filename=f"ket_qua_kiem_tra_{doc.file_name}",
+            caption="Kết quả kiểm tra tồn 201/201 đã hoàn tất. Cột 'Đi HN' thể hiện trạng thái (Phương án B)."
+        )
+
+    except Exception as e:
+        logger.exception(f"Lỗi khi xử lý file đơn hàng: {e}")
+        await update.message.reply_text(f"❌ Lỗi xử lý file: {str(e)}")
+
 # ---------------- Telegram Handlers ----------------
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Đang kiểm tra kết nối odoo, xin chờ...")
@@ -379,7 +564,12 @@ def main():
     application.add_handler(CommandHandler("help", start_command))
     application.add_handler(CommandHandler("ping", ping_command))
     application.add_handler(CommandHandler("keohang", excel_report_command))
+
+    # giữ nguyên: handler cho tra mã sp
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_product_code))
+
+    # thêm handler mới: file excel đơn hàng (.xlsx)
+    application.add_handler(MessageHandler(filters.Document.FILE_EXTENSION("xlsx"), handle_order_excel))
 
     logger.info("bot đang khởi chạy ở chế độ polling.")
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
