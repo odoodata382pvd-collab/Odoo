@@ -56,7 +56,6 @@ def keep_port_open():
             conn, _ = s.accept()
             conn.close()
     except Exception:
-        # nếu không bind đc (port bị chiếm) thì im lặng
         pass
 
 threading.Thread(target=keep_port_open, daemon=True).start()
@@ -113,7 +112,7 @@ def escape_markdown(text):
         text = text.replace(char, f'\\{char}')
     return text.replace('\\`', '`')
 
-# ---------------- Report /keohang (giữ nguyên logic) ----------------
+# ---------------- Report /keohang ----------------
 def get_stock_data():
     uid, models, error_msg = connect_odoo()
     if not uid:
@@ -185,7 +184,7 @@ def get_stock_data():
         error_msg = f"lỗi khi truy vấn dữ liệu odoo xml-rpc: {e}"
         return None, 0, error_msg
 
-# ---------------- Handle product code (CHỈ đổi chi tiết lấy Có hàng) ----------------
+# ---------------- Handle product code ----------------
 async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     product_code = update.message.text.strip().upper()
     await update.message.reply_text(f"đang tra tồn cho `{product_code}`, vui lòng chờ!", parse_mode='Markdown')
@@ -196,13 +195,11 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     try:
-        # Lấy location ids cần thiết
         location_ids = find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD)
         hn_transit_id = location_ids.get('HN_TRANSIT', {}).get('id')
         hn_stock_id = location_ids.get('HN_STOCK', {}).get('id')
         hcm_stock_id = location_ids.get('HCM_STOCK', {}).get('id')
 
-        # Lấy sản phẩm
         product_domain = [(PRODUCT_CODE_FIELD, '=', product_code)]
         products = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'search_read',
@@ -210,13 +207,12 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             {'fields': ['display_name', 'id']}
         )
         if not products:
-            await update.message.reply_text(f"❌ Không tìm thấy sản phẩm nào có mã `{product_code}`, ĐỒ NGOO")
+            await update.message.reply_text(f"❌ Không tìm thấy sản phẩm nào có mã `{product_code}`")
             return
         product = products[0]
         product_id = product['id']
         product_name = product['display_name']
 
-        # Summary: qty_available (Hiện có) theo từng kho
         def get_qty_available(location_id):
             if not location_id: return 0
             stock_product_info = models.execute_kw(
@@ -230,17 +226,13 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         hn_transit_qty = get_qty_available(hn_transit_id)
         hcm_stock_qty = get_qty_available(hcm_stock_id)
 
-        # Detail: lấy tồn chi tiết - CHỈ THAY ĐỔI 2 DÒNG Ở ĐÂY để dùng available_quantity
         quant_domain_all = [('product_id', '=', product_id), ('available_quantity', '>', 0)]
-
-        # ✅ Thay 1: lấy available_quantity thay vì quantity
         quant_data_all = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, 'stock.quant', 'search_read',
             [quant_domain_all],
             {'fields': ['location_id', 'available_quantity']}
         )
 
-        # Lấy tên location
         location_ids_all = list({q['location_id'][0] for q in quant_data_all if q.get('location_id')})
         if location_ids_all:
             location_info = models.execute_kw(
@@ -252,7 +244,6 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             location_info = []
         location_map = {loc['id']: loc for loc in location_info}
 
-        # ✅ Thay 2: cộng dồn theo available_quantity
         stock_by_loc_id = {}
         for q in quant_data_all:
             loc_field = q.get('location_id')
@@ -264,7 +255,6 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
                 continue
             stock_by_loc_id[loc_id] = stock_by_loc_id.get(loc_id, 0.0) + qty
 
-        # Chuyển sang tên kho và dùng int (cắt thập phân)
         all_stock_details = {}
         for loc_id, qty in stock_by_loc_id.items():
             display_name = location_map.get(loc_id, {}).get('complete_name') or location_map.get(loc_id, {}).get('display_name') or f"ID:{loc_id}"
@@ -272,7 +262,6 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             if qty_int > 0:
                 all_stock_details[display_name] = qty_int
 
-        # Tính đề xuất (giữ nguyên logic)
         total_hn_stock = hn_stock_qty + hn_transit_qty
         recommendation_qty = 0
         if total_hn_stock < TARGET_MIN_QTY:
@@ -280,7 +269,6 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             recommendation_qty = min(qty_needed, hcm_stock_qty)
         recommendation_text = f"=> đề xuất nhập thêm `{int(recommendation_qty)}` sp để hn đủ tồn `{TARGET_MIN_QTY}` sản phẩm." if recommendation_qty > 0 else f"=> tồn kho hn đã đủ (`{int(total_hn_stock)}`/{TARGET_MIN_QTY} sp)."
 
-        # Format trả về theo thứ tự bạn yêu cầu
         header_line = f"{product_code} {product_name}"
         summary_lines = [
             f"Tồn kho HN: {int(hn_stock_qty)}",
@@ -289,7 +277,6 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             recommendation_text.replace('`', '')
         ]
 
-        # Sắp xếp tồn chi tiết: ưu tiên PRIORITY_LOCATIONS (so sánh theo substring)
         priority_items = []
         other_items = []
         used_names = set()
@@ -352,7 +339,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. Gõ mã sp (vd: I-78) để tra tồn.\n"
         "2. Dùng lệnh /keohang để tạo báo cáo excel.\n"
         "3. Dùng lệnh /ping để kiểm tra kết nối."
-        
         "4. Không có nhu cầu thì đừng phiền iem!"
     )
     await update.message.reply_text(welcome_message)
@@ -382,9 +368,10 @@ def main():
     application.add_handler(CommandHandler("keohang", excel_report_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_product_code))
 
-    logger.info("bot đang khởi chạy ở chế độ polling.")
-    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-    # ---------------- HTTP server để ping bot (giữ bot tỉnh) ----------------
+    logger.info("bot đang chạy...")
+    application.run_polling()
+
+# ---------------- HTTP server để ping bot (giữ bot tỉnh) ----------------
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 class PingHandler(BaseHTTPRequestHandler):
@@ -394,6 +381,9 @@ class PingHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"Bot is alive!")
 
+    def log_message(self, format, *args):
+        return
+
 def start_http_server():
     try:
         server = HTTPServer(("0.0.0.0", 10001), PingHandler)
@@ -402,9 +392,8 @@ def start_http_server():
     except Exception as e:
         logger.error(f"Lỗi khi chạy HTTP ping server: {e}")
 
-# Chạy server trong thread riêng, không ảnh hưởng bot Telegram
 threading.Thread(target=start_http_server, daemon=True).start()
 
-
-if __name__ == '__main__':
+# ---------------- Run Main ----------------
+if __name__ == "__main__":
     main()
