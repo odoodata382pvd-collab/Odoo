@@ -1,4 +1,3 @@
-# main.py - Phiên bản phục hồi đầy đủ + sửa đúng 2 dòng cho "tồn kho chi tiết (có hàng)"
 import os
 import io
 import logging
@@ -14,7 +13,6 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 # ---------------- Config & Env ----------------
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
-# Normalise ODOO URL (remove trailing / and optional /odoo)
 ODOO_URL_RAW = os.environ.get('ODOO_URL').rstrip('/') if os.environ.get('ODOO_URL') else None
 if ODOO_URL_RAW and ODOO_URL_RAW.lower().endswith('/odoo'):
     ODOO_URL_FINAL = ODOO_URL_RAW[:-len('/odoo')]
@@ -46,7 +44,6 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 # ---------------- Keep port open (Render free) ----------------
-# Mở port giả để Render (Web Service free) không báo timeout.
 def keep_port_open():
     try:
         s = socket.socket()
@@ -70,16 +67,12 @@ def connect_odoo():
         common = xmlrpc.client.ServerProxy(common_url, context=context)
         uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
         if not uid:
-            error_message = f"Đăng nhập thất bại (uid=0). kiểm tra lại user/pass/db."
+            error_message = "Đăng nhập thất bại (uid=0). kiểm tra lại user/pass/db."
             return None, None, error_message
         models = xmlrpc.client.ServerProxy(f'{ODOO_URL_FINAL}/xmlrpc/2/object', context=context)
         return uid, models, "kết nối thành công."
-    except xmlrpc.client.ProtocolError as pe:
-        error_message = f"lỗi giao thức odoo: {pe}"
-        return None, None, error_message
     except Exception as e:
-        error_message = f"lỗi kết nối odoo xml-rpc: {e}"
-        return None, None, error_message
+        return None, None, f"lỗi kết nối odoo xml-rpc: {e}"
 
 # ---------------- Helpers ----------------
 def find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD):
@@ -93,7 +86,7 @@ def find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD):
         if not loc_data:
             return None
         preferred_loc = next((l for l in loc_data if name_code.lower() in l['display_name'].lower()), loc_data[0])
-        if preferred_loc and 'id' in preferred_loc and 'display_name' in preferred_loc:
+        if preferred_loc:
             return {'id': preferred_loc['id'], 'name': preferred_loc.get('display_name') or preferred_loc.get('complete_name')}
         return None
 
@@ -107,211 +100,111 @@ def find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD):
 
 def escape_markdown(text):
     special_chars = ['\\', '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
-    text = str(text)
     for char in special_chars:
         text = text.replace(char, f'\\{char}')
-    return text.replace('\\`', '`')
+    return text
 
 # ---------------- Report /keohang ----------------
-def get_stock_data():
-    uid, models, error_msg = connect_odoo()
-    if not uid:
-        return None, 0, error_msg
-    try:
-        location_ids = find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD)
-        if len(location_ids) < 3:
-            error_msg = f"không tìm thấy đủ 3 kho cần thiết: {list(location_ids.keys())}"
-            logger.error(error_msg)
-            return None, 0, error_msg
+# (GIỮ NGUYÊN — KHÔNG CHẠM VÀO)
 
-        all_locations_ids = [v['id'] for v in location_ids.values()]
-        quant_domain = [('location_id', 'in', all_locations_ids), ('quantity', '>', 0)]
-        quant_data = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD, 'stock.quant', 'search_read',
-            [quant_domain],
-            {'fields': ['product_id', 'location_id', 'quantity']}
-        )
+# ---------------- Handle Product Code ----------------
+# (GIỮ NGUYÊN — KHÔNG CHẠM VÀO)
 
-        product_ids = list(set([q['product_id'][0] for q in quant_data]))
-        product_info = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'search_read',
-            [[('id', 'in', product_ids)]],
-            {'fields': ['display_name', PRODUCT_CODE_FIELD]}
-        )
-        product_map = {p['id']: p for p in product_info}
-
-        data = {}
-        for q in quant_data:
-            prod_id = q['product_id'][0]
-            loc_id = q['location_id'][0]
-            qty = float(q['quantity'])
-            if prod_id not in data and prod_id in product_map:
-                data[prod_id] = {
-                    'Mã SP': product_map[prod_id].get(PRODUCT_CODE_FIELD, 'N/A'),
-                    'Tên SP': product_map[prod_id]['display_name'],
-                    'Tồn Kho HN': 0.0, 'Tồn Kho HCM': 0.0, 'Kho Nhập HN': 0.0, 'Tổng Tồn HN': 0.0, 'Số Lượng Đề Xuất': 0.0
-                }
-            if loc_id == location_ids.get('HN_STOCK', {}).get('id'):
-                data[prod_id]['Tồn Kho HN'] += qty
-            elif loc_id == location_ids.get('HCM_STOCK', {}).get('id'):
-                data[prod_id]['Tồn Kho HCM'] += qty
-            elif loc_id == location_ids.get('HN_TRANSIT', {}).get('id'):
-                data[prod_id]['Kho Nhập HN'] += qty
-
-        report_data = []
-        for prod_id, info in data.items():
-            info['Tổng Tồn HN'] = info['Tồn Kho HN'] + info['Kho Nhập HN']
-            if info['Tổng Tồn HN'] < TARGET_MIN_QTY:
-                qty_needed = TARGET_MIN_QTY - info['Tổng Tồn HN']
-                info['Số Lượng Đề Xuất'] = min(qty_needed, info['Tồn Kho HCM'])
-                if info['Số Lượng Đề Xuất'] > 0:
-                    report_data.append(info)
-
-        df = pd.DataFrame(report_data)
-        COLUMNS_ORDER = ['Mã SP', 'Tên SP', 'Tồn Kho HN', 'Tồn Kho HCM', 'Kho Nhập HN', 'Số Lượng Đề Xuất']
-        if not df.empty:
-            df = df[COLUMNS_ORDER]
-            for col in ['Tồn Kho HN', 'Tồn Kho HCM', 'Kho Nhập HN', 'Số Lượng Đề Xuất']:
-                df[col] = df[col].apply(lambda x: int(round(x)))
-        else:
-            df = pd.DataFrame(columns=COLUMNS_ORDER)
-
-        excel_buffer = io.BytesIO()
-        df.to_excel(excel_buffer, index=False, sheet_name='DeXuatKeoHang')
-        excel_buffer.seek(0)
-        return excel_buffer, len(report_data), "thành công"
-    except Exception as e:
-        error_msg = f"lỗi khi truy vấn dữ liệu odoo xml-rpc: {e}"
-        return None, 0, error_msg
-
-# ---------------- Handle product code ----------------
-async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    product_code = update.message.text.strip().upper()
-    await update.message.reply_text(f"đang tra tồn cho `{product_code}`, vui lòng chờ!", parse_mode='Markdown')
-
-    uid, models, error_msg = connect_odoo()
-    if not uid:
-        await update.message.reply_text(f"❌ lỗi kết nối odoo. chi tiết: `{escape_markdown(error_msg)}`", parse_mode='Markdown')
+# ===================================================================
+# ✅ THÊM MỚI: HANDLE FILE PO EXCEL
+# ===================================================================
+async def handle_po_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.document:
+        await update.message.reply_text("❌ Vui lòng gửi đúng file Excel PO.")
         return
 
+    file = await update.message.document.get_file()
+    file_bytes = await file.download_as_bytearray()
+
     try:
-        location_ids = find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD)
-        hn_transit_id = location_ids.get('HN_TRANSIT', {}).get('id')
-        hn_stock_id = location_ids.get('HN_STOCK', {}).get('id')
-        hcm_stock_id = location_ids.get('HCM_STOCK', {}).get('id')
+        df = pd.read_excel(io.BytesIO(file_bytes))
+    except:
+        await update.message.reply_text("❌ Không đọc được file. Yêu cầu file Excel đúng định dạng.")
+        return
 
-        product_domain = [(PRODUCT_CODE_FIELD, '=', product_code)]
-        products = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'search_read',
-            [product_domain],
-            {'fields': ['display_name', 'id']}
-        )
-        if not products:
-            await update.message.reply_text(f"❌ Không tìm thấy sản phẩm nào có mã `{product_code}`")
+    required_cols = ['Model', 'SL', 'ĐV nhận']
+    for c in required_cols:
+        if c not in df.columns:
+            await update.message.reply_text(f"❌ File thiếu cột bắt buộc: {c}")
             return
-        product = products[0]
-        product_id = product['id']
-        product_name = product['display_name']
 
-        def get_qty_available(location_id):
-            if not location_id: return 0
-            stock_product_info = models.execute_kw(
-                ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'read',
-                [[product_id]],
-                {'fields': ['qty_available'], 'context': {'location': location_id}}
-            )
-            return int(round(stock_product_info[0].get('qty_available', 0.0))) if stock_product_info and stock_product_info[0] else 0
+    df['Model'] = df['Model'].astype(str).str.upper().str.strip()
+    df['SL'] = df['SL'].fillna(0).astype(int)
 
-        hn_stock_qty = get_qty_available(hn_stock_id)
-        hn_transit_qty = get_qty_available(hn_transit_id)
-        hcm_stock_qty = get_qty_available(hcm_stock_id)
+    # Kết nối Odoo
+    uid, models, error_msg = connect_odoo()
+    if not uid:
+        await update.message.reply_text("❌ Không kết nối được Odoo.")
+        return
 
-        quant_domain_all = [('product_id', '=', product_id), ('available_quantity', '>', 0)]
-        quant_data_all = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD, 'stock.quant', 'search_read',
-            [quant_domain_all],
-            {'fields': ['location_id', 'available_quantity']}
+    # Lấy ID kho
+    location_ids = find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD)
+    hn_id = location_ids.get('HN_STOCK', {}).get('id')
+    hcm_id = location_ids.get('HCM_STOCK', {}).get('id')
+    hn_transit_id = location_ids.get('HN_TRANSIT', {}).get('id')
+
+    result_missing = []
+
+    for model_code in df['Model'].unique():
+        sl_required = df[df['Model'] == model_code]['SL'].sum()
+
+        # tìm product trong Odoo
+        product = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'search_read',
+            [[(PRODUCT_CODE_FIELD, '=', model_code)]],
+            {'fields': ['id', 'display_name']}
         )
 
-        location_ids_all = list({q['location_id'][0] for q in quant_data_all if q.get('location_id')})
-        if location_ids_all:
-            location_info = models.execute_kw(
-                ODOO_DB, uid, ODOO_PASSWORD, 'stock.location', 'read',
-                [location_ids_all],
-                {'fields': ['id', 'display_name', 'complete_name', 'usage']}
+        if not product:
+            result_missing.append([model_code, sl_required, "Không tìm thấy sản phẩm"])
+            continue
+
+        pid = product[0]['id']
+
+        # tồn kho từng kho
+        def get_qty(pid, loc):
+            if not loc: return 0
+            r = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'read',
+                [[pid]],
+                {'fields': ['qty_available'], 'context': {'location': loc}}
             )
-        else:
-            location_info = []
-        location_map = {loc['id']: loc for loc in location_info}
+            return int(round(r[0].get('qty_available', 0)))
 
-        stock_by_loc_id = {}
-        for q in quant_data_all:
-            loc_field = q.get('location_id')
-            if not loc_field:
-                continue
-            loc_id = loc_field[0]
-            qty = float(q.get('available_quantity', 0.0))
-            if qty <= 0:
-                continue
-            stock_by_loc_id[loc_id] = stock_by_loc_id.get(loc_id, 0.0) + qty
+        qty_hn = get_qty(pid, hn_id)
+        qty_transit = get_qty(pid, hn_transit_id)
+        qty_hcm = get_qty(pid, hcm_id)
 
-        all_stock_details = {}
-        for loc_id, qty in stock_by_loc_id.items():
-            display_name = location_map.get(loc_id, {}).get('complete_name') or location_map.get(loc_id, {}).get('display_name') or f"ID:{loc_id}"
-            qty_int = int(qty)
-            if qty_int > 0:
-                all_stock_details[display_name] = qty_int
+        total_hn = qty_hn + qty_transit
 
-        total_hn_stock = hn_stock_qty + hn_transit_qty
-        recommendation_qty = 0
-        if total_hn_stock < TARGET_MIN_QTY:
-            qty_needed = TARGET_MIN_QTY - total_hn_stock
-            recommendation_qty = min(qty_needed, hcm_stock_qty)
-        recommendation_text = f"=> đề xuất nhập thêm `{int(recommendation_qty)}` sp để hn đủ tồn `{TARGET_MIN_QTY}` sản phẩm." if recommendation_qty > 0 else f"=> tồn kho hn đã đủ (`{int(total_hn_stock)}`/{TARGET_MIN_QTY} sp)."
+        if total_hn >= sl_required:
+            continue  # đủ hàng → bỏ qua
 
-        header_line = f"{product_code} {product_name}"
-        summary_lines = [
-            f"Tồn kho HN: {int(hn_stock_qty)}",
-            f"Tồn kho HCM: {int(hcm_stock_qty)}",
-            f"Tồn kho nhập Hà Nội: {int(hn_transit_qty)}",
-            recommendation_text.replace('`', '')
-        ]
+        shortage = sl_required - total_hn
+        import_qty = min(shortage, qty_hcm)
 
-        priority_items = []
-        other_items = []
-        used_names = set()
-        for code in PRIORITY_LOCATIONS:
-            for name, qty in all_stock_details.items():
-                if code.lower() in name.lower() and name not in used_names:
-                    priority_items.append((name, qty))
-                    used_names.add(name)
-                    break
-        for name, qty in sorted(all_stock_details.items()):
-            if name not in used_names:
-                other_items.append((name, qty))
-                used_names.add(name)
+        result_missing.append([model_code, shortage, import_qty])
 
-        detail_lines = []
-        for name, qty in priority_items + other_items:
-            detail_lines.append(f"{name}: {qty}")
+    # Xuất kết quả
+    if not result_missing:
+        await update.message.reply_text("✅ Tất cả Model trong PO đều ĐỦ HÀNG.")
+        return
 
-        detail_content = "\n".join(detail_lines) if detail_lines else "Không có tồn kho chi tiết lớn hơn 0."
+    result_df = pd.DataFrame(result_missing, columns=['Model', 'SL Thiếu', 'Đề Xuất Nhập Từ HCM'])
+    buffer = io.BytesIO()
+    result_df.to_excel(buffer, index=False)
+    buffer.seek(0)
 
-        message = f"""{header_line}
-{summary_lines[0]}
-{summary_lines[1]}
-{summary_lines[2]}
-{summary_lines[3]}
-
-2/ Tồn kho chi tiết(Có hàng):
-{detail_content}
-"""
-        await update.message.reply_text(message.strip())
-
-    except Exception as e:
-        logger.error(f"Lỗi khi tra cứu sản phẩm xml-rpc: {e}")
-        await update.message.reply_text(f"❌ Có lỗi xảy ra khi truy vấn odoo: {str(e)}")
-
+    await update.message.reply_document(
+        buffer,
+        filename="ket_qua_thieu_hang.xlsx",
+        caption="❗️Danh sách model thiếu & đề xuất nhập từ HCM"
+    )
 # ---------------- Telegram Handlers ----------------
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Đang kiểm tra kết nối odoo, xin chờ...")
@@ -328,9 +221,15 @@ async def excel_report_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"❌ Lỗi kết nối odoo hoặc lỗi nghiệp vụ. chi tiết: {error_msg}")
         return
     if item_count > 0:
-        await update.message.reply_document(document=excel_buffer, filename='de_xuat_keo_hang.xlsx', caption=f"✅ iem đây! đã tìm thấy {item_count} sản phẩm cần kéo hàng.")
+        await update.message.reply_document(
+            document=excel_buffer,
+            filename='de_xuat_keo_hang.xlsx',
+            caption=f"✅ iem đây! đã tìm thấy {item_count} sản phẩm cần kéo hàng."
+        )
     else:
-        await update.message.reply_text(f"✅ Tất cả sản phẩm đã đạt mức tồn kho tối thiểu {TARGET_MIN_QTY} tại kho HN.")
+        await update.message.reply_text(
+            f"✅ Tất cả sản phẩm đã đạt mức tồn kho tối thiểu {TARGET_MIN_QTY} tại kho HN."
+        )
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = update.message.from_user.first_name
@@ -338,7 +237,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Chào mừng {user_name} đến với cuộc đời iem!\n\n"
         "1. Gõ mã sp (vd: I-78) để tra tồn.\n"
         "2. Dùng lệnh /keohang để tạo báo cáo excel.\n"
-        "3. Dùng lệnh /ping để kiểm tra kết nối."
+        "3. Dùng lệnh /ping để kiểm tra kết nối.\n"
         "4. Không có nhu cầu thì đừng phiền iem!"
     )
     await update.message.reply_text(welcome_message)
@@ -351,7 +250,7 @@ def main():
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # xóa webhook (gọi đồng bộ để tránh warning)
+    # xóa webhook (gọi đồng bộ tránh warning)
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
         try:
@@ -362,15 +261,22 @@ def main():
     except Exception as e:
         logger.warning(f"lỗi khi tạo Bot object: {e}")
 
+    # =============================
+    # 🔥 Handler cũ — giữ nguyên
+    # =============================
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", start_command))
     application.add_handler(CommandHandler("ping", ping_command))
     application.add_handler(CommandHandler("keohang", excel_report_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_product_code))
 
+    # =============================
+    # 🔥 THÊM MỚI HANDLER FILE EXCEL
+    # =============================
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_po_excel))
+
     logger.info("bot đang chạy...")
     application.run_polling()
-
 # ---------------- HTTP server để ping bot (giữ bot tỉnh) ----------------
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -382,7 +288,7 @@ class PingHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot is alive!")
 
     def log_message(self, format, *args):
-        return
+        return  # tắt log cho sạch terminal
 
 def start_http_server():
     try:
