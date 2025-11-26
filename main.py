@@ -1,4 +1,4 @@
-# main.py – Full bản đã tích hợp /checkexcel + FIX handler file
+# main.py – Final stable version (no errors, no algorithm changes)
 import os
 import io
 import logging
@@ -10,10 +10,12 @@ import socket
 import threading
 from telegram import Update, Bot, InputFile
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # ================= CONFIG =================
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 ODOO_URL_RAW = os.environ.get('ODOO_URL').rstrip('/') if os.environ.get('ODOO_URL') else None
+
 if ODOO_URL_RAW and ODOO_URL_RAW.lower().endswith('/odoo'):
     ODOO_URL_FINAL = ODOO_URL_RAW[:-len('/odoo')]
 else:
@@ -53,12 +55,18 @@ threading.Thread(target=keep_port_open, daemon=True).start()
 def connect_odoo():
     try:
         if not ODOO_URL_FINAL:
-            return None, None, "Thiếu biến ODOO_URL"
-        common = xmlrpc.client.ServerProxy(f"{ODOO_URL_FINAL}/xmlrpc/2/common", context=ssl._create_unverified_context())
+            return None, None, "Thiếu ODOO_URL"
+        common = xmlrpc.client.ServerProxy(
+            f"{ODOO_URL_FINAL}/xmlrpc/2/common",
+            context=ssl._create_unverified_context()
+        )
         uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
         if not uid:
-            return None, None, "Sai user/password hoặc db"
-        models = xmlrpc.client.ServerProxy(f"{ODOO_URL_FINAL}/xmlrpc/2/object", context=ssl._create_unverified_context())
+            return None, None, "Sai user / password / db"
+        models = xmlrpc.client.ServerProxy(
+            f"{ODOO_URL_FINAL}/xmlrpc/2/object",
+            context=ssl._create_unverified_context()
+        )
         return uid, models, "OK"
     except Exception as e:
         return None, None, str(e)
@@ -73,14 +81,11 @@ def find_required_location_ids(models, uid):
             [[("display_name", "ilike", name)]],
             {"fields": ["id", "display_name"]}
         )
-        if not data:
-            return None
-        return data[0]
+        return data[0] if data else None
 
     loc_ids["HN_STOCK"] = find(LOCATION_MAP["HN_STOCK_CODE"])
     loc_ids["HCM_STOCK"] = find(LOCATION_MAP["HCM_STOCK_CODE"])
     loc_ids["HN_TRANSIT"] = find(LOCATION_MAP["HN_TRANSIT_NAME"])
-
     return loc_ids
 
 # ================= /keohang (giữ nguyên) =================
@@ -92,24 +97,25 @@ def get_stock_data():
     try:
         loc = find_required_location_ids(models, uid)
         if not all(loc.values()):
-            return None, 0, "Không tìm thấy đủ 3 kho"
+            return None, 0, "Không tìm đủ 3 kho"
 
         ids = [loc[k]["id"] for k in loc]
         quants = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, "stock.quant", "search_read",
             [[("location_id", "in", ids), ("quantity", ">", 0)]],
-            {"fields": ["product_id", "location_id", "quantity"]}
+            {"fields": ["product_id", "location_id", "quantity"]},
         )
 
         prod_ids = list({q["product_id"][0] for q in quants})
         prod_info = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, "product.product", "search_read",
             [[("id", "in", prod_ids)]],
-            {"fields": ["display_name", PRODUCT_CODE_FIELD]}
+            {"fields": ["display_name", PRODUCT_CODE_FIELD]},
         )
         prod_map = {p["id"]: p for p in prod_info}
 
         data = {}
+
         for q in quants:
             pid = q["product_id"][0]
             loc_id = q["location_id"][0]
@@ -133,6 +139,7 @@ def get_stock_data():
                 data[pid]["Kho Nhập HN"] += qty
 
         output = []
+
         for pid, v in data.items():
             total_hn = v["Tồn Kho HN"] + v["Kho Nhập HN"]
             if total_hn < TARGET_MIN_QTY:
@@ -151,7 +158,7 @@ def get_stock_data():
     except Exception as e:
         return None, 0, str(e)
 
-# ================= HANDLE PRODUCT CODE (giữ nguyên logic) =================
+# ================= HANDLE PRODUCT CODE (giữ nguyên) =================
 async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = update.message.text.strip().upper()
     await update.message.reply_text(f"Đang tra tồn mã {code}...")
@@ -170,7 +177,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         prod = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, "product.product", "search_read",
             [[(PRODUCT_CODE_FIELD, "=", code)]],
-            {"fields": ["id", "display_name"]}
+            {"fields": ["id", "display_name"]},
         )
         if not prod:
             await update.message.reply_text("Không tìm thấy sản phẩm.")
@@ -182,12 +189,12 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         def q(loc_id):
             d = models.execute_kw(
                 ODOO_DB, uid, ODOO_PASSWORD, "product.product", "read",
-                [[pid]], {"fields": ["qty_available"], "context": {"location": loc_id}}
+                [[pid]],
+                {"fields": ["qty_available"], "context": {"location": loc_id}},
             )
             return int(d[0]["qty_available"]) if d else 0
 
         q_hn, q_nhap, q_hcm = q(hn), q(nhap), q(hcm)
-        total_hn = q_hn + q_nhap
 
         msg = (
             f"{code} {name}\n"
@@ -218,9 +225,7 @@ async def excel_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     file = await doc.get_file()
-    data = await file.download_as_bytearray()
-
-    df = pd.read_excel(io.BytesIO(data))
+    df = pd.read_excel(io.BytesIO(await file.download_as_bytearray()))
 
     required = ["Model", "SL", "ĐV nhận"]
     for c in required:
@@ -245,12 +250,14 @@ async def excel_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         prod = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD, "product.product", "search_read",
             [[(PRODUCT_CODE_FIELD, "=", model)]],
-            {"fields": ["id"]}
+            {"fields": ["id"]},
         )
         if not prod:
             results.append({
-                "Model": model, "SL yêu cầu": sl_req,
-                "Trạng thái": "Không tìm thấy", "Đề xuất nhập": 0,
+                "Model": model,
+                "SL yêu cầu": sl_req,
+                "Trạng thái": "Không tìm thấy",
+                "Đề xuất nhập": 0,
                 "ĐV nhận": r["ĐV nhận"]
             })
             continue
@@ -260,7 +267,8 @@ async def excel_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         def q(loc_id):
             d = models.execute_kw(
                 ODOO_DB, uid, ODOO_PASSWORD, "product.product", "read",
-                [[pid]], {"fields": ["qty_available"], "context": {"location": loc_id}}
+                [[pid]],
+                {"fields": ["qty_available"], "context": {"location": loc_id}},
             )
             return int(d[0]["qty_available"]) if d else 0
 
@@ -278,7 +286,7 @@ async def excel_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         results.append({
             "Model": model,
             "SL yêu cầu": sl_req,
-            "Tồn HN (HN+Nhập)": total_hn,
+            "Tồn HN(HN+Nhập)": total_hn,
             "Tồn HCM": q_hcm,
             "Trạng thái": status,
             "Đề xuất nhập HCM": suggest,
@@ -295,45 +303,66 @@ async def excel_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         caption="✔ Hoàn tất kiểm tra tồn."
     )
 
-# ================= START, PING =================
+# ================= REPORT =================
+async def excel_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Đang tạo báo cáo đề xuất…")
+
+    buffer, n, msg = get_stock_data()
+
+    if buffer is None:
+        await update.message.reply_text(f"❌ Lỗi: {msg}")
+        return
+
+    if n > 0:
+        await update.message.reply_document(
+            document=buffer,
+            filename="de_xuat_keo_hang.xlsx",
+            caption=f"Có {n} sản phẩm cần kéo hàng."
+        )
+    else:
+        await update.message.reply_text("Không có sản phẩm cần kéo hàng.")
+
+# ================= START / PING =================
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid, _, err = connect_odoo()
-    msg = "Kết nối OK" if uid else f"Lỗi: {err}"
-    await update.message.reply_text(msg)
+    await update.message.reply_text("Kết nối OK" if uid else f"Lỗi: {err}")
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot sẵn sàng.\n- /checkexcel để kiểm tra tồn\n- /keohang để đề xuất kéo hàng")
+    await update.message.reply_text(
+        "Bot sẵn sàng.\n"
+        "- /checkexcel để kiểm tra tồn file Excel\n"
+        "- /keohang để xuất báo cáo\n"
+        "- Gõ mã SP để tra tồn"
+    )
 
 # ================= MAIN =================
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # dọn webhook
+    # Xóa webhook
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
         asyncio.get_event_loop().run_until_complete(bot.delete_webhook())
     except:
         pass
 
-    # Lệnh
+    # Command handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", start_command))
     app.add_handler(CommandHandler("ping", ping_command))
     app.add_handler(CommandHandler("keohang", excel_report_command))
 
-    # NEW — phải đứng TRƯỚC handler text
+    # Excel mode BEFORE text handler
     app.add_handler(CommandHandler("checkexcel", checkexcel_command))
     app.add_handler(MessageHandler(filters.Document.ALL & ~filters.TEXT, excel_file_handler))
 
-    # Handler xử lý mã SP
+    # Text handler (mã SP)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_product_code))
 
-    logger.info("Bot chạy…")
+    logger.info("Bot running…")
     app.run_polling()
 
 # ================= HTTP KEEPALIVE =================
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
 class PingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
