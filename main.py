@@ -506,7 +506,7 @@ def main():
     application.add_handler(CommandHandler("checkexcel", checkexcel_command))
 
     # NEW — HANDLER NHẬN FILE EXCEL
-    application.add_handler(MessageHandler(filters.Document.FILE_EXTENSION("xlsx"), excel_file_handler))
+    application.add_handler(MessageHandler(filters.Document.ALL, excel_file_handler))
 
     # Handler cũ xử lý mã sản phẩm
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_product_code))
