@@ -199,7 +199,7 @@ def _read_po_with_auto_header(file_bytes: bytes):
     for idx in range(len(df_tmp)):
         row_values = df_tmp.iloc[idx].astype(str).str.lower()
         row_text = " ".join(row_values)
-        if any(key in row_text for key in ["mã sp", "ma sp", "mã hàng", "ma hang", "mã sản phẩm", "ma san pham", "mã hh", "ma hh"]):
+        if any(key in row_text for key in ["model", "mã sp", "ma sp", "mã hàng", "ma hang", "mã sản phẩm", "ma san pham"]):
             header_row_idx = idx
             break
 
@@ -215,11 +215,28 @@ def _read_po_with_auto_header(file_bytes: bytes):
 
 def _detect_po_columns(df: pd.DataFrame):
     """
-    Tự động dò các cột: Mã SP, SL cần giao, ĐV nhận
-    Dựa theo header trong file PO đối tác gửi.
+    Tự động nhận diện các cột: Model (Mã SP), Số lượng cần giao, Đơn vị nhận.
+
+    - ƯU TIÊN TUYỆT ĐỐI: cột 'Model'
+    - Các cột khác giữ nguyên logic dò như cũ
     """
     cols_lower = {col: str(col).strip().lower() for col in df.columns}
 
+    # 1. Ưu tiên cột "Model" (đúng chuẩn)
+    code_col = None
+    for col, lower in cols_lower.items():
+        if lower == "model":
+            code_col = col
+            break
+
+    # 2. Nếu file viết MODEL / Model / model (có khoảng trắng) vẫn nhận
+    if code_col is None:
+        for col, lower in cols_lower.items():
+            if lower.strip() == "model":
+                code_col = col
+                break
+
+    # 3. Fall-back nếu KHÔNG có Model: cố gắng tìm 'mã sp' như cũ
     def find_col(candidates):
         for col, lower in cols_lower.items():
             for key in candidates:
@@ -227,10 +244,15 @@ def _detect_po_columns(df: pd.DataFrame):
                     return col
         return None
 
-    code_col = find_col(['mã sp', 'ma sp', 'mã hàng', 'ma hang', 'mã sản phẩm', 'ma san pham', 'mã hh', 'ma hh'])
+    if code_col is None:
+        code_col = find_col(['mã sp', 'ma sp', 'mã hàng', 'ma hang', 'mã sản phẩm', 'ma san pham'])
+
+    # 4. Cột số lượng & ĐV nhận giữ nguyên cách dò
     qty_col = find_col(['sl', 'số lượng', 'so luong', 's.l', 'sl đặt', 'sl dat'])
-    recv_col = find_col(['đv nhận', 'dv nhận', 'đơn vị nhận', 'don vi nhan', 'đv nhận hàng', 'dv nhận hang',
-                         'cửa hàng nhận', 'cua hang nhan'])
+    recv_col = find_col([
+        'đv nhận', 'dv nhận', 'đơn vị nhận', 'don vi nhan',
+        'đv nhận hàng', 'dv nhận hang', 'cửa hàng nhận', 'cua hang nhan'
+    ])
 
     return code_col, qty_col, recv_col
 
@@ -272,7 +294,7 @@ def process_po_and_build_report(file_bytes: bytes):
     """
     Đọc file PO Excel, đối chiếu tồn kho và sinh file Excel kết quả.
 
-    Cột kết quả theo format chị đã OKE1:
+    Cột kết quả theo format:
     ['Mã SP','Tên SP','ĐV nhận','SL cần giao',
      'Tồn HN','Tồn Kho Nhập','Tổng tồn HN','Tồn HCM',
      'Trạng thái','SL cần kéo từ HCM','SL thiếu']
@@ -287,7 +309,7 @@ def process_po_and_build_report(file_bytes: bytes):
     code_col, qty_col, recv_col = _detect_po_columns(df_raw)
     if not code_col or not qty_col or not recv_col:
         return None, (
-            "Không xác định được đủ 3 cột [Mã SP, Số lượng, ĐV nhận].\n"
+            "Không xác định được đủ 3 cột [Model (Mã SP), Số lượng, ĐV nhận].\n"
             f"Các cột hiện có: {list(df_raw.columns)}"
         )
 
@@ -668,9 +690,11 @@ def main():
     application.add_handler(CommandHandler("help", start_command))
     application.add_handler(CommandHandler("ping", ping_command))
     application.add_handler(CommandHandler("keohang", excel_report_command))
+
     # handler mới cho /checkpo + nhận file, KHÔNG ảnh hưởng handler cũ
     application.add_handler(CommandHandler("checkpo", checkpo_command))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_po_file))
+
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_product_code))
 
     logger.info("bot đang chạy...")
