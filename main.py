@@ -633,13 +633,12 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if excel_buffer is None:
         await update.message.reply_text(f"❌ Có lỗi khi xử lý PO: {error_msg}")
         return
-
     await update.message.reply_document(
         document=excel_buffer,
         filename='kiem_tra_po.xlsx',
-        caption="
         caption="✅ Iem gửi chị file kiểm tra PO và đề xuất kéo hàng rồi nè."
-    )
+)
+
 
 # ---------------- Main ----------------
 def main():
