@@ -84,38 +84,54 @@ def connect_odoo():
 
     except Exception as e:
         return None, None, f"Lỗi kết nối: {e}"
-
 # ---------------- Helpers ----------------
+
 def find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD):
+    """
+    FIXED VERSION – nhận diện kho nhập Hà Nội chính xác hơn,
+    không phụ thuộc vào tên hiển thị cố định.
+    Giữ nguyên hoàn toàn thuật toán còn lại.
+    """
+
     out = {}
 
-    def search(key):
+    def search_by_code_or_name(keys):
         locs = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'stock.location', 'search_read',
-            [[('display_name', 'ilike', key)]],
+            [[('usage', '=', 'internal')]],
             {'fields': ['id', 'display_name', 'complete_name']}
         )
         if not locs:
             return None
 
-        for l in locs:
-            if key.lower() in l['display_name'].lower():
-                return {'id': l['id'], 'name': l['display_name']}
+        for key in keys:
+            key_low = key.lower()
+            for l in locs:
+                full = (l['complete_name'] or "").lower()
+                disp = (l['display_name'] or "").lower()
 
-        l = locs[0]
-        return {'id': l['id'], 'name': l['display_name']}
+                if key_low in disp or key_low in full:
+                    return {'id': l['id'], 'name': l['display_name']}
+        return None
 
-    hn = search(LOCATION_MAP['HN_STOCK_CODE'])
-    if hn: out['HN_STOCK'] = hn
+    # HN stock
+    out['HN_STOCK'] = search_by_code_or_name([
+        LOCATION_MAP['HN_STOCK_CODE']
+    ])
 
-    hcm = search(LOCATION_MAP['HCM_STOCK_CODE'])
-    if hcm: out['HCM_STOCK'] = hcm
+    # HCM stock
+    out['HCM_STOCK'] = search_by_code_or_name([
+        LOCATION_MAP['HCM_STOCK_CODE']
+    ])
 
-    tran = search(LOCATION_MAP['HN_TRANSIT_NAME'])
-    if tran: out['HN_TRANSIT'] = tran
+    # HN Transit — nhận diện linh hoạt
+    out['HN_TRANSIT'] = search_by_code_or_name([
+        "kho nhập", "hn transit", "hn nhập", LOCATION_MAP['HN_TRANSIT_NAME']
+    ])
 
     return out
+
 
 def escape_markdown(text):
     chars = ['\\','_','*','[',']','(',')','~','`','>','#','+','-','=','|','{','}','.','!']
@@ -123,6 +139,7 @@ def escape_markdown(text):
     for c in chars:
         text = text.replace(c, f"\\{c}")
     return text.replace('\\`', '`')
+
 # ---------------- Report /keohang ----------------
 def get_stock_data():
     uid, models, error_msg = connect_odoo()
@@ -140,14 +157,7 @@ def get_stock_data():
         hcm_id  = location_ids.get('HCM_STOCK', {}).get('id')
         tran_id = location_ids.get('HN_TRANSIT', {}).get('id')
 
-        # --------------------------
-        # LẤY TỒN KHO KHẢ DỤNG (REAL FREE STOCK)
-        # --------------------------
-        # Odoo version khác nhau:
-        # - Nếu available_quantity có → dùng luôn
-        # - Nếu không có → dùng quantity - reserved_quantity
-        # --------------------------
-
+        # -------- LẤY TỒN KHO THỰC (REAL FREE STOCK) --------
         quant_data_raw = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'stock.quant', 'search_read',
@@ -155,14 +165,12 @@ def get_stock_data():
             {'fields': ['product_id', 'location_id', 'quantity', 'reserved_quantity', 'available_quantity']}
         )
 
-        # Gom theo product
         stock_map = {}
 
         for q in quant_data_raw:
             pid = q['product_id'][0]
             loc = q['location_id'][0]
 
-            # ========== CHỈNH ĐÚNG LỖI GỐC ==========
             if 'available_quantity' in q and q.get('available_quantity') is not None:
                 real_qty = float(q.get('available_quantity', 0))
             else:
@@ -180,7 +188,6 @@ def get_stock_data():
                 stock_map[pid]['tran'] += real_qty
             elif loc == hcm_id:
                 stock_map[pid]['hcm'] += real_qty
-
         if not stock_map:
             df_empty = pd.DataFrame(columns=[
                 'Mã SP', 'Tên SP', 'Tồn Kho HN',
@@ -192,7 +199,7 @@ def get_stock_data():
             return buf, 0, "không có SP nào cần kéo"
 
         # --------------------------
-        # Lấy tên SP
+        # Lấy tên sản phẩm
         # --------------------------
         pids = list(stock_map.keys())
         product_info = models.execute_kw(
@@ -204,7 +211,7 @@ def get_stock_data():
         product_map = {p['id']: p for p in product_info}
 
         # --------------------------
-        # Build báo cáo
+        # Build báo cáo kéo hàng
         # --------------------------
         report = []
 
@@ -253,12 +260,10 @@ def get_stock_data():
         error_msg = f"lỗi khi xử lý kéo hàng: {e}"
         logger.error(error_msg)
         return None, 0, error_msg
+
+
 # ---------------- PO /checkpo helpers ----------------
 def _read_po_with_auto_header(file_bytes: bytes):
-    """
-    Đọc file PO, tự động dò dòng header (do file VHC có thể có title phía trên).
-    Trả về df_raw (DataFrame đã có header đúng) hoặc (None, error_msg) nếu lỗi.
-    """
     try:
         df_tmp = pd.read_excel(io.BytesIO(file_bytes), header=None)
     except Exception as e:
@@ -273,7 +278,6 @@ def _read_po_with_auto_header(file_bytes: bytes):
             break
 
     if header_row_idx is None:
-        # nếu không tìm thấy, dùng luôn dòng đầu tiên làm header (giống cách read_excel mặc định)
         header_row_idx = 0
 
     try:
@@ -284,29 +288,21 @@ def _read_po_with_auto_header(file_bytes: bytes):
 
 
 def _detect_po_columns(df: pd.DataFrame):
-    """
-    Tự động nhận diện các cột: Model (Mã SP), Số lượng cần giao, Đơn vị nhận.
-
-    - ƯU TIÊN TUYỆT ĐỐI: cột 'Model'
-    - Các cột khác giữ nguyên logic dò như cũ
-    """
     cols_lower = {col: str(col).strip().lower() for col in df.columns}
 
-    # 1. Ưu tiên cột "Model"
+    # ƯU TIÊN tuyệt đối cột MODEL
     code_col = None
     for col, lower in cols_lower.items():
         if lower == "model":
             code_col = col
             break
 
-    # 2. Accept MODEL / Model / model
     if code_col is None:
         for col, lower in cols_lower.items():
             if lower.strip() == "model":
                 code_col = col
                 break
 
-    # 3. fallback nếu không có Model
     def find_col(candidates):
         for col, lower in cols_lower.items():
             for key in candidates:
@@ -324,13 +320,10 @@ def _detect_po_columns(df: pd.DataFrame):
     ])
 
     return code_col, qty_col, recv_col
-
-
 def _get_stock_for_product_with_cache(models, uid, product_id, location_ids, cache):
     """
     Lấy tồn kho theo đúng logic cũ:
-    - Dùng product.product 'read' với context {'location': LOCATION_ID}
-    Trả về dict {'hn': int, 'transit': int, 'hcm': int}
+    Dùng product.product 'read' với context {'location': LOCATION_ID}
     Có cache để không gọi lại nhiều lần.
     """
     if product_id in cache:
@@ -362,9 +355,6 @@ def _get_stock_for_product_with_cache(models, uid, product_id, location_ids, cac
 
 
 def process_po_and_build_report(file_bytes: bytes):
-    """
-    Đọc file PO Excel, đối chiếu tồn kho và sinh file Excel kết quả.
-    """
     df_raw, err = _read_po_with_auto_header(file_bytes)
     if df_raw is None:
         return None, err
@@ -384,8 +374,8 @@ def process_po_and_build_report(file_bytes: bytes):
 
     df['Mã SP'] = df['Mã SP'].astype(str).str.strip().str.upper()
     df['SL cần giao'] = pd.to_numeric(df['SL cần giao'], errors='coerce').fillna(0)
-
     df = df[(df['Mã SP'] != "") & (df['SL cần giao'] > 0)]
+
     if df.empty:
         return None, "Không có dòng hợp lệ."
 
@@ -437,7 +427,6 @@ def process_po_and_build_report(file_bytes: bytes):
             name = prod['display_name']
 
             stock = _get_stock_for_product_with_cache(models, uid, pid, location_ids, stock_cache)
-
             hn = stock['hn']
             tr = stock['transit']
             hcm = stock['hcm']
@@ -511,7 +500,6 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         hn_stock_id = location_ids.get('HN_STOCK', {}).get('id')
         hcm_stock_id = location_ids.get('HCM_STOCK', {}).get('id')
 
-        # tìm sản phẩm
         products = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'product.product', 'search_read',
@@ -664,7 +652,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "2. /keohang để tạo báo cáo Excel.\n"
         "3. /ping để kiểm tra kết nối Odoo."
     )
-# ---------------- Telegram Handlers cho /checkpo ----------------
+
+
 async def checkpo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['waiting_for_po'] = True
     await update.message.reply_text(
