@@ -124,107 +124,95 @@ def escape_markdown(text):
         text = text.replace(c, f"\\{c}")
     return text.replace('\\`', '`')
 # ---------------- Report /keohang ----------------
+def _get_qty_available_for_product(models, uid, product_id, location_id):
+    """
+    Lấy tồn theo đúng logic lệnh gửi mã:
+    dùng product.product 'read' + context {location: location_id}
+    """
+    if not location_id:
+        return 0
+    info = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        'product.product', 'read',
+        [[product_id]],
+        {'fields': ['qty_available'], 'context': {'location': location_id}}
+    )
+    if info and info[0]:
+        return int(round(info[0].get('qty_available', 0.0)))
+    return 0
+
+
 def get_stock_data():
+    """
+    Hàm /keohang – nay dùng CHUNG LOGIC tồn kho với lệnh gửi mã.
+    Không đổi thuật toán kéo hàng.
+    Không đổi form trả về.
+    Chỉ thay cách lấy tồn (HN, Transit, HCM) cho chính xác.
+    """
     uid, models, error_msg = connect_odoo()
     if not uid:
         return None, 0, error_msg
 
     try:
+        # lấy 3 location giống các lệnh khác
         location_ids = find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD)
         if len(location_ids) < 3:
-            error_msg = f"không tìm thấy đủ 3 kho cần thiết: {list(location_ids.keys())}"
-            logger.error(error_msg)
-            return None, 0, error_msg
+            return None, 0, "không tìm thấy đủ 3 kho."
 
-        hn_id   = location_ids.get('HN_STOCK', {}).get('id')
-        hcm_id  = location_ids.get('HCM_STOCK', {}).get('id')
-        tran_id = location_ids.get('HN_TRANSIT', {}).get('id')
+        hn_id   = location_ids['HN_STOCK']['id']
+        tr_id   = location_ids['HN_TRANSIT']['id']
+        hcm_id  = location_ids['HCM_STOCK']['id']
 
-        # --------------------------
-        # LẤY TỒN KHO KHẢ DỤNG (REAL FREE STOCK)
-        # --------------------------
-        # Odoo version khác nhau:
-        # - Nếu available_quantity có → dùng luôn
-        # - Nếu không có → dùng quantity - reserved_quantity
-        # --------------------------
-
-        quant_data_raw = models.execute_kw(
+        # lấy tất cả sản phẩm có tồn ở 3 kho
+        quant_data = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'stock.quant', 'search_read',
-            [[('location_id', 'in', [hn_id, tran_id, hcm_id])]],
-            {'fields': ['product_id', 'location_id', 'quantity', 'reserved_quantity', 'available_quantity']}
+            [[('location_id', 'in', [hn_id, tr_id, hcm_id])]],
+            {'fields': ['product_id']}
         )
 
-        # Gom theo product
-        stock_map = {}
-
-        for q in quant_data_raw:
-            pid = q['product_id'][0]
-            loc = q['location_id'][0]
-
-            # ========== CHỈNH ĐÚNG LỖI GỐC ==========
-            if 'available_quantity' in q and q.get('available_quantity') is not None:
-                real_qty = float(q.get('available_quantity', 0))
-            else:
-                real_qty = float(q.get('quantity', 0)) - float(q.get('reserved_quantity', 0))
-
-            if real_qty <= 0:
-                continue
-
-            if pid not in stock_map:
-                stock_map[pid] = {'hn': 0, 'tran': 0, 'hcm': 0}
-
-            if loc == hn_id:
-                stock_map[pid]['hn'] += real_qty
-            elif loc == tran_id:
-                stock_map[pid]['tran'] += real_qty
-            elif loc == hcm_id:
-                stock_map[pid]['hcm'] += real_qty
-
-        if not stock_map:
-            df_empty = pd.DataFrame(columns=[
-                'Mã SP', 'Tên SP', 'Tồn Kho HN',
-                'Tồn Kho HCM', 'Kho Nhập HN', 'Số Lượng Đề Xuất'
+        if not quant_data:
+            empty = pd.DataFrame(columns=[
+                'Mã SP','Tên SP','Tồn Kho HN','Tồn Kho HCM','Kho Nhập HN','Số Lượng Đề Xuất'
             ])
             buf = io.BytesIO()
-            df_empty.to_excel(buf, index=False, sheet_name='DeXuatKeoHang')
+            empty.to_excel(buf, index=False, sheet_name="DeXuatKeoHang")
             buf.seek(0)
-            return buf, 0, "không có SP nào cần kéo"
+            return buf, 0, "không có sp nào"
 
-        # --------------------------
-        # Lấy tên SP
-        # --------------------------
-        pids = list(stock_map.keys())
+        # list product
+        product_ids = sorted(list({q['product_id'][0] for q in quant_data}))
+
         product_info = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
-            'product.product', 'search_read',
-            [[('id', 'in', pids)]],
-            {'fields': ['display_name', PRODUCT_CODE_FIELD]}
+            'product.product','search_read',
+            [[('id','in',product_ids)]],
+            {'fields':['id','display_name', PRODUCT_CODE_FIELD]}
         )
-        product_map = {p['id']: p for p in product_info}
+        pmap = {p['id']:p for p in product_info}
 
-        # --------------------------
-        # Build báo cáo
-        # --------------------------
         report = []
 
-        for pid, qtys in stock_map.items():
-            prod = product_map.get(pid)
+        # xử lý từng sản phẩm
+        for pid in product_ids:
+            prod = pmap.get(pid)
             if not prod:
                 continue
 
-            code = prod.get(PRODUCT_CODE_FIELD, '')
-            name = prod.get('display_name', '')
+            code = prod.get(PRODUCT_CODE_FIELD,'')
+            name = prod.get('display_name','')
 
-            ton_hn   = int(round(qtys['hn']))
-            ton_tran = int(round(qtys['tran']))
-            ton_hcm  = int(round(qtys['hcm']))
+            # dùng CHUNG LOGIC check tồn
+            ton_hn   = _get_qty_available_for_product(models, uid, pid, hn_id)
+            ton_tran = _get_qty_available_for_product(models, uid, pid, tr_id)
+            ton_hcm  = _get_qty_available_for_product(models, uid, pid, hcm_id)
 
             tong_hn = ton_hn + ton_tran
 
             if tong_hn < TARGET_MIN_QTY:
                 need = TARGET_MIN_QTY - tong_hn
                 de_xuat = min(need, ton_hcm)
+
                 if de_xuat > 0:
                     report.append({
                         'Mã SP': code,
@@ -236,8 +224,7 @@ def get_stock_data():
                     })
 
         df = pd.DataFrame(report)
-        cols = ['Mã SP', 'Tên SP', 'Tồn Kho HN', 'Tồn Kho HCM', 'Kho Nhập HN', 'Số Lượng Đề Xuất']
-
+        cols = ['Mã SP','Tên SP','Tồn Kho HN','Tồn Kho HCM','Kho Nhập HN','Số Lượng Đề Xuất']
         if not df.empty:
             df = df[cols]
         else:
@@ -250,9 +237,7 @@ def get_stock_data():
         return buf, len(df), "thành công"
 
     except Exception as e:
-        error_msg = f"lỗi khi xử lý kéo hàng: {e}"
-        logger.error(error_msg)
-        return None, 0, error_msg
+        return None, 0, f"lỗi khi xử lý kéo hàng: {e}"
 # ---------------- PO /checkpo helpers ----------------
 def _read_po_with_auto_header(file_bytes: bytes):
     """
@@ -273,7 +258,6 @@ def _read_po_with_auto_header(file_bytes: bytes):
             break
 
     if header_row_idx is None:
-        # nếu không tìm thấy, dùng luôn dòng đầu tiên làm header (giống cách read_excel mặc định)
         header_row_idx = 0
 
     try:
@@ -284,29 +268,20 @@ def _read_po_with_auto_header(file_bytes: bytes):
 
 
 def _detect_po_columns(df: pd.DataFrame):
-    """
-    Tự động nhận diện các cột: Model (Mã SP), Số lượng cần giao, Đơn vị nhận.
-
-    - ƯU TIÊN TUYỆT ĐỐI: cột 'Model'
-    - Các cột khác giữ nguyên logic dò như cũ
-    """
     cols_lower = {col: str(col).strip().lower() for col in df.columns}
 
-    # 1. Ưu tiên cột "Model"
     code_col = None
     for col, lower in cols_lower.items():
         if lower == "model":
             code_col = col
             break
 
-    # 2. Accept MODEL / Model / model
     if code_col is None:
         for col, lower in cols_lower.items():
             if lower.strip() == "model":
                 code_col = col
                 break
 
-    # 3. fallback nếu không có Model
     def find_col(candidates):
         for col, lower in cols_lower.items():
             for key in candidates:
@@ -328,10 +303,8 @@ def _detect_po_columns(df: pd.DataFrame):
 
 def _get_stock_for_product_with_cache(models, uid, product_id, location_ids, cache):
     """
-    Lấy tồn kho theo đúng logic cũ:
-    - Dùng product.product 'read' với context {'location': LOCATION_ID}
-    Trả về dict {'hn': int, 'transit': int, 'hcm': int}
-    Có cache để không gọi lại nhiều lần.
+    Lấy tồn kho theo logic gốc dành cho PO check:
+    - Dùng product.product read với context {'location': LOCATION_ID}
     """
     if product_id in cache:
         return cache[product_id]
@@ -362,9 +335,6 @@ def _get_stock_for_product_with_cache(models, uid, product_id, location_ids, cac
 
 
 def process_po_and_build_report(file_bytes: bytes):
-    """
-    Đọc file PO Excel, đối chiếu tồn kho và sinh file Excel kết quả.
-    """
     df_raw, err = _read_po_with_auto_header(file_bytes)
     if df_raw is None:
         return None, err
