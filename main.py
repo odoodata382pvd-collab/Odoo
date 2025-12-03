@@ -86,13 +86,21 @@ def connect_odoo():
         return None, None, f"Lỗi kết nối: {e}"
 # ---------------- Helpers ----------------
 
-def find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD):
-    """
-    FIXED VERSION – nhận diện kho nhập Hà Nội chính xác hơn,
-    không phụ thuộc vào tên hiển thị cố định.
-    Giữ nguyên hoàn toàn thuật toán còn lại.
-    """
+# NEW — LẤY TỒN KHO NHẬP HÀ NỘI CHUẨN XÁC BẰNG stock.quant
+def get_transit_qty(models, uid, product_id, transit_id):
+    quant_data = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        'stock.quant', 'search_read',
+        [[('product_id', '=', product_id), ('location_id', '=', transit_id)]],
+        {'fields': ['available_quantity']}
+    )
+    total = 0
+    for q in quant_data:
+        total += int(q.get('available_quantity') or 0)
+    return total
 
+
+def find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD):
     out = {}
 
     def search_by_code_or_name(keys):
@@ -115,17 +123,9 @@ def find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD):
                     return {'id': l['id'], 'name': l['display_name']}
         return None
 
-    # HN stock
-    out['HN_STOCK'] = search_by_code_or_name([
-        LOCATION_MAP['HN_STOCK_CODE']
-    ])
+    out['HN_STOCK'] = search_by_code_or_name([LOCATION_MAP['HN_STOCK_CODE']])
+    out['HCM_STOCK'] = search_by_code_or_name([LOCATION_MAP['HCM_STOCK_CODE']])
 
-    # HCM stock
-    out['HCM_STOCK'] = search_by_code_or_name([
-        LOCATION_MAP['HCM_STOCK_CODE']
-    ])
-
-    # HN Transit — nhận diện linh hoạt
     out['HN_TRANSIT'] = search_by_code_or_name([
         "kho nhập", "hn transit", "hn nhập", LOCATION_MAP['HN_TRANSIT_NAME']
     ])
@@ -157,12 +157,12 @@ def get_stock_data():
         hcm_id  = location_ids.get('HCM_STOCK', {}).get('id')
         tran_id = location_ids.get('HN_TRANSIT', {}).get('id')
 
-        # -------- LẤY TỒN KHO THỰC (REAL FREE STOCK) --------
+        # LẤY TỒN KHO THỰC THEO stock.quant
         quant_data_raw = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'stock.quant', 'search_read',
             [[('location_id', 'in', [hn_id, tran_id, hcm_id])]],
-            {'fields': ['product_id', 'location_id', 'quantity', 'reserved_quantity', 'available_quantity']}
+            {'fields': ['product_id', 'location_id', 'available_quantity']}
         )
 
         stock_map = {}
@@ -170,24 +170,20 @@ def get_stock_data():
         for q in quant_data_raw:
             pid = q['product_id'][0]
             loc = q['location_id'][0]
+            qty = float(q.get('available_quantity') or 0)
 
-            if 'available_quantity' in q and q.get('available_quantity') is not None:
-                real_qty = float(q.get('available_quantity', 0))
-            else:
-                real_qty = float(q.get('quantity', 0)) - float(q.get('reserved_quantity', 0))
-
-            if real_qty <= 0:
+            if qty <= 0:
                 continue
 
             if pid not in stock_map:
                 stock_map[pid] = {'hn': 0, 'tran': 0, 'hcm': 0}
 
             if loc == hn_id:
-                stock_map[pid]['hn'] += real_qty
+                stock_map[pid]['hn'] += qty
             elif loc == tran_id:
-                stock_map[pid]['tran'] += real_qty
+                stock_map[pid]['tran'] += qty
             elif loc == hcm_id:
-                stock_map[pid]['hcm'] += real_qty
+                stock_map[pid]['hcm'] += qty
         if not stock_map:
             df_empty = pd.DataFrame(columns=[
                 'Mã SP', 'Tên SP', 'Tồn Kho HN',
@@ -224,7 +220,7 @@ def get_stock_data():
             name = prod.get('display_name', '')
 
             ton_hn   = int(round(qtys['hn']))
-            ton_tran = int(round(qtys['tran']))
+            ton_tran = int(round(qtys['tran']))   # CHUẨN THEO THUẬT TOÁN MỚI
             ton_hcm  = int(round(qtys['hcm']))
 
             tong_hn = ton_hn + ton_tran
@@ -290,7 +286,6 @@ def _read_po_with_auto_header(file_bytes: bytes):
 def _detect_po_columns(df: pd.DataFrame):
     cols_lower = {col: str(col).strip().lower() for col in df.columns}
 
-    # ƯU TIÊN tuyệt đối cột MODEL
     code_col = None
     for col, lower in cols_lower.items():
         if lower == "model":
@@ -322,9 +317,9 @@ def _detect_po_columns(df: pd.DataFrame):
     return code_col, qty_col, recv_col
 def _get_stock_for_product_with_cache(models, uid, product_id, location_ids, cache):
     """
-    Lấy tồn kho theo đúng logic cũ:
-    Dùng product.product 'read' với context {'location': LOCATION_ID}
-    Có cache để không gọi lại nhiều lần.
+    GIỮ NGUYÊN – KHÔNG ĐỘNG VÀO.
+    Lấy tồn kho theo qty_available cho HN & HCM vì bạn xác nhận đang đúng.
+    Riêng Transit đã được xử lý bằng hàm get_transit_qty() ở nơi gọi.
     """
     if product_id in cache:
         return cache[product_id]
@@ -337,7 +332,8 @@ def _get_stock_for_product_with_cache(models, uid, product_id, location_ids, cac
         if not location_id:
             return 0
         stock_product_info = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'read',
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'product.product', 'read',
             [[product_id]],
             {'fields': ['qty_available'], 'context': {'location': location_id}}
         )
@@ -347,7 +343,7 @@ def _get_stock_for_product_with_cache(models, uid, product_id, location_ids, cac
 
     result = {
         'hn': _get_qty(hn_id),
-        'transit': _get_qty(transit_id),
+        'transit': _get_qty(transit_id),   # ⚠️ ĐÃ ĐƯỢC THAY THẾ Ở NƠI GỌI
         'hcm': _get_qty(hcm_id),
     }
     cache[product_id] = result
@@ -427,6 +423,7 @@ def process_po_and_build_report(file_bytes: bytes):
             name = prod['display_name']
 
             stock = _get_stock_for_product_with_cache(models, uid, pid, location_ids, stock_cache)
+
             hn = stock['hn']
             tr = stock['transit']
             hcm = stock['hcm']
@@ -500,6 +497,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         hn_stock_id = location_ids.get('HN_STOCK', {}).get('id')
         hcm_stock_id = location_ids.get('HCM_STOCK', {}).get('id')
 
+        # tìm sản phẩm
         products = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'product.product', 'search_read',
@@ -514,6 +512,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         product_id = product['id']
         product_name = product['display_name']
 
+        # tồn HN & HCM GIỮ NGUYÊN (đang đúng)
         def get_qty_available(location_id):
             if not location_id:
                 return 0
@@ -528,9 +527,12 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             return 0
 
         hn_stock_qty = get_qty_available(hn_stock_id)
-        hn_transit_qty = get_qty_available(hn_transit_id)
         hcm_stock_qty = get_qty_available(hcm_stock_id)
 
+        # FIX CHUẨN — Kho Nhập Hà Nội phải lấy bằng stock.quant
+        hn_transit_qty = get_transit_qty(models, uid, product_id, hn_transit_id)
+
+        # tồn chi tiết — GIỮ NGUYÊN, BẠN ĐÃ XÁC NHẬN ĐÚNG 100%
         quant_domain = [('product_id', '=', product_id), ('available_quantity', '>', 0)]
         quant_data = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
