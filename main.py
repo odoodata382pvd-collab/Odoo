@@ -45,7 +45,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------- Keep port open ----------------
+# ---------------- Keep port open (Render free) ----------------
 def keep_port_open():
     try:
         s = socket.socket()
@@ -59,7 +59,7 @@ def keep_port_open():
 
 threading.Thread(target=keep_port_open, daemon=True).start()
 
-# ---------------- Odoo Connect ----------------
+# ---------------- Odoo connect ----------------
 def connect_odoo():
     try:
         if not ODOO_URL_FINAL:
@@ -86,7 +86,7 @@ def connect_odoo():
         return None, None, f"Lỗi kết nối: {e}"
 # ---------------- Helpers ----------------
 
-# NEW — LẤY TỒN TRANSIT = quantity (HIỆN CÓ)
+# LẤY TỒN TRANSIT = quantity (HIỆN CÓ)
 def get_transit_qty(models, uid, product_id, transit_id):
     quant_data = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
@@ -125,7 +125,7 @@ def find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD):
     out['HN_STOCK'] = search_by_code_or_name([LOCATION_MAP['HN_STOCK_CODE']])
     out['HCM_STOCK'] = search_by_code_or_name([LOCATION_MAP['HCM_STOCK_CODE']])
 
-    # ƯU TIÊN BẮT ĐÚNG "KHO NHẬP HÀ NỘI"
+    # ƯU TIÊN BẮT ĐÚNG KHO NHẬP HÀ NỘI
     out['HN_TRANSIT'] = search_by_code_or_name([
         "kho nhập hà nội",
         "kho nhap ha noi",
@@ -144,6 +144,7 @@ def escape_markdown(text):
     for c in chars:
         text = text.replace(c, f"\\{c}")
     return text.replace('\\`', '`')
+
 
 # ---------------- Report /keohang ----------------
 def get_stock_data():
@@ -170,11 +171,11 @@ def get_stock_data():
             pid = q['product_id'][0]
             loc = q['location_id'][0]
 
-            # HN + HCM = available_quantity
+            # HN + HCM = available_quantity (GIỮ NGUYÊN)
             if loc == hn_id or loc == hcm_id:
                 qty = float(q.get('available_quantity') or 0)
 
-            # TRANSIT = quantity — Option A
+            # TRANSIT = quantity (HIỆN CÓ)
             elif loc == tran_id:
                 qty = float(q.get('quantity') or 0)
 
@@ -229,7 +230,7 @@ def get_stock_data():
             name = prod.get('display_name', '')
 
             ton_hn   = int(round(qtys['hn']))      # available_quantity
-            ton_tran = int(round(qtys['tran']))    # quantity – Option A
+            ton_tran = int(round(qtys['tran']))    # quantity (HIỆN CÓ)
             ton_hcm  = int(round(qtys['hcm']))     # available_quantity
 
             tong_hn = ton_hn + ton_tran
@@ -295,6 +296,7 @@ def _read_po_with_auto_header(file_bytes: bytes):
 def _detect_po_columns(df: pd.DataFrame):
     cols_lower = {col: str(col).strip().lower() for col in df.columns}
 
+    # Ưu tiên cột "Model"
     code_col = None
     for col, lower in cols_lower.items():
         if lower == "model":
@@ -352,7 +354,7 @@ def _get_stock_for_product_with_cache(models, uid, product_id, location_ids, cac
 
     result = {
         'hn': _get_qty(hn_id),
-        'transit': _get_qty(transit_id),  # không dùng nữa, đã thay ở nơi gọi
+        'transit': _get_qty(transit_id),  # KHÔNG DÙNG, đã thay bằng quantity ở nơi gọi
         'hcm': _get_qty(hcm_id),
     }
     cache[product_id] = result
@@ -438,7 +440,7 @@ def process_po_and_build_report(file_bytes: bytes):
             hn  = stock['hn']
             hcm = stock['hcm']
 
-            # NEW — TRANSIT = quantity (hiện có)
+            # NEW — Transit = quantity (HIỆN CÓ)
             tr = get_transit_qty(models, uid, pid, location_ids.get('HN_TRANSIT').get('id'))
 
             total_hn = hn + tr
@@ -511,7 +513,6 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         hn_transit_id = location_ids.get('HN_TRANSIT', {}).get('id')
         hcm_stock_id  = location_ids.get('HCM_STOCK', {}).get('id')
 
-        # tìm sản phẩm
         products = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'product.product', 'search_read',
@@ -526,7 +527,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         product_id = product['id']
         product_name = product['display_name']
 
-        # HN & HCM giữ nguyên — qty_available
+        # HN & HCM: qty_available — giữ nguyên
         def get_qty_available(location_id):
             if not location_id:
                 return 0
@@ -540,13 +541,13 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
                 return int(round(stock_product_info[0].get('qty_available', 0.0)))
             return 0
 
-        hn_stock_qty  = get_qty_available(hn_stock_id)
+        hn_stock_qty = get_qty_available(hn_stock_id)
         hcm_stock_qty = get_qty_available(hcm_stock_id)
 
         # NEW — Transit = quantity (HIỆN CÓ)
         hn_transit_qty = get_transit_qty(models, uid, product_id, hn_transit_id)
 
-        # tồn chi tiết — giữ nguyên 100%
+        # Tồn chi tiết — giữ nguyên (only available_quantity)
         quant_domain = [('product_id', '=', product_id), ('available_quantity', '>', 0)]
         quant_data = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
@@ -566,7 +567,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             location_info = []
 
-        loc_map = {l['id']:l for l in location_info}
+        loc_map = {l['id']: l for l in location_info}
         stock_details = {}
 
         for q in quant_data:
@@ -577,14 +578,12 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             qty = float(q.get('available_quantity', 0.0))
             if qty <= 0:
                 continue
-
-            loc_name = (
+            name_loc = (
                 loc_map.get(loc_id,{}).get('complete_name')
                 or loc_map.get(loc_id,{}).get('display_name')
                 or f"ID:{loc_id}"
             )
-
-            stock_details[loc_name] = stock_details.get(loc_name, 0) + int(qty)
+            stock_details[name_loc] = stock_details.get(name_loc,0) + int(qty)
 
         total_hn = hn_stock_qty + hn_transit_qty
 
@@ -593,7 +592,6 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             need = TARGET_MIN_QTY - total_hn
             recommend = min(need, hcm_stock_qty)
 
-        # sắp xếp ưu tiên — giữ nguyên
         priority_items = []
         other_items = []
         used = set()
@@ -692,11 +690,12 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Không nhận được file, vui lòng gửi lại file Excel (.xlsx).")
         return
 
-    if not document.file_name.lower().endswith(".xlsx"):
+    file_name = (document.file_name or "").lower()
+    if not file_name.endswith(".xlsx"):
         await update.message.reply_text("Chỉ hỗ trợ file Excel định dạng .xlsx thôi nha.")
         return
 
-    await update.message.reply_text("⌛️ Iem đang xử lý file PO...")
+    await update.message.reply_text("⌛️ Iem đang xử lý file PO, chờ em xíu xìu xiu nha...")
 
     try:
         file = await document.get_file()
@@ -707,55 +706,34 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     excel_buffer, error_msg = process_po_and_build_report(bytes(file_bytes))
     if excel_buffer is None:
-        await update.message.reply_text(f"❌ Lỗi xử lý PO: {error_msg}")
+        await update.message.reply_text(f"❌ Có lỗi xảy ra khi xử lý PO: {error_msg}")
         return
 
     await update.message.reply_document(
         document=excel_buffer,
         filename="kiem_tra_po.xlsx",
-        caption="❤️ Iem gửi chị file kiểm tra PO nè!"
+        caption="❤️ Iem gửi chị file kiểm tra PO và đối chiếu tồn kho đây ạ!"
     )
 
 
-# ---------------- Main ----------------
-def main():
-    if not TELEGRAM_TOKEN or not ODOO_URL_RAW or not ODOO_DB or not ODOO_USERNAME or not ODOO_PASSWORD:
-        logger.error("Thiếu cấu hình môi trường (token, url, db, user, pass).")
-        return
-
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    try:
-        bot = Bot(token=TELEGRAM_TOKEN)
-        asyncio.get_event_loop().run_until_complete(bot.delete_webhook())
-        logger.info("Đã xóa webhook cũ.")
-    except Exception as e:
-        logger.warning(f"Lỗi khi xóa webhook: {e}")
-
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", start_command))
-    application.add_handler(CommandHandler("ping", ping_command))
-    application.add_handler(CommandHandler("keohang", excel_report_command))
-    application.add_handler(CommandHandler("checkpo", checkpo_command))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_po_file))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_product_code))
-
-    logger.info("Bot đang chạy…")
-    application.run_polling()
-
-
-# ---------------- HTTP server giữ bot sống ----------------
+# ---------------- HTTP Server giữ bot sống + auto-ping ----------------
 from http.server import BaseHTTPRequestHandler, HTTPServer
+import requests
+import time
 
 class PingHandler(BaseHTTPRequestHandler):
-    def do_GET(self): 
-        self.send_response(200)
-        self.send_header("Content-type","text/plain")
-        self.end_headers()
-        self.wfile.write(b"Bot is alive!")
+    def do_GET(self):
+        if self.path == "/" or self.path == "/ping":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Bot is alive!")
+        else:
+            self.send_response(404)
+            self.end_headers()
 
-    def log_message(self, *args):
+    def log_message(self, format, *args):
         return
+
 
 def start_http():
     try:
@@ -765,7 +743,23 @@ def start_http():
     except Exception as e:
         logger.error(f"Lỗi HTTP server: {e}")
 
+
 threading.Thread(target=start_http, daemon=True).start()
+
+
+# 🔥 AUTO-PING 5 PHÚT 1 LẦN (KHÔNG ĐỤNG TỚI THUẬT TOÁN KHÁC)
+PING_URL = "https://google.com"  # URL bất kỳ để tạo outbound traffic
+
+def keep_alive_ping():
+    while True:
+        try:
+            requests.get(PING_URL, timeout=10)
+            logger.info("Keep-alive ping sent.")
+        except:
+            pass
+        time.sleep(300)  # 5 phút
+
+threading.Thread(target=keep_alive_ping, daemon=True).start()
 
 
 # ---------------- Run ----------------
