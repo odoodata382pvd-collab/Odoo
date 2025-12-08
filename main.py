@@ -635,19 +635,18 @@ async def checkpo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Ok, gửi file PO Excel (.xlsx) để iem kiểm tra tồn kho theo mẫu đối tác gửi nha!"
     )
 
+# ==== HÀM MỚI: AUTO XỬ LÝ MỌI FILE EXCEL GỬI VÀO ====
 async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
-    if not context.user_data.get("waiting_for_po"):
-        return
-    context.user_data["waiting_for_po"] = False
 
     document = update.message.document
     if not document:
-        await update.message.reply_text("❌ Không nhận được file. Vui lòng gửi file Excel (.xlsx).")
         return
-    if not document.file_name.lower().endswith(".xlsx"):
-        await update.message.reply_text("❌ Chỉ hỗ trợ file Excel (*.xlsx).")
+
+    file_name = (document.file_name or "").lower()
+    if not (file_name.endswith(".xlsx") or file_name.endswith(".xls")):
+        # Không phải file Excel → bỏ qua im lặng, tránh làm phiền người dùng.
         return
 
     await update.message.reply_text("⌛ Iem đang xử lý file PO...")
@@ -788,7 +787,8 @@ def watchdog_201():
                 for chat_id in get_registered_chat_ids():
                     try:
                         bot = Bot(token=TELEGRAM_TOKEN)
-                        asyncio.run(bot.send_message(chat_id, msg))
+                        # Gửi sync, KHÔNG dùng asyncio.run để tránh xung đột event loop
+                        bot.send_message(chat_id=chat_id, text=msg)
                     except Exception as e:
                         logger.error(f"Lỗi gửi thông báo cho {chat_id}: {e}")
 
