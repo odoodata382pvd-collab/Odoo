@@ -85,8 +85,6 @@ def connect_odoo():
         return uid, models, "OK"
     except Exception as e:
         return None, None, f"Lỗi kết nối Odoo: {e}"
-
-
 def get_odoo_url_components():
     if not ODOO_URL_FINAL:
         return None, None
@@ -164,7 +162,6 @@ def register_chat_id(chat_id):
 def get_registered_chat_ids():
     with CHAT_IDS_LOCK:
         return list(REGISTERED_CHAT_IDS)
-
 # ================== /KEOHANG REPORT ==================
 def get_stock_data():
     uid, models, error_msg = connect_odoo()
@@ -195,12 +192,9 @@ def get_stock_data():
             loc = q["location_id"][0]
 
             if loc == tran_id:
-                qty = float(q.get("quantity") or 0)        # Kho nhập HN = HIỆN CÓ
+                qty = float(q.get("quantity") or 0)
             else:
-                if q.get("available_quantity") is not None:
-                    qty = float(q.get("available_quantity") or 0)
-                else:
-                    qty = float(q.get("quantity") or 0) - float(q.get("reserved_quantity") or 0)
+                qty = float(q.get("available_quantity") or 0)
 
             if qty <= 0:
                 continue
@@ -300,6 +294,7 @@ def _read_po_with_auto_header(file_bytes: bytes):
     except Exception as e:
         return None, f"Lỗi đọc file PO với header dòng {header_idx+1}: {e}"
 
+
 def _detect_po_columns(df: pd.DataFrame):
     cols = {col: str(col).lower().strip() for col in df.columns}
     code_col = None
@@ -325,7 +320,6 @@ def _detect_po_columns(df: pd.DataFrame):
     qty_col = find(["sl", "số lượng", "so luong", "sl đặt", "sl dat"])
     recv_col = find(["đv nhận", "dv nhận", "đơn vị nhận", "don vi nhan", "cửa hàng nhận"])
     return code_col, qty_col, recv_col
-
 def _get_stock_for_product_with_cache(models, uid, product_id, location_ids, cache):
     if product_id in cache:
         return cache[product_id]
@@ -350,6 +344,7 @@ def _get_stock_for_product_with_cache(models, uid, product_id, location_ids, cac
     cache[product_id] = result
     return result
 
+
 def process_po_and_build_report(file_bytes: bytes):
     df_raw, err = _read_po_with_auto_header(file_bytes)
     if df_raw is None:
@@ -366,9 +361,14 @@ def process_po_and_build_report(file_bytes: bytes):
 
     df = df_raw[[code_col, qty_col, recv_col]].copy()
     df.columns = ["Mã SP", "SL cần giao", "ĐV nhận"]
-    df["Mã SP"] = df["Mã SP"].astype(str).str.strip().upper()
+
+    # ====== FIX LỖI UPPER(): đổi .upper() → .str.upper() ======
+    df["Mã SP"] = df["Mã SP"].astype(str).str.strip().str.upper()
+    # ===========================================================
+
     df["SL cần giao"] = pd.to_numeric(df["SL cần giao"], errors="coerce").fillna(0)
     df = df[(df["Mã SP"] != "") & (df["SL cần giao"] > 0)]
+
     if df.empty:
         return None, "Không có dòng hợp lệ để xử lý."
 
@@ -461,13 +461,14 @@ def process_po_and_build_report(file_bytes: bytes):
             "Trạng thái", "SL cần kéo từ HCM", "SL thiếu"
         ]
         df_out = df_out[cols]
+
         buffer = io.BytesIO()
         df_out.to_excel(buffer, index=False, sheet_name="KiemTraPO")
         buffer.seek(0)
         return buffer, None
+
     except Exception as e:
         return None, f"Lỗi xử lý PO: {e}"
-
 # ================== HANDLERS ==================
 async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
@@ -588,6 +589,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.error(f"Lỗi tra tồn: {e}")
         await update.message.reply_text(f"❌ Lỗi: {e}")
 
+
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
@@ -597,6 +599,7 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Kết nối Odoo OK (DB: {ODOO_DB})")
     else:
         await update.message.reply_text(f"❌ Lỗi: {error_msg}")
+
 
 async def excel_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
@@ -615,6 +618,7 @@ async def excel_report_command(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         await update.message.reply_text(f"Không có sản phẩm nào cần kéo hàng (tối thiểu {TARGET_MIN_QTY}).")
 
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
@@ -624,18 +628,20 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. Gõ mã SP để tra tồn.\n"
         "2. /keohang để tạo báo cáo Excel.\n"
         "3. /ping để kiểm tra kết nối Odoo.\n"
-        "4. /checkpo để kiểm tra tồn theo file PO."
+        "4. Gửi file Excel PO để bot xử lý tự động."
     )
+
 
 async def checkpo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
     context.user_data["waiting_for_po"] = True
     await update.message.reply_text(
-        "Ok, gửi file PO Excel (.xlsx) để iem kiểm tra tồn kho theo mẫu đối tác gửi nha!"
+        "Gửi file PO Excel (.xlsx) để iem kiểm tra tồn kho theo mẫu đối tác gửi nha!"
     )
 
-# ==== HÀM MỚI: AUTO XỬ LÝ MỌI FILE EXCEL GỬI VÀO ====
+
+# ================== AUTO-DETECT FILE PO ==================
 async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
@@ -646,10 +652,10 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     file_name = (document.file_name or "").lower()
     if not (file_name.endswith(".xlsx") or file_name.endswith(".xls")):
-        # Không phải file Excel → bỏ qua im lặng, tránh làm phiền người dùng.
-        return
+        return  # Không phải file Excel → bỏ qua
 
     await update.message.reply_text("⌛ Iem đang xử lý file PO...")
+
     try:
         file = await document.get_file()
         file_bytes = await file.download_as_bytearray()
@@ -668,7 +674,7 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption="❤️ Iem gửi chị file kiểm tra PO đây ạ!"
     )
 
-# ================== HTTP PING SERVER + AUTO PING ==================
+# ================== HTTP SERVER + AUTO-PING ==================
 class PingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -689,6 +695,7 @@ def start_http_server():
 
 threading.Thread(target=start_http_server, daemon=True).start()
 
+
 PING_URL = "https://google.com"
 
 def auto_ping():
@@ -701,6 +708,7 @@ def auto_ping():
         time.sleep(300)
 
 threading.Thread(target=auto_ping, daemon=True).start()
+
 
 # ================== WATCHDOG KHO 201/201 ==================
 WATCH_INTERVAL = 60
@@ -775,7 +783,7 @@ def watchdog_201():
                 status = "NHẬP KHO" if diff > 0 else "XUẤT KHO"
 
                 msg = (
-                    f"📦 Cập nhật tồn kho 201/201 – {status}\n\n"
+                    f"📦 Cập nhật tồn kho 201/২০১ – {status}\n\n"
                     f"Mã SP: {sp_code}\n"
                     f"Tên SP: {sp_name}\n"
                     f"Biến động: {'+' if diff > 0 else ''}{diff} SP\n"
@@ -787,18 +795,20 @@ def watchdog_201():
                 for chat_id in get_registered_chat_ids():
                     try:
                         bot = Bot(token=TELEGRAM_TOKEN)
-                        # Gửi sync, KHÔNG dùng asyncio.run để tránh xung đột event loop
                         bot.send_message(chat_id=chat_id, text=msg)
                     except Exception as e:
                         logger.error(f"Lỗi gửi thông báo cho {chat_id}: {e}")
 
             previous_snapshot = current_snapshot
             time.sleep(WATCH_INTERVAL)
+
         except Exception as e:
             logger.error(f"Lỗi watchdog: {e}")
             time.sleep(WATCH_INTERVAL)
 
+
 threading.Thread(target=watchdog_201, daemon=True).start()
+
 
 # ================== MAIN ==================
 def main():
@@ -820,11 +830,16 @@ def main():
     application.add_handler(CommandHandler("ping", ping_command))
     application.add_handler(CommandHandler("keohang", excel_report_command))
     application.add_handler(CommandHandler("checkpo", checkpo_command))
+
+    # Tự động xử lý mọi file Excel
     application.add_handler(MessageHandler(filters.Document.ALL, handle_po_file))
+
+    # Tra tồn
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_product_code))
 
     logger.info("Bot started!")
     application.run_polling()
+
 
 if __name__ == "__main__":
     main()
