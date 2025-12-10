@@ -14,8 +14,9 @@ from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import pytz
 
-# ---------------- Config & Env ----------------
+# ---------------- Config Environment ----------------
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 
 ODOO_URL_RAW = os.environ.get('ODOO_URL').rstrip('/') if os.environ.get('ODOO_URL') else None
@@ -31,9 +32,9 @@ ODOO_PASSWORD = os.environ.get('ODOO_PASSWORD')
 TARGET_MIN_QTY = 50
 
 LOCATION_MAP = {
-    'HN_STOCK_CODE': '201/201',             # Kho HN
-    'HCM_STOCK_CODE': '124/124',           # Kho HCM
-    'HN_TRANSIT_NAME': 'Kho nhập Hà Nội',  # Kho nhập HN
+    'HN_STOCK_CODE': '201/201',
+    'HCM_STOCK_CODE': '124/124',
+    'HN_TRANSIT_NAME': 'Kho nhập Hà Nội',
 }
 
 PRIORITY_LOCATIONS = [
@@ -119,9 +120,7 @@ def find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD):
         for l in locs:
             if key.lower() in (l['display_name'] or '').lower():
                 return {'id': l['id'], 'name': l['display_name']}
-
-        l = locs[0]
-        return {'id': l['id'], 'name': l['display_name']}
+        return {'id': locs[0]['id'], 'name': locs[0]['display_name']}
 
     hn = search(LOCATION_MAP['HN_STOCK_CODE'])
     if hn:
@@ -137,11 +136,8 @@ def find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD):
 
     return out
 
-# ---------------- Kho Nhập HN: lấy "Hiện có" (quantity) ----------------
+# ---------------- Kho Nhập HN – quantity ----------------
 def get_transit_quantity(models, uid, product_id, transit_location_id):
-    """
-    Lấy tồn Kho Nhập Hà Nội theo cột 'Hiện có' (quantity) trong stock.quant.
-    """
     if not transit_location_id:
         return 0
 
@@ -152,6 +148,7 @@ def get_transit_quantity(models, uid, product_id, transit_location_id):
           ('location_id', '=', transit_location_id)]],
         {'fields': ['quantity']}
     )
+
     total = 0
     for q in quant_data:
         total += int(q.get('quantity') or 0)
@@ -164,7 +161,7 @@ def escape_markdown(text):
         text = text.replace(c, f"\\{c}")
     return text.replace('\\`', '`')
 
-# ---------------- Chat ID Registry (cho watchdog) ----------------
+# ---------------- Chat ID Registry ----------------
 REGISTERED_CHAT_IDS = set()
 CHAT_IDS_LOCK = threading.Lock()
 
@@ -175,6 +172,7 @@ def register_chat_id(chat_id):
         cid = int(chat_id)
     except Exception:
         cid = chat_id
+
     with CHAT_IDS_LOCK:
         REGISTERED_CHAT_IDS.add(cid)
 
@@ -305,6 +303,8 @@ def get_stock_data():
     except Exception as e:
         logger.error(f"lỗi khi xử lý kéo hàng: {e}")
         return None, 0, f"lỗi khi xử lý kéo hàng: {e}"
+
+
 # ---------------- PO /checkpo helpers ----------------
 def _read_po_with_auto_header(file_bytes: bytes):
     try:
@@ -375,10 +375,6 @@ def _detect_po_columns(df: pd.DataFrame):
 
 
 def _get_stock_for_product_with_cache(models, uid, product_id, location_ids, cache):
-    """
-    HN & HCM: qty_available.
-    Transit: sẽ được lấy lại bằng get_transit_quantity() ở nơi sử dụng.
-    """
     if product_id in cache:
         return cache[product_id]
 
@@ -401,7 +397,7 @@ def _get_stock_for_product_with_cache(models, uid, product_id, location_ids, cac
 
     result = {
         'hn': _get_qty(hn_id),
-        'transit': _get_qty(transit_id),  # KHÔNG dùng nữa, chỉ giữ cho đủ cấu trúc
+        'transit': _get_qty(transit_id),
         'hcm': _get_qty(hcm_id),
     }
     cache[product_id] = result
@@ -409,9 +405,6 @@ def _get_stock_for_product_with_cache(models, uid, product_id, location_ids, cac
 
 
 def process_po_and_build_report(file_bytes: bytes):
-    """
-    Đọc file PO Excel, đối chiếu tồn kho và sinh file Excel kết quả.
-    """
     df_raw, err = _read_po_with_auto_header(file_bytes)
     if df_raw is None:
         return None, err
@@ -542,6 +535,8 @@ def process_po_and_build_report(file_bytes: bytes):
 
     except Exception as e:
         return None, f"Lỗi khi xử lý PO: {e}"
+
+
 # ---------------- Handle product code ----------------
 async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
@@ -598,11 +593,8 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         hn_stock_qty  = get_qty_available(hn_stock_id)
         hcm_stock_qty = get_qty_available(hcm_stock_id)
-
-        # Kho Nhập HN: dùng HIỆN CÓ (quantity)
         hn_transit_qty = get_transit_quantity(models, uid, product_id, hn_transit_id)
 
-        # Tồn chi tiết (CÓ HÀNG) – giữ nguyên
         quant_domain = [('product_id', '=', product_id), ('available_quantity', '>', 0)]
         quant_data = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
@@ -674,7 +666,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"Tồn kho HCM: {int(hcm_stock_qty)}\n"
             f"Tồn kho nhập Hà Nội: {int(hn_transit_qty)}\n"
             f"=> đề xuất nhập thêm {int(recommend)} sp để hn đủ tồn {TARGET_MIN_QTY} sản phẩm.\n\n"
-            f"2/ Tồn kho chi tiết(Có hàng):"
+            "2/ Tồn kho chi tiết(Có hàng):"
         )
 
         if final_list:
@@ -747,6 +739,8 @@ async def checkpo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Ok, gửi file PO Excel (.xlsx) để iem kiểm tra tồn kho theo mẫu đối tác gửi nha!"
     )
+
+
 async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
@@ -786,7 +780,8 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption="❤️ Iem gửi chị file kiểm tra PO và đối chiếu tồn kho đây ạ!"
     )
 
-# ---------------- HTTP Ping Server (giữ sống) ----------------
+
+# ---------------- HTTP Ping Server ----------------
 class PingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -797,6 +792,7 @@ class PingHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
+
 def start_http():
     try:
         server = HTTPServer(("0.0.0.0", 10001), PingHandler)
@@ -805,9 +801,10 @@ def start_http():
     except Exception as e:
         logger.error(f"Lỗi HTTP server: {e}")
 
+
 threading.Thread(target=start_http, daemon=True).start()
 
-# ---------------- AUTO-PING (không dùng requests) ----------------
+# ---------------- AUTO-PING ----------------
 PING_URL = "https://google.com"
 
 def keep_alive_ping():
@@ -819,18 +816,17 @@ def keep_alive_ping():
             logger.warning(f"Keep-alive ping failed: {e}")
         time.sleep(300)
 
-threading.Thread(target=keep_alive_ping, daemon=True).start()
-# ---------------- WATCHDOG KHO 201/201 (60s) ----------------
 
+threading.Thread(target=keep_alive_ping, daemon=True).start()
+
+# ---------------- WATCHDOG 201/201 ----------------
 WATCH_INTERVAL = 60
 previous_snapshot = {}
 
+
 def watchdog_201():
-    """
-    Theo dõi biến động tồn kho tại kho 201/201 (Kho HN – CÓ HÀNG).
-    Gửi thông báo dạng đầy đủ khi có nhập/xuất.
-    """
     global previous_snapshot
+    tz = pytz.timezone("Asia/Ho_Chi_Minh")
 
     while True:
         try:
@@ -871,11 +867,12 @@ def watchdog_201():
                 if new_qty == old_qty:
                     continue
 
-                diff = new_qty - old_qty  # + nhập, - xuất
+                diff = new_qty - old_qty
 
                 product_info = models.execute_kw(
                     ODOO_DB, uid, ODOO_PASSWORD,
-                    "product.product", "read", [[pid]],
+                    "product.product", "read",
+                    [[pid]],
                     {"fields": ["display_name", PRODUCT_CODE_FIELD]}
                 )[0]
 
@@ -886,26 +883,53 @@ def watchdog_201():
                     ODOO_DB, uid, ODOO_PASSWORD,
                     "stock.move", "search_read",
                     [[("product_id", "=", pid)]],
-                    {"fields": ["name"], "limit": 1, "order": "id desc"}
+                    {"fields": ["id", "picking_id"], "limit": 1, "order": "id desc"}
                 )
 
-                move_name = move_data[0]["name"] if move_data else "N/A"
+                picking_name = "N/A"
+                actor = "Không xác định"
+
+                if move_data:
+                    picking_info = None
+                    picking_field = move_data[0].get("picking_id")
+
+                    if picking_field:
+                        picking_id = picking_field[0]
+                        picking_info = models.execute_kw(
+                            ODOO_DB, uid, ODOO_PASSWORD,
+                            "stock.picking", "read",
+                            [[picking_id]],
+                            {"fields": ["name", "write_uid", "create_uid"]}
+                        )[0]
+
+                        picking_name = picking_info.get("name", "N/A")
+
+                        w_uid = picking_info.get("write_uid")
+                        c_uid = picking_info.get("create_uid")
+
+                        if w_uid:
+                            actor = w_uid[1]
+                        elif c_uid:
+                            actor = c_uid[1]
+
                 status = "NHẬP KHO" if diff > 0 else "XUẤT KHO"
+                now_vn = datetime.now(tz).strftime('%H:%M %d/%m/%Y')
 
                 msg = (
-                    f"📦 Cập nhật tồn kho 201/201 – {status}\n\n"
-                    f"Mã SP: {code}\n"
-                    f"Tên SP: {name}\n"
-                    f"Biến động: {'+' if diff > 0 else ''}{diff} SP\n"
-                    f"Tổng tồn sau biến động (có hàng): {new_qty} SP\n\n"
-                    f"Thời gian: {datetime.now().strftime('%H:%M %d/%m/%Y')}\n"
-                    f"Mã lệnh / ID giao dịch: {move_name}"
+                    f"📦 *Cập nhật tồn kho 201/201 – {status}*\n\n"
+                    f"*Mã SP:* {code}\n"
+                    f"*Tên SP:* {name}\n"
+                    f"*Biến động:* {'+' if diff > 0 else ''}{diff} SP\n"
+                    f"*Tổng tồn mới:* {new_qty} SP\n\n"
+                    f"*Mã lệnh:* {picking_name}\n"
+                    f"*Người thao tác:* {actor}\n"
+                    f"*Thời gian:* {now_vn}"
                 )
 
                 for chat_id in get_registered_chat_ids():
                     try:
                         bot = Bot(token=TELEGRAM_TOKEN)
-                        asyncio.run(bot.send_message(chat_id, msg))
+                        asyncio.run(bot.send_message(chat_id, msg, parse_mode="Markdown"))
                     except Exception as e:
                         logger.error(f"Lỗi gửi thông báo tới {chat_id}: {e}")
 
@@ -916,7 +940,9 @@ def watchdog_201():
             logger.error(f"Lỗi watchdog: {e}")
             time.sleep(WATCH_INTERVAL)
 
+
 threading.Thread(target=watchdog_201, daemon=True).start()
+
 
 # ---------------- MAIN ----------------
 def main():
