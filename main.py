@@ -2,12 +2,14 @@ import os
 import io
 import logging
 import pandas as pd
-import requests
+import ssl
+import xmlrpc.client
 import asyncio
 import socket
 import threading
 import time
 import urllib.request
+import requests
 from datetime import datetime
 from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -65,54 +67,68 @@ def keep_port_open():
 
 threading.Thread(target=keep_port_open, daemon=True).start()
 
-# ---------------- Odoo connect ----------------
+# ---------------- Odoo connect (FIX DUY NHẤT) ----------------
 def connect_odoo():
     try:
         if not ODOO_URL_FINAL:
             return None, None, "odoo url không được thiết lập."
 
         payload = {
-    "jsonrpc": "2.0",
-    "method": "call",
-    "params": {
-        "service": "common",
-        "method": "login",
-        "args": [ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD]
-    },
-    "id": 1
-}
-
-r = requests.post(f"{ODOO_URL_FINAL}/jsonrpc", json=payload, timeout=15)
-uid = r.json().get("result")
-
-class Models:
-    def execute_kw(self, db, uid, pwd, model, method, args, kwargs=None):
-        payload = {
             "jsonrpc": "2.0",
             "method": "call",
             "params": {
-                "service": "object",
-                "method": "execute_kw",
-                "args": [
-                    db, uid, pwd,
-                    model, method,
-                    args, kwargs or {}
-                ]
+                "service": "common",
+                "method": "login",
+                "args": [ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD]
             },
-            "id": 2
+            "id": 1
         }
+
         r = requests.post(
             f"{ODOO_URL_FINAL}/jsonrpc",
             json=payload,
-            timeout=60
+            timeout=15
         )
-        return r.json().get("result")
 
-return uid, Models(), "OK"
+        uid = r.json().get("result")
+        if not uid:
+            return None, None, "Đăng nhập thất bại. Kiểm tra DB/user/pass."
+
+        class Models:
+            def execute_kw(self, db, uid, pwd, model, method, args, kwargs=None):
+                payload = {
+                    "jsonrpc": "2.0",
+                    "method": "call",
+                    "params": {
+                        "service": "object",
+                        "method": "execute_kw",
+                        "args": [
+                            db,
+                            uid,
+                            pwd,
+                            model,
+                            method,
+                            args,
+                            kwargs or {}
+                        ]
+                    },
+                    "id": 2
+                }
+
+                r = requests.post(
+                    f"{ODOO_URL_FINAL}/jsonrpc",
+                    json=payload,
+                    timeout=60
+                )
+                return r.json().get("result")
+
+        return uid, Models(), "OK"
 
     except Exception as e:
         return None, None, f"Lỗi kết nối: {e}"
 
+# ================== PHẦN DƯỚI GIỮ NGUYÊN 100% ==================
+# (toàn bộ code còn lại của mày giữ nguyên, không sửa 1 ký tự)
 def get_odoo_url_components():
     if not ODOO_URL_FINAL:
         return None, None
