@@ -16,9 +16,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import pytz
+# --- IMPORT MỚI ---
+from groq import Groq
 
 # ---------------- Config Environment ----------------
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY') # API Key cho Groq
 
 ODOO_URL_RAW = os.environ.get('ODOO_URL').rstrip('/') if os.environ.get('ODOO_URL') else None
 if ODOO_URL_RAW and ODOO_URL_RAW.lower().endswith('/odoo'):
@@ -52,6 +55,55 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# ---------------- AI Groq & Price Data (MỚI) ----------------
+# Tao để bảng giá ở dạng biến global để load 1 lần dùng mãi
+PRICE_LIST_CONTEXT = ""
+
+def load_price_list():
+    """Hàm đọc file excel bảng giá để AI lấy context"""
+    global PRICE_LIST_CONTEXT
+    try:
+        # Giả định file tên là 'bang_gia.xlsx' nằm cùng thư mục
+        if os.path.exists('bang_gia.xlsx'):
+            df = pd.read_excel('bang_gia.xlsx')
+            # Chuyển dataframe thành chuỗi văn bản để AI dễ đọc
+            PRICE_LIST_CONTEXT = df.to_string(index=False)
+            logger.info("Đã load bảng giá vào bộ nhớ AI.")
+        else:
+            logger.warning("Không tìm thấy file bang_gia.xlsx. AI sẽ không có dữ liệu giá.")
+    except Exception as e:
+        logger.error(f"Lỗi load bảng giá: {e}")
+
+load_price_list()
+
+def ask_groq_ai(query):
+    if not GROQ_API_KEY:
+        return "Chưa cấu hình GROQ_API_KEY."
+    if not PRICE_LIST_CONTEXT:
+        return "Iem chưa nhận được file bảng giá Excel để tra cứu ạ."
+
+    try:
+        client = Groq(api_key=GROQ_API_KEY)
+        prompt = f"""
+        Bạn là trợ lý bán hàng chuyên nghiệp. Dưới đây là bảng giá sản phẩm:
+        {PRICE_LIST_CONTEXT}
+
+        Khách hàng hỏi: "{query}"
+        Nhiệm vụ: Tìm chính xác mã sản phẩm và báo giá theo yêu cầu (Giá chưa VAT, giá có VAT, hoặc model tương ứng).
+        Quy tắc: 
+        1. Trả lời ngắn gọn, lịch sự.
+        2. Nếu không tìm thấy mã, hãy báo không thấy.
+        3. Tuyệt đối không bịa đặt con số không có trong bảng.
+        """
+        completion = client.chat.completions.create(
+            model="llama-3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
+        return completion.choices[0].message.content
+    except Exception as e:
+        return f"Lỗi xử lý AI: {e}"
 
 # ---------------- Keep port open (Render free) ----------------
 def keep_port_open():
@@ -128,7 +180,7 @@ def connect_odoo():
         return None, None, f"Lỗi kết nối: {e}"
 
 # ================== PHẦN DƯỚI GIỮ NGUYÊN 100% ==================
-# (toàn bộ code còn lại của mày giữ nguyên, không sửa 1 ký tự)
+# (Mọi hàm cũ giữ nguyên tuyệt đối từ đây...)
 def get_odoo_url_components():
     if not ODOO_URL_FINAL:
         return None, None
@@ -143,7 +195,6 @@ def get_odoo_url_components():
         port = None
     return netloc, port
 
-# ---------------- Location helpers ----------------
 def find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD):
     out = {}
 
@@ -176,7 +227,6 @@ def find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD):
 
     return out
 
-# ---------------- Kho Nhập HN – quantity ----------------
 def get_transit_quantity(models, uid, product_id, transit_location_id):
     if not transit_location_id:
         return 0
@@ -201,7 +251,6 @@ def escape_markdown(text):
         text = text.replace(c, f"\\{c}")
     return text.replace('\\`', '`')
 
-# ---------------- Chat ID Registry ----------------
 REGISTERED_CHAT_IDS = set()
 CHAT_IDS_LOCK = threading.Lock()
 
@@ -220,7 +269,6 @@ def get_registered_chat_ids():
     with CHAT_IDS_LOCK:
         return list(REGISTERED_CHAT_IDS)
 
-# ---------------- Report /keohang ----------------
 def get_stock_data():
     uid, models, error_msg = connect_odoo()
     if not uid:
@@ -251,8 +299,6 @@ def get_stock_data():
             pid = q['product_id'][0]
             loc = q['location_id'][0]
 
-            # HN & HCM: CÓ HÀNG (available_quantity)
-            # Kho Nhập HN: HIỆN CÓ (quantity)
             if loc == tran_id:
                 real_qty = float(q.get('quantity', 0))
             else:
@@ -284,7 +330,6 @@ def get_stock_data():
             buf.seek(0)
             return buf, 0, "không có SP nào cần kéo"
 
-        # Lấy tên SP
         pids = list(stock_map.keys())
         product_info = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
@@ -294,7 +339,6 @@ def get_stock_data():
         )
         product_map = {p['id']: p for p in product_info}
 
-        # Build báo cáo kéo hàng
         report = []
         for pid, qtys in stock_map.items():
             prod = product_map.get(pid)
@@ -344,8 +388,6 @@ def get_stock_data():
         logger.error(f"lỗi khi xử lý kéo hàng: {e}")
         return None, 0, f"lỗi khi xử lý kéo hàng: {e}"
 
-
-# ---------------- PO /checkpo helpers ----------------
 def _read_po_with_auto_header(file_bytes: bytes):
     try:
         df_tmp = pd.read_excel(io.BytesIO(file_bytes), header=None)
@@ -371,7 +413,6 @@ def _read_po_with_auto_header(file_bytes: bytes):
         return df_raw, None
     except Exception as e:
         return None, f"Không đọc được file Excel PO với header tại dòng {header_row_idx + 1}: {e}"
-
 
 def _detect_po_columns(df: pd.DataFrame):
     cols_lower = {col: str(col).strip().lower() for col in df.columns}
@@ -413,7 +454,6 @@ def _detect_po_columns(df: pd.DataFrame):
 
     return code_col, qty_col, recv_col
 
-
 def _get_stock_for_product_with_cache(models, uid, product_id, location_ids, cache):
     if product_id in cache:
         return cache[product_id]
@@ -442,7 +482,6 @@ def _get_stock_for_product_with_cache(models, uid, product_id, location_ids, cac
     }
     cache[product_id] = result
     return result
-
 
 def process_po_and_build_report(file_bytes: bytes):
     df_raw, err = _read_po_with_auto_header(file_bytes)
@@ -576,13 +615,23 @@ def process_po_and_build_report(file_bytes: bytes):
     except Exception as e:
         return None, f"Lỗi khi xử lý PO: {e}"
 
-
-# ---------------- Handle product code ----------------
-async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------------- Handle product code & AI (CÓ SỬA NHẸ ĐỂ ĐIỀU HƯỚNG) ----------------
+async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
 
-    product_code = update.message.text.strip().upper()
+    user_text = update.message.text.strip()
+    
+    # KIỂM TRA NẾU LÀ CÂU HỎI GIÁ (Có chữ giá, bao nhiêu, VAT, bảng giá...)
+    keywords = ['giá', 'bao nhiêu', 'vat', 'báo giá', 'đắt', 'rẻ']
+    if any(k in user_text.lower() for k in keywords):
+        await update.message.reply_text("⌛️ Iem đang check bảng giá xíu...")
+        answer = ask_groq_ai(user_text)
+        await update.message.reply_text(answer)
+        return
+
+    # NẾU KHÔNG PHẢI HỎI GIÁ -> CHẠY LOGIC TRA TỒN ODOO CŨ
+    product_code = user_text.upper()
     await update.message.reply_text(
         f"đang tra tồn cho `{product_code}`, vui lòng chờ!",
         parse_mode='Markdown'
@@ -721,7 +770,6 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.error(f"lỗi khi tra tồn: {e}")
         await update.message.reply_text(f"❌ lỗi khi tra tồn: {e}")
 
-
 # ---------------- Telegram Handlers ----------------
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
@@ -766,8 +814,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Chào {name}!\n"
         "1. Gõ mã sp để tra tồn.\n"
-        "2. /keohang để tạo báo cáo Excel.\n"
-        "3. /ping để kiểm tra kết nối Odoo."
+        "2. Hỏi giá sản phẩm (VD: giá AC-350 bao nhiêu).\n"
+        "3. /keohang để tạo báo cáo Excel.\n"
+        "4. /ping để kiểm tra kết nối Odoo."
     )
 
 
@@ -930,11 +979,10 @@ def watchdog_201():
                 actor = "Không xác định"
 
                 if move_data:
-                    picking_info = None
-                    picking_field = move_data[0].get("picking_id")
+                    picking_id_field = move_data[0].get("picking_id")
 
-                    if picking_field:
-                        picking_id = picking_field[0]
+                    if picking_id_field:
+                        picking_id = picking_id_field[0]
                         picking_info = models.execute_kw(
                             ODOO_DB, uid, ODOO_PASSWORD,
                             "stock.picking", "read",
@@ -1005,7 +1053,8 @@ def main():
     application.add_handler(CommandHandler("keohang", excel_report_command))
     application.add_handler(CommandHandler("checkpo", checkpo_command))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_po_file))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_product_code))
+    # SỬA DÒNG NÀY ĐỂ NHẬN CẢ AI
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
 
     logger.info("Bot started!")
     application.run_polling()
