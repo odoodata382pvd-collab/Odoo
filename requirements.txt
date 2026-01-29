@@ -1,5 +1,6 @@
-python-telegram-bot
 pandas
-openpyxl
+python-telegram-bot
 requests
-pip install groq
+pytz
+groq
+openpyxl
