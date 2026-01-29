@@ -16,12 +16,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import pytz
-# --- TÍCH HỢP GROQ ---
+# --- TÍCH HỢP THÊM GROQ ---
 from groq import Groq
 
 # ---------------- Config Environment ----------------
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
-GROQ_API_KEY = os.environ.get('GROQ_API_KEY') # Biến môi trường mới cho AI
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY') # Biến môi trường mới
 
 ODOO_URL_RAW = os.environ.get('ODOO_URL').rstrip('/') if os.environ.get('ODOO_URL') else None
 if ODOO_URL_RAW and ODOO_URL_RAW.lower().endswith('/odoo'):
@@ -60,12 +60,10 @@ logger = logging.getLogger(__name__)
 PRICE_LIST_CONTEXT = ""
 
 def process_price_excel(file_bytes):
-    """Hàm tự động mapping và nạp bảng giá cho AI"""
     global PRICE_LIST_CONTEXT
     try:
         df_tmp = pd.read_excel(io.BytesIO(file_bytes), header=None)
         header_row_idx = 0
-        # Tìm dòng tiêu đề tự động
         for idx in range(min(len(df_tmp), 15)):
             row_text = " ".join(df_tmp.iloc[idx].astype(str).lower())
             if any(key in row_text for key in ["model", "mã", "giá", "price"]):
@@ -79,22 +77,11 @@ def process_price_excel(file_bytes):
         return False, str(e)
 
 def ask_groq_ai(query):
-    """Hàm gọi AI Groq tra cứu giá"""
     if not GROQ_API_KEY: return "Chưa cấu hình GROQ_API_KEY."
-    if not PRICE_LIST_CONTEXT: return "Iem chưa có bảng giá. Hãy gửi file Excel bảng giá cho iem trước nhé!"
+    if not PRICE_LIST_CONTEXT: return "Iem chưa có bảng giá. Hãy gửi file Excel để nạp nhé!"
     try:
         client = Groq(api_key=GROQ_API_KEY)
-        prompt = f"""
-        Bạn là chuyên gia tra giá chuyên nghiệp. 
-        Dữ liệu bảng giá hiện tại của công ty:
-        {PRICE_LIST_CONTEXT}
-
-        Câu hỏi khách hàng: "{query}"
-        Yêu cầu:
-        1. Tự tìm cột Mã SP và các cột Giá (chưa VAT, có VAT, lẻ, sỉ...).
-        2. Trả lời đúng con số trong bảng, không bịa đặt.
-        3. Ngôn ngữ lịch sự, ngắn gọn.
-        """
+        prompt = f"Bảng giá:\n{PRICE_LIST_CONTEXT}\n\nKhách hỏi: {query}\nTrả lời ngắn gọn giá của mã SP được hỏi."
         completion = client.chat.completions.create(
             model="llama-3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
@@ -117,7 +104,7 @@ def keep_port_open():
 
 threading.Thread(target=keep_port_open, daemon=True).start()
 
-# ---------------- Odoo connect (GIỮ NGUYÊN 100%) ----------------
+# ---------------- Odoo connect (FIX DUY NHẤT) ----------------
 def connect_odoo():
     try:
         if not ODOO_URL_FINAL:
@@ -622,21 +609,21 @@ def process_po_and_build_report(file_bytes: bytes):
         return None, f"Lỗi khi xử lý PO: {e}"
 
 
-# ---------------- Handle product code (HÀM GỐC + TÍCH HỢP AI) ----------------
+# ---------------- Handle product code (BẮT ĐẦU TÍCH HỢP) ----------------
 async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
 
-    # --- CHÈN THÊM LOGIC AI ---
-    user_text = update.message.text.strip()
-    if any(k in user_text.lower() for k in ['giá', 'bao nhiêu', 'vat', 'bảng giá', 'price']):
-        await update.message.reply_text("⌛️ Iem đang tra bảng giá, chờ iem xíu...")
-        answer = ask_groq_ai(user_text)
+    # --- ĐOẠN TÍCH HỢP GROQ: KHÔNG THAY ĐỔI GÌ BÊN DƯỚI ---
+    user_input = update.message.text.strip()
+    if any(k in user_input.lower() for k in ['giá', 'bao nhiêu', 'vat', 'bảng giá', 'price']):
+        await update.message.reply_text("⌛️ Iem đang check bảng giá xíu...")
+        answer = ask_groq_ai(user_input)
         await update.message.reply_text(answer)
         return
-    # --- HẾT PHẦN CHÈN ---
+    # --- HẾT ĐOẠN TÍCH HỢP ---
 
-    product_code = user_text.upper() # Giữ nguyên logic cũ
+    product_code = user_input.upper()
     await update.message.reply_text(
         f"đang tra tồn cho `{product_code}`, vui lòng chờ!",
         parse_mode='Markdown'
@@ -776,7 +763,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"❌ lỗi khi tra tồn: {e}")
 
 
-# ---------------- Telegram Handlers (GIỮ NGUYÊN) ----------------
+# ---------------- Telegram Handlers ----------------
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
@@ -820,8 +807,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Chào {name}!\n"
         "1. Gõ mã sp để tra tồn.\n"
-        "2. Gửi file Excel để nạp BẢNG GIÁ mới.\n"
-        "3. Hỏi giá sản phẩm để AI báo giá.\n"
+        "2. Hỏi giá sản phẩm để iem báo giá.\n"
+        "3. Gửi file Excel bảng giá để cập nhật.\n"
         "4. /keohang để tạo báo cáo Excel.\n"
         "5. /ping để kiểm tra kết nối Odoo."
     )
@@ -842,44 +829,50 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_chat_id(chat_id)
 
     document = update.message.document
-    if not document: return
+    if not document:
+        return
 
     file_name = (document.file_name or "").lower()
     if not file_name.endswith(".xlsx"):
         await update.message.reply_text("Chỉ hỗ trợ file Excel định dạng .xlsx thôi nha.")
         return
 
-    # --- PHÂN LOẠI FILE: Nếu đang chờ PO ---
+    # --- ĐOẠN TÍCH HỢP XỬ LÝ FILE: Phân biệt PO và Bảng Giá ---
     if context.user_data.get('waiting_for_po'):
         context.user_data['waiting_for_po'] = False
         await update.message.reply_text("⌛️ Iem đang xử lý file PO, chờ em xíu xìu xiu nha...")
+
         try:
             file = await document.get_file()
             file_bytes = await file.download_as_bytearray()
             excel_buffer, error_msg = process_po_and_build_report(bytes(file_bytes))
             if excel_buffer:
-                await update.message.reply_document(document=excel_buffer, filename="kiem_tra_po.xlsx", caption="❤️ Iem gửi file kiểm tra PO đây ạ!")
+                await update.message.reply_document(
+                    document=excel_buffer,
+                    filename="kiem_tra_po.xlsx",
+                    caption="❤️ Iem gửi chị file kiểm tra PO đây ạ!"
+                )
             else:
                 await update.message.reply_text(f"❌ Lỗi: {error_msg}")
         except Exception as e:
-            await update.message.reply_text(f"❌ Lỗi: {e}")
+            await update.message.reply_text(f"❌ Lỗi khi tải file PO: {e}")
         return
+    else:
+        # Nếu không chờ PO -> Mặc định nạp bảng giá mới
+        await update.message.reply_text("📥 Đang nạp bảng giá mới cho AI...")
+        try:
+            file = await document.get_file()
+            file_bytes = await file.download_as_bytearray()
+            success, info = process_price_excel(bytes(file_bytes))
+            if success:
+                await update.message.reply_text(f"✅ Đã nạp bảng giá ({info} dòng). Chị có thể hỏi giá bất cứ mã nào rồi nha!")
+            else:
+                await update.message.reply_text(f"❌ Lỗi nạp bảng giá: {info}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Lỗi xử lý file: {e}")
 
-    # --- NẾU KHÔNG CHỜ PO -> NẠP BẢNG GIÁ ---
-    await update.message.reply_text("📥 Đang nạp bảng giá mới cho AI tra cứu...")
-    try:
-        file = await document.get_file()
-        file_bytes = await file.download_as_bytearray()
-        success, info = process_price_excel(bytes(file_bytes))
-        if success:
-            await update.message.reply_text(f"✅ Đã nạp thành công bảng giá ({info} dòng). Chị có thể bắt đầu hỏi giá!")
-        else:
-            await update.message.reply_text(f"❌ Không đọc được bảng giá: {info}")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Lỗi: {e}")
 
-
-# ---------------- HTTP Ping Server (GIỮ NGUYÊN) ----------------
+# ---------------- HTTP Ping Server ----------------
 class PingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -902,7 +895,7 @@ def start_http():
 
 threading.Thread(target=start_http, daemon=True).start()
 
-# ---------------- AUTO-PING (GIỮ NGUYÊN) ----------------
+# ---------------- AUTO-PING ----------------
 PING_URL = "https://google.com"
 
 def keep_alive_ping():
@@ -917,7 +910,7 @@ def keep_alive_ping():
 
 threading.Thread(target=keep_alive_ping, daemon=True).start()
 
-# ---------------- WATCHDOG 201/201 (GIỮ NGUYÊN) ----------------
+# ---------------- WATCHDOG 201/201 ----------------
 WATCH_INTERVAL = 60
 previous_snapshot = {}
 
@@ -930,6 +923,7 @@ def watchdog_201():
         try:
             uid, models, err = connect_odoo()
             if not uid:
+                logger.error(f"Watchdog không kết nối được Odoo: {err}")
                 time.sleep(WATCH_INTERVAL)
                 continue
 
@@ -937,6 +931,7 @@ def watchdog_201():
             hn_id = location_ids.get("HN_STOCK", {}).get("id")
 
             if not hn_id:
+                logger.error("Watchdog: Không tìm thấy kho 201/201")
                 time.sleep(WATCH_INTERVAL)
                 continue
 
@@ -987,6 +982,7 @@ def watchdog_201():
 
                 if move_data:
                     picking_field = move_data[0].get("picking_id")
+
                     if picking_field:
                         picking_id = picking_field[0]
                         picking_info = models.execute_kw(
@@ -997,8 +993,14 @@ def watchdog_201():
                         )[0]
 
                         picking_name = picking_info.get("name", "N/A")
+
                         w_uid = picking_info.get("write_uid")
-                        if w_uid: actor = w_uid[1]
+                        c_uid = picking_info.get("create_uid")
+
+                        if w_uid:
+                            actor = w_uid[1]
+                        elif c_uid:
+                            actor = c_uid[1]
 
                 status = "NHẬP KHO" if diff > 0 else "XUẤT KHO"
                 now_vn = datetime.now(tz).strftime('%H:%M %d/%m/%Y')
@@ -1018,22 +1020,24 @@ def watchdog_201():
                     try:
                         bot = Bot(token=TELEGRAM_TOKEN)
                         asyncio.run(bot.send_message(chat_id, msg, parse_mode="Markdown"))
-                    except: pass
+                    except Exception as e:
+                        logger.error(f"Lỗi gửi thông báo tới {chat_id}: {e}")
 
             previous_snapshot = current_snapshot
             time.sleep(WATCH_INTERVAL)
 
         except Exception as e:
+            logger.error(f"Lỗi watchdog: {e}")
             time.sleep(WATCH_INTERVAL)
 
 
 threading.Thread(target=watchdog_201, daemon=True).start()
 
 
-# ---------------- MAIN (GIỮ NGUYÊN) ----------------
+# ---------------- MAIN ----------------
 def main():
     if not TELEGRAM_TOKEN or not ODOO_URL_RAW or not ODOO_DB or not ODOO_USERNAME or not ODOO_PASSWORD:
-        logger.error("Thiếu cấu hình môi trường.")
+        logger.error("Thiếu cấu hình môi trường (token, url, db, user, pass).")
         return
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -1041,7 +1045,7 @@ def main():
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
         asyncio.get_event_loop().run_until_complete(bot.delete_webhook())
-        logger.info("đã xóa webhook cũ.")
+        logger.info("đã xóa webhook cũ (nếu có).")
     except Exception as e:
         logger.warning(f"Lỗi xóa webhook: {e}")
 
