@@ -60,14 +60,15 @@ logger = logging.getLogger(__name__)
 PRICE_LIST_CONTEXT = ""
 
 def process_price_excel(file_bytes):
-    """Hàm tự động mapping và nạp bảng giá - Đã sửa lỗi .str.lower()"""
+    """Hàm tự động mapping và nạp bảng giá - FIX LỖI ÉP KIỂU STRING"""
     global PRICE_LIST_CONTEXT
     try:
         df_tmp = pd.read_excel(io.BytesIO(file_bytes), header=None)
         header_row_idx = 0
         for idx in range(min(len(df_tmp), 15)):
-            # Đã sửa lỗi: Thêm .str để xử lý Series của Pandas
-            row_text = " ".join(df_tmp.iloc[idx].astype(str).str.lower())
+            # Sửa lỗi: Đảm bảo mọi giá trị trong dòng là string trước khi xử lý
+            row_values = df_tmp.iloc[idx].astype(str).str.lower().fillna('')
+            row_text = " ".join(row_values)
             if any(key in row_text for key in ["model", "mã", "giá", "price"]):
                 header_row_idx = idx
                 break
@@ -84,7 +85,7 @@ def ask_groq_ai(query):
     if not PRICE_LIST_CONTEXT: return "Iem chưa có bảng giá. Hãy gửi file Excel để nạp nhé!"
     try:
         client = Groq(api_key=GROQ_API_KEY)
-        prompt = f"Bảng giá:\n{PRICE_LIST_CONTEXT}\n\nKhách hỏi: {query}\nTrả lời ngắn gọn giá của mã SP được hỏi dựa trên bảng giá."
+        prompt = f"Bảng giá:\n{PRICE_LIST_CONTEXT}\n\nKhách hỏi: {query}\nTrả lời ngắn gọn giá của mã SP được hỏi."
         completion = client.chat.completions.create(
             model="llama-3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
@@ -92,21 +93,6 @@ def ask_groq_ai(query):
         )
         return completion.choices[0].message.content
     except Exception as e: return f"Lỗi AI: {e}"
-
-# ---------------- Tự động nạp Chat ID để không mất Watchdog ----------------
-CHAT_FILE = "registered_chats.txt"
-
-def load_registered_chats():
-    if os.path.exists(CHAT_FILE):
-        with open(CHAT_FILE, "r") as f:
-            for line in f:
-                if line.strip():
-                    REGISTERED_CHAT_IDS.add(int(line.strip()))
-
-def save_chat_id(chat_id):
-    if chat_id not in REGISTERED_CHAT_IDS:
-        with open(CHAT_FILE, "a") as f:
-            f.write(f"{chat_id}\n")
 
 # ---------------- Keep port open (Render free) ----------------
 def keep_port_open():
@@ -122,7 +108,7 @@ def keep_port_open():
 
 threading.Thread(target=keep_port_open, daemon=True).start()
 
-# ---------------- Odoo connect (FIX DUY NHẤT) ----------------
+# ---------------- Odoo connect (GIỮ NGUYÊN) ----------------
 def connect_odoo():
     try:
         if not ODOO_URL_FINAL:
@@ -268,7 +254,6 @@ def register_chat_id(chat_id):
         cid = chat_id
 
     with CHAT_IDS_LOCK:
-        save_chat_id(cid) # Lưu vào file chats.txt
         REGISTERED_CHAT_IDS.add(cid)
 
 def get_registered_chat_ids():
@@ -405,8 +390,8 @@ def _read_po_with_auto_header(file_bytes: bytes):
 
     header_row_idx = None
     for idx in range(len(df_tmp)):
-        # Đã sửa lỗi: Thêm .str để xử lý Series
-        row_values = df_tmp.iloc[idx].astype(str).str.lower()
+        # Ép kiểu string an toàn để không lỗi float found
+        row_values = df_tmp.iloc[idx].astype(str).str.lower().fillna('')
         row_text = " ".join(row_values)
         if any(key in row_text for key in [
             "model", "mã sp", "ma sp", "mã hàng", "ma hang",
@@ -629,7 +614,7 @@ def process_po_and_build_report(file_bytes: bytes):
         return None, f"Lỗi khi xử lý PO: {e}"
 
 
-# ---------------- Handle product code (BẮT ĐẦU TÍCH HỢP AI) ----------------
+# ---------------- Handle product code (BẮT ĐẦU TÍCH HỢP) ----------------
 async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
@@ -934,6 +919,20 @@ threading.Thread(target=keep_alive_ping, daemon=True).start()
 WATCH_INTERVAL = 60
 previous_snapshot = {}
 
+# Thêm cơ chế lưu trữ Chat ID để không mất thông báo Watchdog khi bot restart
+CHAT_STORAGE = "registered_chats.txt"
+
+def load_registered_chats():
+    if os.path.exists(CHAT_STORAGE):
+        with open(CHAT_STORAGE, "r") as f:
+            for line in f:
+                if line.strip():
+                    REGISTERED_CHAT_IDS.add(int(line.strip()))
+
+def save_chat_id_to_file(chat_id):
+    if chat_id not in REGISTERED_CHAT_IDS:
+        with open(CHAT_STORAGE, "a") as f:
+            f.write(f"{chat_id}\n")
 
 def watchdog_201():
     global previous_snapshot
