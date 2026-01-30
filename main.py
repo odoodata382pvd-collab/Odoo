@@ -64,17 +64,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------------- AI GROQ & PRICE DATA (KHẮC PHỤC LỖI NẠP FILE & RATE LIMIT) ----------------
+# ---------------- AI GROQ & PRICE DATA (FIX LỖI TRIỆT ĐỂ) ----------------
 PRICE_DATA_FILE = "price_cache.json"
 
 def process_price_excel(file_bytes):
-    """Hàm nạp bảng giá: Sửa lỗi Series object has no attribute lower"""
+    """Hàm nạp bảng giá: Fix lỗi Series object has no attribute lower"""
     try:
         xl = pd.ExcelFile(io.BytesIO(file_bytes))
-        # Ưu tiên lấy sheet T12,2025 hoặc sheet cuối cùng
-        target_sheet = 'T12,2025' if 'T12,2025' in xl.sheet_names else xl.sheet_names[-1]
-        
-        # Đọc thô dữ liệu không có header để quét
+        # Tìm sheet có chữ 'T' và số (VD: T12,2025) hoặc lấy sheet đầu tiên
+        target_sheet = None
+        for name in xl.sheet_names:
+            if name.upper().startswith("T") and any(c.isdigit() for c in name):
+                target_sheet = name
+                break
+        if not target_sheet:
+            target_sheet = xl.sheet_names[0] # Fallback
+
+        # Đọc thô dữ liệu không có header để quét tiêu đề
         df_raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=target_sheet, header=None)
         
         header_row_idx = 0
@@ -82,23 +88,23 @@ def process_price_excel(file_bytes):
         
         # Quét 20 dòng đầu để tìm header
         for idx, row in df_raw.iterrows():
-            # FIX LỖI: Chuyển từng giá trị trong row thành string rồi mới join
-            row_values = [str(val).lower() for val in row.values]
-            row_text = " ".join(row_values)
+            # FIX LỖI: Chuyển toàn bộ row thành list string rồi join
+            row_as_list = [str(x).lower() for x in row.values]
+            row_str = " ".join(row_as_list)
             
-            # Điều kiện nhận diện dòng tiêu đề của bạn
-            if "mã hàng" in row_text and ("niêm yết" in row_text or "giá" in row_text):
+            # Điều kiện nhận diện dòng tiêu đề
+            if "mã hàng" in row_str or "mã sp" in row_str:
                 header_row_idx = idx
                 found_header = True
                 break
         
         if not found_header:
-            return False, "Không tìm thấy dòng tiêu đề chứa 'Mã hàng' và 'Niêm yết'"
+            return False, f"Không tìm thấy dòng tiêu đề chứa 'Mã hàng' trong sheet {target_sheet}"
 
-        # Đọc lại file với dòng header đã tìm được
+        # Đọc lại file với dòng header chuẩn
         df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=target_sheet, header=header_row_idx)
         
-        # Chuẩn hóa tên cột (bỏ khoảng trắng thừa)
+        # Chuẩn hóa tên cột
         df.columns = [str(col).strip() for col in df.columns]
         
         # Tìm cột Mã hàng chính xác
@@ -108,13 +114,13 @@ def process_price_excel(file_bytes):
             # Loại bỏ dòng mà Mã hàng bị trống (NaN)
             df = df.dropna(subset=[ma_hang_col])
             
-            # Chuyển toàn bộ dữ liệu sang string để lưu JSON an toàn
+            # Chuyển toàn bộ dữ liệu sang string để lưu JSON
             data_dict = df.astype(str).to_dict(orient='records')
             
             with open(PRICE_DATA_FILE, 'w', encoding='utf-8') as f:
                 json.dump(data_dict, f, ensure_ascii=False, indent=4)
                 
-            return True, len(df)
+            return True, f"{len(df)} dòng (Sheet: {target_sheet})"
         
         return False, f"Không tìm thấy cột 'Mã hàng'. Các cột tìm thấy: {list(df.columns)}"
 
@@ -123,17 +129,17 @@ def process_price_excel(file_bytes):
         return False, str(e)
 
 def ask_groq_ai(query):
-    """Hàm AI: Tự tìm dòng dữ liệu trước khi gửi để tránh lỗi 429 và xoay vòng Key"""
+    """Hàm AI: Tự tìm dữ liệu Python trước khi gửi AI (Tránh 429 và trả lời sai)"""
     global current_key_index
     
     if not os.path.exists(PRICE_DATA_FILE):
-        return "Em chưa có dữ liệu bảng giá. Hãy gửi file Excel để nạp nhé!"
+        return "Iem chưa có dữ liệu bảng giá. Hãy gửi file Excel để nạp nhé!"
 
     try:
         with open(PRICE_DATA_FILE, 'r', encoding='utf-8') as f:
             full_data = json.load(f)
 
-        # 1. Tìm kiếm bằng Python (Tiết kiệm 99% token)
+        # 1. Tìm kiếm bằng Python
         query_upper = query.upper()
         found_item = None
         
@@ -142,24 +148,25 @@ def ask_groq_ai(query):
             key_ma = next((k for k in item.keys() if "mã" in k.lower() and ("hàng" in k.lower() or "sp" in k.lower())), None)
             if key_ma:
                 ma_sp = str(item[key_ma]).upper().strip()
-                # Logic so sánh: Mã trong file (A-092) nằm trong câu hỏi (giá A-092)
                 if ma_sp and ma_sp in query_upper:
                     found_item = item
                     break
         
         if not found_item:
-            return "Em không tìm thấy mã hàng này trong bảng giá ạ."
+            return "Iem không tìm thấy mã hàng này trong bảng giá ạ."
 
-        # 2. Làm sạch dữ liệu (Bỏ NaN)
+        # 2. Làm sạch dữ liệu
         clean_info = {k: v for k, v in found_item.items() if str(v).lower() != 'nan' and 'unnamed' not in str(k).lower()}
 
         # 3. Prompt tối ưu
         prompt = f"""
         Dữ liệu sản phẩm: {clean_info}
         Câu hỏi: "{query}"
-        Yêu cầu:
-        - Trả lời giá chính xác từ dữ liệu trên và làm tròn tới đơn vị hàng nghìn.
-        - Nếu hỏi "Giá chưa VAT" hoặc "- VAT", lấy giá trị ở cột "- VAT".
+        
+        YÊU CẦU:
+        - Trả lời chính xác con số từ dữ liệu trên.
+        - Nếu hỏi "Giá chưa VAT" hoặc "- VAT", hãy lấy giá trị ở cột "- VAT".
+        - Bỏ qua các con số nhỏ (ví dụ 0.35, 15%), đó là chiết khấu, KHÔNG PHẢI GIÁ TIỀN.
         - Trả lời ngắn gọn: "Mã [Mã SP]: [Loại giá] là [Số tiền] VNĐ".
         """
 
@@ -179,7 +186,6 @@ def ask_groq_ai(query):
                 )
                 return completion.choices[0].message.content
             except Exception as e:
-                # Nếu lỗi Rate Limit (429) -> Đổi key
                 if "429" in str(e):
                     logger.warning(f"Key {current_key_index} hết hạn mức. Đổi key...")
                     current_key_index = (current_key_index + 1) % 3
@@ -205,7 +211,7 @@ def keep_port_open():
 
 threading.Thread(target=keep_port_open, daemon=True).start()
 
-# ---------------- Odoo connect (FIX DUY NHẤT) ----------------
+# ---------------- Odoo connect (GIỮ NGUYÊN) ----------------
 def connect_odoo():
     try:
         if not ODOO_URL_FINAL:
@@ -967,7 +973,7 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_bytes = await file.download_as_bytearray()
             success, info = process_price_excel(bytes(file_bytes))
             if success:
-                await update.message.reply_text(f"✅ Đã nạp thành công bảng giá ({info} dòng). Chị có thể bắt đầu hỏi giá rồi nha!")
+                await update.message.reply_text(f"✅ Đã nạp thành công bảng giá ({info}). Chị có thể bắt đầu hỏi giá rồi nha!")
             else:
                 await update.message.reply_text(f"❌ Lỗi nạp bảng giá: {info}")
         except Exception as e:
