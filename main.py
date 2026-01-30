@@ -21,7 +21,14 @@ from groq import Groq
 
 # ---------------- Config Environment ----------------
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
-GROQ_API_KEY = os.environ.get('GROQ_API_KEY') 
+
+# Cấu hình 3 API Key để xoay vòng
+AI_KEYS = [
+    os.environ.get('GROQ_API_KEY_1'),
+    os.environ.get('GROQ_API_KEY_2'),
+    os.environ.get('GROQ_API_KEY_3')
+]
+current_key_index = 0
 
 ODOO_URL_RAW = os.environ.get('ODOO_URL').rstrip('/') if os.environ.get('ODOO_URL') else None
 if ODOO_URL_RAW and ODOO_URL_RAW.lower().endswith('/odoo'):
@@ -56,71 +63,86 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------------- AI Groq & Price Data (SỬA LỖI TRA CỨU SAI) ----------------
-PRICE_DATA_FILE = "stored_price_list.txt"
-
-def save_price_context(content):
-    with open(PRICE_DATA_FILE, "w", encoding="utf-8") as f:
-        f.write(content)
-
-def get_price_context():
-    if os.path.exists(PRICE_DATA_FILE):
-        with open(PRICE_DATA_FILE, "r", encoding="utf-8") as f:
-            return f.read()
-    return ""
+# ---------------- AI GROQ & PRICE DATA (BỔ SUNG CẢI TIẾN) ----------------
+PRICE_DATA_CACHE = None
 
 def process_price_excel(file_bytes):
-    """Hàm nạp bảng giá: Tối ưu để loại bỏ dòng NaN và lấy đúng giá trị thực"""
+    """Hàm nạp bảng giá: Lưu vào bộ nhớ RAM để tra cứu nhanh"""
+    global PRICE_DATA_CACHE
     try:
         xl = pd.ExcelFile(io.BytesIO(file_bytes))
-        # Lấy sheet T12,2025 hoặc sheet cuối cùng
-        target_sheet = 'T12,2025' if 'T12,2025' in xl.sheet_names else xl.sheet_names[-1]
-        
+        latest_sheet = xl.sheet_names[-1]
         # Đọc dữ liệu từ dòng số 4 (header thực tế)
-        df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=target_sheet, header=3)
+        df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=latest_sheet, header=3)
         
-        # Lọc bỏ dòng không có mã hàng (loại bỏ các dòng tiêu đề phân nhóm như QUẠT, NỒI...)
+        # Làm sạch dữ liệu: bỏ dòng trống, ép kiểu chữ
         if 'Mã hàng' in df.columns:
             df = df.dropna(subset=['Mã hàng'])
+            # Ép kiểu Mã hàng về chuỗi viết hoa để dễ so sánh
+            df['Mã hàng'] = df['Mã hàng'].astype(str).str.strip().str.upper()
         
-        # Ép kiểu dữ liệu về String để AI không bị nhầm lẫn định dạng số
-        df = df.astype(str)
-        
-        context = df.to_string(index=False)
-        save_price_context(context)
+        PRICE_DATA_CACHE = df
         return True, len(df)
     except Exception as e:
-        logger.error(f"Lỗi xử lý bảng giá: {e}")
+        logger.error(f"Lỗi nạp bảng giá: {e}")
         return False, str(e)
 
 def ask_groq_ai(query):
-    """Hàm gọi AI: Đã tối ưu Prompt để đọc đúng cột giá - VAT"""
-    if not GROQ_API_KEY: return "Chưa cấu hình GROQ_API_KEY."
+    """Hàm AI: Tự tìm dòng mã hàng trước khi gửi cho AI để tiết kiệm Token và tránh Error 429"""
+    global current_key_index
     
-    price_data = get_price_context() 
-    if not price_data: return "Iem chưa có dữ liệu bảng giá."
-    
-    try:
-        client = Groq(api_key=GROQ_API_KEY)
-        # Prompt chi tiết ra lệnh cho AI đọc đúng cột J hoặc L
-        prompt = f"""
-        Dữ liệu bảng giá hệ thống Mẹ và Bé:
-        {price_data}
+    if not any(AI_KEYS): return "Chưa cấu hình API Key trong Environment."
+    if PRICE_DATA_CACHE is None: return "Iem chưa có dữ liệu bảng giá."
 
-        Câu hỏi khách hàng: "{query}"
-        Nhiệm vụ:
-        1. Tìm đúng sản phẩm theo 'Mã hàng'. Lưu ý mã SP có dấu gạch ngang (VD: A-009, AC-182).
-        2. Nếu khách hỏi 'Giá chưa VAT' hoặc '-VAT', hãy nhìn vào giá trị ở cột ghi là '- VAT'.
-        3. Tuyệt đối không trả lời giá trị 'NaN' hoặc 'None'. Nếu thấy giá trị đó, hãy báo là chưa có giá chính xác.
-        4. Trả lời cực kỳ ngắn gọn theo mẫu: "Mã [Mã hàng]: [Loại giá khách hỏi] là [Số tiền] VNĐ".
-        """
-        completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0
-        )
-        return completion.choices[0].message.content
-    except Exception as e: return f"Lỗi AI: {e}"
+    # 1. Tìm mã sản phẩm trong câu hỏi (Ví dụ: AC-182)
+    target_row = None
+    query_upper = query.upper()
+    for _, row in PRICE_DATA_CACHE.iterrows():
+        ma_hang = str(row['Mã hàng']).upper()
+        if ma_hang in query_upper:
+            target_row = row
+            break
+    
+    if target_row is None:
+        return "Iem xin lỗi, iem không tìm thấy mã hàng này trong bảng giá hiện tại."
+
+    # 2. Chỉ gửi thông tin của duy nhất mã hàng đó cho AI (Cực kỳ tiết kiệm token)
+    product_info = target_row.to_dict()
+    # Loại bỏ các giá trị NaN rác để AI không đọc nhầm
+    clean_info = {k: v for k, v in product_info.items() if pd.notna(v) and str(v).lower() != 'nan'}
+
+    prompt = f"""
+    Dữ liệu sản phẩm khách hỏi: {clean_info}
+    Câu hỏi khách hàng: "{query}"
+    Nhiệm vụ: Trả lời chính xác con số giá từ dữ liệu trên. 
+    Lưu ý: 
+    - Nếu khách hỏi Giá chưa VAT, hãy tìm cột '- VAT'.
+    - Trả lời cực kỳ ngắn gọn: "Mã [Mã hàng]: [Loại giá] là [Số tiền] VNĐ".
+    """
+
+    # 3. Logic xoay vòng 3 API Key
+    for _ in range(3):
+        api_key = AI_KEYS[current_key_index]
+        if not api_key:
+            current_key_index = (current_key_index + 1) % 3
+            continue
+            
+        try:
+            client = Groq(api_key=api_key)
+            completion = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0
+            )
+            return completion.choices[0].message.content
+        except Exception as e:
+            if "429" in str(e): # Lỗi Rate Limit
+                logger.warning(f"Key {current_key_index + 1} hết hạn mức, đang đổi key...")
+                current_key_index = (current_key_index + 1) % 3
+                continue
+            return f"Lỗi AI: {e}"
+    
+    return "Tất cả 3 API Key đều đã hết hạn mức trong hôm nay, vui lòng quay lại sau nhé!"
 
 # ---------------- Keep port open (Render free) ----------------
 def keep_port_open():
@@ -136,7 +158,7 @@ def keep_port_open():
 
 threading.Thread(target=keep_port_open, daemon=True).start()
 
-# ---------------- Odoo connect (GIỮ NGUYÊN) ----------------
+# ---------------- Odoo connect (FIX DUY NHẤT) ----------------
 def connect_odoo():
     try:
         if not ODOO_URL_FINAL:
@@ -197,8 +219,6 @@ def connect_odoo():
         return None, None, f"Lỗi kết nối: {e}"
 
 # ================== PHẦN DƯỚI GIỮ NGUYÊN 100% ==================
-# (Mọi hàm cũ tra tồn kho Odoo, Check PO và Watchdog của mày giữ nguyên tuyệt đối từ đây...)
-
 def get_odoo_url_components():
     if not ODOO_URL_FINAL:
         return None, None
@@ -213,6 +233,7 @@ def get_odoo_url_components():
         port = None
     return netloc, port
 
+# ---------------- Location helpers ----------------
 def find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD):
     out = {}
 
@@ -245,6 +266,7 @@ def find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD):
 
     return out
 
+# ---------------- Kho Nhập HN – quantity ----------------
 def get_transit_quantity(models, uid, product_id, transit_location_id):
     if not transit_location_id:
         return 0
@@ -269,6 +291,7 @@ def escape_markdown(text):
         text = text.replace(c, f"\\{c}")
     return text.replace('\\`', '`')
 
+# ---------------- Chat ID Registry ----------------
 REGISTERED_CHAT_IDS = set()
 CHAT_IDS_LOCK = threading.Lock()
 
@@ -287,6 +310,7 @@ def get_registered_chat_ids():
     with CHAT_IDS_LOCK:
         return list(REGISTERED_CHAT_IDS)
 
+# ---------------- Report /keohang ----------------
 def get_stock_data():
     uid, models, error_msg = connect_odoo()
     if not uid:
@@ -407,6 +431,7 @@ def get_stock_data():
         return None, 0, f"lỗi khi xử lý kéo hàng: {e}"
 
 
+# ---------------- PO /checkpo helpers ----------------
 def _read_po_with_auto_header(file_bytes: bytes):
     try:
         df_tmp = pd.read_excel(io.BytesIO(file_bytes), header=None)
@@ -642,6 +667,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
 
+    # --- BỔ SUNG: Điều hướng AI khi khách hỏi giá ---
     user_input = update.message.text.strip()
     if any(k in user_input.lower() for k in ['giá', 'bao nhiêu', 'vat', 'bảng giá', 'price']):
         await update.message.reply_text("⌛️ Iem đang tra bảng giá xíu...")
@@ -874,7 +900,7 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_document(
                     document=excel_buffer,
                     filename="kiem_tra_po.xlsx",
-                    caption="❤️ Iem gửi chị file kiểm tra PO và đối chiếu tồn kho đây ạ!"
+                    caption="❤️ Iem gửi chị file kiểm tra PO đây ạ!"
                 )
             else:
                 await update.message.reply_text(f"❌ Lỗi: {error_msg}")
@@ -882,6 +908,7 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Lỗi khi tải file PO: {e}")
         return
     else:
+        # Gửi bảng giá AI
         await update.message.reply_text("📥 Đang nạp bảng giá mới cho AI...")
         try:
             file = await document.get_file()
