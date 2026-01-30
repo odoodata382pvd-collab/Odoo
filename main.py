@@ -1,6 +1,5 @@
 import os
 import io
-import json
 import logging
 import pandas as pd
 import ssl
@@ -11,19 +10,20 @@ import threading
 import time
 import urllib.request
 import requests
+import json
+import re
 from datetime import datetime
 from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import pytz
-# --- TÍCH HỢP THÊM GROQ ---
 from groq import Groq
 
 # ---------------- Config Environment ----------------
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 
-# Cấu hình 3 API Key để xoay vòng
+# Cấu hình 3 API Key để xoay vòng (Thêm vào biến môi trường trên Render)
 AI_KEYS = [
     os.environ.get('GROQ_API_KEY_1'),
     os.environ.get('GROQ_API_KEY_2'),
@@ -64,72 +64,103 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------------- AI GROQ & PRICE DATA (FIX LỖI TRIỆT ĐỂ) ----------------
+# ---------------- TÍNH NĂNG MỚI: AI GROQ & XỬ LÝ BẢNG GIÁ ----------------
 PRICE_DATA_FILE = "price_cache.json"
 
 def process_price_excel(file_bytes):
-    """Hàm nạp bảng giá: Fix lỗi Series object has no attribute lower"""
+    """
+    Hàm nạp bảng giá: 
+    1. Tìm Sheet mới nhất theo thời gian (Txx,xxxx).
+    2. Quét tìm dòng tiêu đề chứa 'Mã hàng'.
+    3. Lưu dữ liệu sạch vào JSON.
+    """
     try:
         xl = pd.ExcelFile(io.BytesIO(file_bytes))
-        # Tìm sheet có chữ 'T' và số (VD: T12,2025) hoặc lấy sheet đầu tiên
+        sheet_names = xl.sheet_names
+        
+        # --- LOGIC 1: Tìm Sheet mới nhất dựa trên tên (VD: T12,2025) ---
         target_sheet = None
-        for name in xl.sheet_names:
-            if name.upper().startswith("T") and any(c.isdigit() for c in name):
-                target_sheet = name
-                break
+        max_date = None
+        # Regex bắt các dạng: T12,2025 | T12.2025 | T12-2025 | T12 2025
+        pattern = re.compile(r'T(\d+)[\.,_\-\s](\d+)', re.IGNORECASE)
+        
+        for name in sheet_names:
+            match = pattern.search(name)
+            if match:
+                try:
+                    month = int(match.group(1))
+                    year = int(match.group(2))
+                    current_date = datetime(year, month, 1)
+                    
+                    if max_date is None or current_date > max_date:
+                        max_date = current_date
+                        target_sheet = name
+                except ValueError:
+                    continue
+        
+        # Fallback: Nếu không tìm thấy sheet ngày tháng, dùng sheet đầu tiên
         if not target_sheet:
-            target_sheet = xl.sheet_names[0] # Fallback
+            target_sheet = sheet_names[0]
+            logger.info(f"Không tìm thấy sheet ngày tháng, dùng sheet đầu tiên: {target_sheet}")
+        else:
+            logger.info(f"Đã tìm thấy sheet giá mới nhất: {target_sheet}")
 
-        # Đọc thô dữ liệu không có header để quét tiêu đề
+        # --- LOGIC 2: Quét tìm Header an toàn (Fix lỗi Attribute Error) ---
         df_raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=target_sheet, header=None)
         
         header_row_idx = 0
         found_header = False
         
-        # Quét 20 dòng đầu để tìm header
+        # Quét 25 dòng đầu để tìm header
         for idx, row in df_raw.iterrows():
-            # FIX LỖI: Chuyển toàn bộ row thành list string rồi join
-            row_as_list = [str(x).lower() for x in row.values]
-            row_str = " ".join(row_as_list)
+            # Ép kiểu string từng ô rồi mới join để tránh lỗi với ô số/ngày tháng
+            row_list = [str(val).lower() for val in row.values]
+            row_str = " ".join(row_list)
             
-            # Điều kiện nhận diện dòng tiêu đề
+            # Điều kiện tìm dòng tiêu đề
             if "mã hàng" in row_str or "mã sp" in row_str:
                 header_row_idx = idx
                 found_header = True
                 break
         
         if not found_header:
-            return False, f"Không tìm thấy dòng tiêu đề chứa 'Mã hàng' trong sheet {target_sheet}"
+            return False, f"Không tìm thấy dòng tiêu đề 'Mã hàng' trong sheet {target_sheet}"
 
-        # Đọc lại file với dòng header chuẩn
+        # --- LOGIC 3: Đọc dữ liệu chuẩn ---
         df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=target_sheet, header=header_row_idx)
         
-        # Chuẩn hóa tên cột
-        df.columns = [str(col).strip() for col in df.columns]
+        # Chuẩn hóa tên cột (xóa khoảng trắng thừa)
+        df.columns = [str(c).strip() for c in df.columns]
         
         # Tìm cột Mã hàng chính xác
         ma_hang_col = next((c for c in df.columns if 'mã hàng' in c.lower() or 'mã sp' in c.lower()), None)
         
         if ma_hang_col:
-            # Loại bỏ dòng mà Mã hàng bị trống (NaN)
+            # Lọc bỏ dòng mà Mã hàng bị trống (NaN) hoặc là dòng tiêu đề phụ (VD: QUẠT, NỒI...)
             df = df.dropna(subset=[ma_hang_col])
             
-            # Chuyển toàn bộ dữ liệu sang string để lưu JSON
+            # Ép kiểu string toàn bộ để lưu JSON không lỗi
             data_dict = df.astype(str).to_dict(orient='records')
             
+            # Lưu file vật lý (Persistence)
             with open(PRICE_DATA_FILE, 'w', encoding='utf-8') as f:
                 json.dump(data_dict, f, ensure_ascii=False, indent=4)
                 
             return True, f"{len(df)} dòng (Sheet: {target_sheet})"
         
-        return False, f"Không tìm thấy cột 'Mã hàng'. Các cột tìm thấy: {list(df.columns)}"
+        return False, f"Lỗi cấu trúc cột trong sheet {target_sheet}"
 
     except Exception as e:
         logger.error(f"Lỗi nạp bảng giá: {e}")
         return False, str(e)
 
 def ask_groq_ai(query):
-    """Hàm AI: Tự tìm dữ liệu Python trước khi gửi AI (Tránh 429 và trả lời sai)"""
+    """
+    Hàm AI:
+    1. Mapping dòng dữ liệu bằng Python (Tiết kiệm Token, tránh lỗi 429).
+    2. Prompt yêu cầu làm tròn số và bỏ qua chiết khấu.
+    3. Xoay vòng 3 API Key.
+    """
     global current_key_index
     
     if not os.path.exists(PRICE_DATA_FILE):
@@ -139,35 +170,39 @@ def ask_groq_ai(query):
         with open(PRICE_DATA_FILE, 'r', encoding='utf-8') as f:
             full_data = json.load(f)
 
-        # 1. Tìm kiếm bằng Python
         query_upper = query.upper()
         found_item = None
         
+        # 1. Tìm kiếm Python (Mapping Mã SP)
         for item in full_data:
-            # Tìm key nào là Mã hàng
+            # Tìm key chứa chữ "Mã" (Mã hàng, Mã SP...)
             key_ma = next((k for k in item.keys() if "mã" in k.lower() and ("hàng" in k.lower() or "sp" in k.lower())), None)
             if key_ma:
                 ma_sp = str(item[key_ma]).upper().strip()
+                # Logic so sánh: Mã trong file (A-092) nằm trong câu hỏi (giá A-092)
                 if ma_sp and ma_sp in query_upper:
                     found_item = item
                     break
         
         if not found_item:
-            return "Iem không tìm thấy mã hàng này trong bảng giá ạ."
+            return "Iem không tìm thấy mã hàng này trong bảng giá ạ (Hoặc chị kiểm tra lại mã xem đúng chưa nha)."
 
-        # 2. Làm sạch dữ liệu
+        # 2. Làm sạch dữ liệu trước khi gửi AI (Bỏ NaN, bỏ cột Unnamed)
         clean_info = {k: v for k, v in found_item.items() if str(v).lower() != 'nan' and 'unnamed' not in str(k).lower()}
 
-        # 3. Prompt tối ưu
+        # 3. Prompt thông minh
         prompt = f"""
-        Dữ liệu sản phẩm: {clean_info}
-        Câu hỏi: "{query}"
+        Dữ liệu sản phẩm (Dictionary): 
+        {clean_info}
         
-        YÊU CẦU:
-        - Trả lời chính xác con số từ dữ liệu trên.
-        - Nếu hỏi "Giá chưa VAT" hoặc "- VAT", hãy lấy giá trị ở cột "- VAT".
-        - Bỏ qua các con số nhỏ (ví dụ 0.35, 15%), đó là chiết khấu, KHÔNG PHẢI GIÁ TIỀN.
-        - Trả lời ngắn gọn: "Mã [Mã SP]: [Loại giá] là [Số tiền] VNĐ".
+        Câu hỏi khách hàng: "{query}"
+        
+        NHIỆM VỤ QUAN TRỌNG:
+        1. Tìm đúng loại giá khách hỏi (Giá nhập, Giá niêm yết, Giá bán...). 
+           - Lưu ý: "Giá chưa VAT" thường nằm ở cột "- VAT" hoặc "- VAT.1".
+        2. BỎ QUA các con số phần trăm nhỏ (như 0.35, 15, 30). Đó là chiết khấu, KHÔNG PHẢI GIÁ TIỀN.
+        3. LÀM TRÒN SỐ: Nếu giá là số lẻ (ví dụ 525909.0), hãy làm tròn đến hàng nghìn gần nhất (thành 526.000).
+        4. Trả lời ngắn gọn: "Mã [Mã SP]: [Loại giá] là [Số tiền đã làm tròn] VNĐ".
         """
 
         # 4. Xoay vòng 3 API Key
@@ -176,7 +211,6 @@ def ask_groq_ai(query):
             if not api_key:
                 current_key_index = (current_key_index + 1) % 3
                 continue
-                
             try:
                 client = Groq(api_key=api_key)
                 completion = client.chat.completions.create(
@@ -186,16 +220,16 @@ def ask_groq_ai(query):
                 )
                 return completion.choices[0].message.content
             except Exception as e:
-                if "429" in str(e):
-                    logger.warning(f"Key {current_key_index} hết hạn mức. Đổi key...")
+                if "429" in str(e): # Rate Limit Error
+                    logger.warning(f"Key {current_key_index + 1} hết hạn mức. Đổi key...")
                     current_key_index = (current_key_index + 1) % 3
                     continue
                 return f"Lỗi AI: {e}"
         
-        return "Tất cả 3 Key AI đều đang bận hoặc hết hạn mức. Thử lại sau nhé!"
+        return "Hệ thống AI đang bận (Hết quota cho cả 3 key), vui lòng thử lại sau nhé!"
 
     except Exception as e:
-        return f"Lỗi hệ thống: {e}"
+        return f"Lỗi hệ thống tra cứu: {e}"
 
 # ---------------- Keep port open (Render free) ----------------
 def keep_port_open():
@@ -211,7 +245,7 @@ def keep_port_open():
 
 threading.Thread(target=keep_port_open, daemon=True).start()
 
-# ---------------- Odoo connect (GIỮ NGUYÊN) ----------------
+# ---------------- Odoo connect (FIX DUY NHẤT) ----------------
 def connect_odoo():
     try:
         if not ODOO_URL_FINAL:
@@ -723,14 +757,14 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     user_input = update.message.text.strip()
     
-    # --- LOGIC AI ---
+    # --- LOGIC MỚI: Nếu hỏi giá thì dùng AI ---
     if any(k in user_input.lower() for k in ['giá', 'bao nhiêu', 'vat', 'bảng giá', 'price']):
         await update.message.reply_text("⌛️ Iem đang tra bảng giá xíu...")
         answer = ask_groq_ai(user_input)
         await update.message.reply_text(answer)
         return
 
-    # --- LOGIC ODOO ---
+    # --- LOGIC CŨ: Tra tồn kho Odoo ---
     product_code = user_input.upper()
     await update.message.reply_text(
         f"đang tra tồn cho `{product_code}`, vui lòng chờ!",
@@ -945,8 +979,9 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Chỉ hỗ trợ file Excel định dạng .xlsx thôi nha.")
         return
 
-    # --- PHÂN LOẠI FILE: PO hay Bảng Giá ---
+    # --- LOGIC MỚI: Phân biệt PO và Bảng Giá ---
     if context.user_data.get('waiting_for_po'):
+        # Xử lý PO (Code cũ)
         context.user_data['waiting_for_po'] = False
         await update.message.reply_text("⌛️ Iem đang xử lý file PO, chờ em xíu xìu xiu nha...")
 
@@ -966,7 +1001,7 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Lỗi khi tải file PO: {e}")
         return
     else:
-        # Mặc định là nạp Bảng Giá
+        # Xử lý Bảng Giá (Tính năng mới)
         await update.message.reply_text("📥 Đang nạp bảng giá mới cho AI...")
         try:
             file = await document.get_file()
@@ -1002,21 +1037,6 @@ def start_http():
 
 
 threading.Thread(target=start_http, daemon=True).start()
-
-# ---------------- AUTO-PING ----------------
-PING_URL = "https://google.com"
-
-def keep_alive_ping():
-    while True:
-        try:
-            urllib.request.urlopen(PING_URL, timeout=10)
-            logger.info("Keep-alive ping sent.")
-        except Exception as e:
-            logger.warning(f"Keep-alive ping failed: {e}")
-        time.sleep(300)
-
-
-threading.Thread(target=keep_alive_ping, daemon=True).start()
 
 # ---------------- WATCHDOG 201/201 ----------------
 WATCH_INTERVAL = 60
