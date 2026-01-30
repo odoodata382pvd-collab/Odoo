@@ -18,7 +18,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import pytz
-# --- TÍCH HỢP THÊM GROQ ---
 from groq import Groq
 
 # ---------------- Config Environment ----------------
@@ -65,20 +64,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------------- AI GROQ & PRICE DATA (TÍNH NĂNG MỚI) ----------------
+# ---------------- AI GROQ & PRICE DATA (FIX LỖI SAI GIÁ & 0 ĐỒNG) ----------------
 PRICE_DATA_FILE = "price_cache.json"
 
 def process_price_excel(file_bytes):
     """
     Hàm nạp bảng giá: 
-    1. Tìm Sheet mới nhất theo thời gian (Txx,xxxx).
-    2. Lưu dữ liệu + Tên sheet vào Cache JSON.
+    1. Tìm Sheet mới nhất (Txx,xxxx).
+    2. Quét header chính xác.
+    3. Lưu dữ liệu.
     """
     try:
         xl = pd.ExcelFile(io.BytesIO(file_bytes))
         sheet_names = xl.sheet_names
         
-        # 1. Tìm Sheet mới nhất theo tên (T12,2025...)
+        # 1. Tìm Sheet mới nhất
         target_sheet = None
         max_date = None
         pattern = re.compile(r'T(\d+)[\.,_\-\s](\d+)', re.IGNORECASE)
@@ -102,7 +102,7 @@ def process_price_excel(file_bytes):
         else:
             logger.info(f"Dùng sheet mới nhất: {target_sheet}")
 
-        # 2. Quét header an toàn
+        # 2. Quét header (Fix lỗi Attribute Error cũ)
         df_raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=target_sheet, header=None)
         header_row_idx = 0
         found_header = False
@@ -118,17 +118,20 @@ def process_price_excel(file_bytes):
         if not found_header:
             return False, f"Không tìm thấy cột 'Mã hàng' trong sheet {target_sheet}"
 
-        # 3. Đọc dữ liệu & Lưu cache
+        # 3. Đọc dữ liệu chuẩn
         df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=target_sheet, header=header_row_idx)
+        
+        # Chuẩn hóa tên cột: Xóa khoảng trắng thừa
         df.columns = [str(c).strip() for c in df.columns]
         
+        # Tìm cột Mã hàng
         ma_hang_col = next((c for c in df.columns if 'mã hàng' in c.lower() or 'mã sp' in c.lower()), None)
         
         if ma_hang_col:
             df = df.dropna(subset=[ma_hang_col])
+            # Ép kiểu string để tránh lỗi JSON
             data_dict = df.astype(str).to_dict(orient='records')
             
-            # Cấu trúc lưu mới: Bao gồm cả tên Sheet
             cache_data = {
                 "sheet_name": target_sheet,
                 "data": data_dict
@@ -146,7 +149,7 @@ def process_price_excel(file_bytes):
         return False, str(e)
 
 def ask_groq_ai(query):
-    """Hàm AI: Trả lời theo FORM MẪU BẮT BUỘC"""
+    """Hàm AI: Prompt chuyên sâu để lấy đúng cột và loại bỏ số 0/số nhỏ"""
     global current_key_index
     
     if not os.path.exists(PRICE_DATA_FILE):
@@ -156,7 +159,7 @@ def ask_groq_ai(query):
         with open(PRICE_DATA_FILE, 'r', encoding='utf-8') as f:
             cache = json.load(f)
             
-        if isinstance(cache, list): # Tương thích ngược
+        if isinstance(cache, list):
             full_data = cache
             sheet_name = "Mới nhất"
         else:
@@ -178,27 +181,33 @@ def ask_groq_ai(query):
         if not found_item:
             return "Iem không tìm thấy mã hàng này trong bảng giá ạ."
 
+        # Lọc bỏ giá trị NaN
         clean_info = {k: v for k, v in found_item.items() if str(v).lower() != 'nan' and 'unnamed' not in str(k).lower()}
 
-        # 2. PROMPT ÉP FORM TRẢ LỜI CHUẨN
+        # 2. PROMPT FIX LỖI GIÁ (QUAN TRỌNG NHẤT)
         prompt = f"""
-        Dữ liệu sản phẩm: {clean_info}
+        Dữ liệu sản phẩm (JSON): 
+        {clean_info}
+        
         Tên bảng giá: {sheet_name}
         Câu hỏi: "{query}"
         
-        NHIỆM VỤ: Trả lời chính xác theo mẫu dưới đây.
-        QUY TẮC SỐ LIỆU:
-        - Giá nhập: Lấy cột "Giá nhập (+VAT 10%)" hoặc tương tự.
-        - VAT 10%: Lấy cột "Giá (VAT 10%)".
-        - VAT 8%: Lấy cột "Giá Mới (VAT 8%)" hoặc cột giá thấp hơn.
-        - Giá niêm yết: Lấy cột "Niêm Yết".
-        - Giá chưa VAT: Lấy cột "- VAT" hoặc "- VAT.1". Lấy con số tiền, bỏ qua nếu là NaN.
-        - QUAN TRỌNG: Làm tròn số đến hàng nghìn (VD: 525909 -> 526.000). Bỏ qua các số % chiết khấu (0.35, 15...).
+        NHIỆM VỤ: Trả lời chính xác theo FORM mẫu bên dưới.
         
-        FORM TRẢ LỜI BẮT BUỘC (Copy y nguyên, không thêm lời dẫn):
+        QUY TẮC XỬ LÝ SỐ LIỆU (BẮT BUỘC):
+        1. **CHẶN SỐ NHỎ:** Bất kỳ con số nào nhỏ hơn 1000 (Ví dụ: 0, 0.3, 0.15, 30, 40) => ĐÓ LÀ PHẦN TRĂM CHIẾT KHẤU HOẶC RÁC. TUYỆT ĐỐI KHÔNG DÙNG LÀM GIÁ.
+        2. **TÌM CỘT GIÁ CHÍNH XÁC:**
+           - "Giá niêm yết": Lấy ở cột 'Niêm Yết'.
+           - "Giá nhập (VAT 10%)": Lấy ở cột 'Giá nhập (+VAT 10%)' hoặc cột chứa số lớn gần 100.000 trở lên.
+           - "Giá nhập (VAT 8%)": Lấy ở cột 'Giá nhập (Bao gồm VAT)' hoặc cột 'Giá Mới'.
+           - "Giá chưa VAT": Lấy ở cột '- VAT' (giá cũ) hoặc '- VAT.1' (giá mới 8%). Ưu tiên lấy giá ở cột '- VAT.1' nếu có.
+        3. **LÀM TRÒN:** Nếu giá là số lẻ (VD: 311818.18), hãy làm tròn thành 312.000.
+        4. Nếu một loại giá là 0 hoặc không tìm thấy số lớn > 1000, ghi là "Chưa có thông tin".
+        
+        FORM TRẢ LỜI (Copy y nguyên):
         📦 *[Mã SP]*
         📅 Bảng giá tháng ({sheet_name})
-        💰 *Giá nhập:* [Số tiền] VNĐ
+        💰 *Giá nhập:*
         - *VAT 10%: * [Số tiền] VNĐ
         - *VAT 8%: * [Số tiền] VNĐ
         - *Giá niêm yết: * [Số tiền] VNĐ
@@ -244,7 +253,7 @@ def keep_port_open():
 
 threading.Thread(target=keep_port_open, daemon=True).start()
 
-# ---------------- Odoo connect (FIX DUY NHẤT) ----------------
+# ---------------- Odoo connect (GIỮ NGUYÊN) ----------------
 def connect_odoo():
     try:
         if not ODOO_URL_FINAL:
@@ -1035,6 +1044,21 @@ def start_http():
 
 
 threading.Thread(target=start_http, daemon=True).start()
+
+# ---------------- AUTO-PING ----------------
+PING_URL = "https://google.com"
+
+def keep_alive_ping():
+    while True:
+        try:
+            urllib.request.urlopen(PING_URL, timeout=10)
+            logger.info("Keep-alive ping sent.")
+        except Exception as e:
+            logger.warning(f"Keep-alive ping failed: {e}")
+        time.sleep(300)
+
+
+threading.Thread(target=keep_alive_ping, daemon=True).start()
 
 # ---------------- WATCHDOG 201/201 ----------------
 WATCH_INTERVAL = 60
