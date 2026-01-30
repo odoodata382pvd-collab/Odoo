@@ -16,12 +16,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import pytz
-# --- TÍCH HỢP THÊM GROQ ---
+# --- BỔ SUNG THƯ VIỆN AI ---
 from groq import Groq
 
 # ---------------- Config Environment ----------------
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
-GROQ_API_KEY = os.environ.get('GROQ_API_KEY') # Biến môi trường mới cho AI
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY') # Biến môi trường cho AI
 
 ODOO_URL_RAW = os.environ.get('ODOO_URL').rstrip('/') if os.environ.get('ODOO_URL') else None
 if ODOO_URL_RAW and ODOO_URL_RAW.lower().endswith('/odoo'):
@@ -56,49 +56,45 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------------- AI Groq & Price Data (TÍCH HỢP THÊM) ----------------
+# ---------------- AI GROQ & PRICE DATA (BỔ SUNG) ----------------
 PRICE_LIST_CONTEXT = ""
 
 def process_price_excel(file_bytes):
-    """Hàm nạp bảng giá: Tự động tìm header và nhận diện đủ dòng dữ liệu"""
+    """Hàm nạp bảng giá: Đã sửa lỗi ép kiểu dữ liệu để nhận đủ 100+ dòng"""
     global PRICE_LIST_CONTEXT
     try:
-        # Đọc sheet cuối cùng (thường là sheet mới nhất trong bảng giá của mày)
         xl = pd.ExcelFile(io.BytesIO(file_bytes))
         latest_sheet = xl.sheet_names[-1]
         df_raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=latest_sheet, header=None)
         
-        # Tìm dòng tiêu đề (quét 20 dòng đầu)
         header_row_idx = 0
         for idx in range(min(len(df_raw), 20)):
-            # Ép kiểu string toàn bộ dòng để không lỗi float found khi quét header
+            # Ép kiểu string toàn bộ hàng để quét tiêu đề chính xác
             row_values = df_raw.iloc[idx].astype(str).str.lower().fillna('')
             row_text = " ".join(row_values)
             if any(key in row_text for key in ["mã hàng", "model", "mã sp", "niêm yết"]):
                 header_row_idx = idx
                 break
         
-        # Đọc lại với header đúng
         df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=latest_sheet, header=header_row_idx)
-        # Loại bỏ các dòng hoàn toàn trống
         df = df.dropna(how='all')
         
         PRICE_LIST_CONTEXT = df.to_string(index=False)
         return True, len(df)
     except Exception as e:
-        logger.error(f"Lỗi xử lý bảng giá: {e}")
+        logger.error(f"Lỗi nạp bảng giá: {e}")
         return False, str(e)
 
 def ask_groq_ai(query):
-    """Hàm AI tra cứu giá"""
+    """Hàm gọi AI tra cứu giá: Đã sửa lỗi Model 404"""
     if not GROQ_API_KEY: return "Chưa cấu hình GROQ_API_KEY."
     if not PRICE_LIST_CONTEXT: return "Iem chưa có dữ liệu bảng giá."
     try:
         client = Groq(api_key=GROQ_API_KEY)
-        prompt = f"Bảng giá hiện tại:\n{PRICE_LIST_CONTEXT}\n\nKhách hỏi: {query}\nTìm đúng mã sản phẩm và báo giá chính xác. Trả lời ngắn gọn."
+        # Sử dụng Model mới nhất llama-3.3-70b-versatile
         completion = client.chat.completions.create(
-            model="llama-3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": f"Dữ liệu bảng giá:\n{PRICE_LIST_CONTEXT}\n\nKhách hỏi: {query}\nHãy trả lời giá chính xác và ngắn gọn."}],
             temperature=0
         )
         return completion.choices[0].message.content
@@ -628,14 +624,13 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
 
-    # --- ĐOẠN TÍCH HỢP GROQ: CHỈ CHÈN VÀO ĐẦU ---
+    # --- BỔ SUNG: Nếu khách hỏi liên quan đến giá ---
     user_input = update.message.text.strip()
     if any(k in user_input.lower() for k in ['giá', 'bao nhiêu', 'vat', 'bảng giá', 'price']):
         await update.message.reply_text("⌛️ Iem đang tra bảng giá xíu...")
         answer = ask_groq_ai(user_input)
         await update.message.reply_text(answer)
         return
-    # --- HẾT ĐOẠN TÍCH HỢP ---
 
     product_code = user_input.upper()
     await update.message.reply_text(
@@ -851,39 +846,33 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Chỉ hỗ trợ file Excel định dạng .xlsx thôi nha.")
         return
 
-    # --- ĐOẠN TÍCH HỢP XỬ LÝ FILE: Phân biệt PO và Bảng Giá ---
+    # --- BỔ SUNG: Phân biệt PO và Bảng Giá ---
     if context.user_data.get('waiting_for_po'):
         context.user_data['waiting_for_po'] = False
         await update.message.reply_text("⌛️ Iem đang xử lý file PO, chờ em xíu xìu xiu nha...")
-
         try:
             file = await document.get_file()
             file_bytes = await file.download_as_bytearray()
             excel_buffer, error_msg = process_po_and_build_report(bytes(file_bytes))
             if excel_buffer:
-                await update.message.reply_document(
-                    document=excel_buffer,
-                    filename="kiem_tra_po.xlsx",
-                    caption="❤️ Iem gửi chị file kiểm tra PO đây ạ!"
-                )
+                await update.message.reply_document(document=excel_buffer, filename="kiem_tra_po.xlsx", caption="❤️ Xong rồi!")
             else:
                 await update.message.reply_text(f"❌ Lỗi: {error_msg}")
         except Exception as e:
-            await update.message.reply_text(f"❌ Lỗi khi tải file PO: {e}")
-        return
+            await update.message.reply_text(f"❌ Lỗi tải file: {e}")
     else:
-        # Nếu không chờ PO -> Mặc định nạp bảng giá mới
+        # Nếu gửi file Excel bình thường -> Nạp Bảng Giá AI
         await update.message.reply_text("📥 Đang nạp bảng giá mới cho AI...")
         try:
             file = await document.get_file()
             file_bytes = await file.download_as_bytearray()
             success, info = process_price_excel(bytes(file_bytes))
             if success:
-                await update.message.reply_text(f"✅ Đã nạp thành công bảng giá ({info} dòng). Chị có thể hỏi giá bất kỳ mã nào rồi nha!")
+                await update.message.reply_text(f"✅ Đã nạp thành công bảng giá ({info} dòng). Chị có thể hỏi giá bất cứ mã nào rồi nha!")
             else:
                 await update.message.reply_text(f"❌ Lỗi nạp bảng giá: {info}")
         except Exception as e:
-            await update.message.reply_text(f"❌ Lỗi xử lý file: {e}")
+            await update.message.reply_text(f"❌ Lỗi xử lý: {e}")
 
 
 # ---------------- HTTP Ping Server ----------------
