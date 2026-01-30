@@ -1,9 +1,7 @@
 import os
 import io
-import json
 import logging
 import pandas as pd
-import re
 import ssl
 import xmlrpc.client
 import asyncio
@@ -12,6 +10,8 @@ import threading
 import time
 import urllib.request
 import requests
+import json
+import re
 from datetime import datetime
 from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -64,21 +64,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------------- AI GROQ & PRICE DATA (FIX LỖI SAI GIÁ & 0 ĐỒNG) ----------------
+# ---------------- TÍNH NĂNG MỚI: AI GROQ & XỬ LÝ BẢNG GIÁ ----------------
 PRICE_DATA_FILE = "price_cache.json"
 
 def process_price_excel(file_bytes):
     """
     Hàm nạp bảng giá: 
-    1. Tìm Sheet mới nhất (Txx,xxxx).
-    2. Quét header chính xác.
-    3. Lưu dữ liệu.
+    1. Tìm Sheet có thời gian mới nhất (Txx,xxxx).
+    2. Quét header thông minh (xử lý gộp dòng).
+    3. Lưu dữ liệu + Tên Sheet vào Cache.
     """
     try:
         xl = pd.ExcelFile(io.BytesIO(file_bytes))
         sheet_names = xl.sheet_names
         
-        # 1. Tìm Sheet mới nhất
+        # 1. Tìm Sheet mới nhất theo tên (T12,2025...)
         target_sheet = None
         max_date = None
         pattern = re.compile(r'T(\d+)[\.,_\-\s](\d+)', re.IGNORECASE)
@@ -98,38 +98,59 @@ def process_price_excel(file_bytes):
         
         if not target_sheet:
             target_sheet = sheet_names[0]
-            logger.info(f"Dùng sheet đầu tiên: {target_sheet}")
+            logger.info(f"Không tìm thấy sheet ngày tháng, dùng sheet đầu tiên: {target_sheet}")
         else:
-            logger.info(f"Dùng sheet mới nhất: {target_sheet}")
+            logger.info(f"Đã tìm thấy sheet giá mới nhất: {target_sheet}")
 
-        # 2. Quét header (Fix lỗi Attribute Error cũ)
+        # 2. Đọc thô để dò tìm Header chính xác
         df_raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=target_sheet, header=None)
+        
         header_row_idx = 0
         found_header = False
         
+        # Quét 25 dòng đầu
         for idx, row in df_raw.iterrows():
             row_list = [str(val).lower() for val in row.values]
             row_str = " ".join(row_list)
-            if "mã hàng" in row_str or "mã sp" in row_str:
+            
+            # Ưu tiên tìm dòng có chữ "niêm yết" (thường chứa đủ cột giá)
+            if "niêm yết" in row_str:
                 header_row_idx = idx
                 found_header = True
                 break
+            
+            # Nếu không thấy niêm yết, tìm dòng có mã hàng
+            elif "mã hàng" in row_str or "mã sp" in row_str:
+                if not found_header:
+                    header_row_idx = idx
+                    # Không break vội, tìm tiếp xem có dòng nào xịn hơn không
         
         if not found_header:
-            return False, f"Không tìm thấy cột 'Mã hàng' trong sheet {target_sheet}"
+            return False, f"Không tìm thấy dòng tiêu đề hợp lệ trong sheet {target_sheet}"
 
-        # 3. Đọc dữ liệu chuẩn
+        # 3. Đọc dữ liệu với header tìm được
         df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=target_sheet, header=header_row_idx)
         
-        # Chuẩn hóa tên cột: Xóa khoảng trắng thừa
+        # --- HEADER PATCHING (VÁ LỖI MERGE CELL) ---
+        # Nếu chọn dòng "Niêm Yết" làm header, các cột "Mã hàng" ở dòng trên có thể bị Unnamed.
+        # Lấy tên từ dòng phía trên để điền vào.
+        if header_row_idx > 0:
+            for i, col_name in enumerate(df.columns):
+                if str(col_name).startswith('Unnamed') or str(col_name).lower() == 'nan':
+                    # Lấy giá trị ở dòng ngay trên header
+                    val_above = str(df_raw.iloc[header_row_idx - 1, i]).strip()
+                    if val_above and val_above.lower() != 'nan':
+                        df.columns.values[i] = val_above
+
+        # Chuẩn hóa tên cột
         df.columns = [str(c).strip() for c in df.columns]
         
-        # Tìm cột Mã hàng
+        # Tìm cột Mã hàng chính xác
         ma_hang_col = next((c for c in df.columns if 'mã hàng' in c.lower() or 'mã sp' in c.lower()), None)
         
         if ma_hang_col:
             df = df.dropna(subset=[ma_hang_col])
-            # Ép kiểu string để tránh lỗi JSON
+            # Ép kiểu string toàn bộ
             data_dict = df.astype(str).to_dict(orient='records')
             
             cache_data = {
@@ -149,7 +170,9 @@ def process_price_excel(file_bytes):
         return False, str(e)
 
 def ask_groq_ai(query):
-    """Hàm AI: Prompt chuyên sâu để lấy đúng cột và loại bỏ số 0/số nhỏ"""
+    """
+    Hàm AI: Trả lời theo FORM BẮT BUỘC + Logic lọc giá
+    """
     global current_key_index
     
     if not os.path.exists(PRICE_DATA_FILE):
@@ -159,6 +182,7 @@ def ask_groq_ai(query):
         with open(PRICE_DATA_FILE, 'r', encoding='utf-8') as f:
             cache = json.load(f)
             
+        # Xử lý tương thích ngược
         if isinstance(cache, list):
             full_data = cache
             sheet_name = "Mới nhất"
@@ -166,14 +190,15 @@ def ask_groq_ai(query):
             full_data = cache.get("data", [])
             sheet_name = cache.get("sheet_name", "Mới nhất")
 
-        # 1. Tìm dòng dữ liệu (Python Search)
         query_upper = query.upper()
         found_item = None
         
+        # 1. Tìm kiếm Python (Mapping Mã SP)
         for item in full_data:
             key_ma = next((k for k in item.keys() if "mã" in k.lower() and ("hàng" in k.lower() or "sp" in k.lower())), None)
             if key_ma:
                 ma_sp = str(item[key_ma]).upper().strip()
+                # Logic so sánh: Mã trong file (A-092) nằm trong câu hỏi
                 if ma_sp and ma_sp in query_upper:
                     found_item = item
                     break
@@ -181,37 +206,34 @@ def ask_groq_ai(query):
         if not found_item:
             return "Iem không tìm thấy mã hàng này trong bảng giá ạ."
 
-        # Lọc bỏ giá trị NaN
         clean_info = {k: v for k, v in found_item.items() if str(v).lower() != 'nan' and 'unnamed' not in str(k).lower()}
 
-        # 2. PROMPT FIX LỖI GIÁ (QUAN TRỌNG NHẤT)
+        # 2. PROMPT FIX LỖI GIÁ & FORM TRẢ LỜI
         prompt = f"""
-        Dữ liệu sản phẩm (JSON): 
-        {clean_info}
-        
+        Dữ liệu sản phẩm: {clean_info}
         Tên bảng giá: {sheet_name}
         Câu hỏi: "{query}"
         
         NHIỆM VỤ: Trả lời chính xác theo FORM mẫu bên dưới.
         
         QUY TẮC XỬ LÝ SỐ LIỆU (BẮT BUỘC):
-        1. **CHẶN SỐ NHỎ:** Bất kỳ con số nào nhỏ hơn 1000 (Ví dụ: 0, 0.3, 0.15, 30, 40) => ĐÓ LÀ PHẦN TRĂM CHIẾT KHẤU HOẶC RÁC. TUYỆT ĐỐI KHÔNG DÙNG LÀM GIÁ.
-        2. **TÌM CỘT GIÁ CHÍNH XÁC:**
-           - "Giá niêm yết": Lấy ở cột 'Niêm Yết'.
-           - "Giá nhập (VAT 10%)": Lấy ở cột 'Giá nhập (+VAT 10%)' hoặc cột chứa số lớn gần 100.000 trở lên.
-           - "Giá nhập (VAT 8%)": Lấy ở cột 'Giá nhập (Bao gồm VAT)' hoặc cột 'Giá Mới'.
-           - "Giá chưa VAT": Lấy ở cột '- VAT' (giá cũ) hoặc '- VAT.1' (giá mới 8%). Ưu tiên lấy giá ở cột '- VAT.1' nếu có.
-        3. **LÀM TRÒN:** Nếu giá là số lẻ (VD: 311818.18), hãy làm tròn thành 312.000.
-        4. Nếu một loại giá là 0 hoặc không tìm thấy số lớn > 1000, ghi là "Chưa có thông tin".
+        1. **CHẶN SỐ NHỎ:** Bất kỳ con số nào nhỏ hơn 1000 (Ví dụ: 0, 0.3, 0.15, 30, 40) => ĐÓ LÀ CHIẾT KHẤU HOẶC RÁC. BỎ QUA NGAY.
+        2. **TÌM CỘT GIÁ:**
+           - "Giá niêm yết": Cột 'Niêm Yết'.
+           - "Giá nhập": Cột 'Giá nhập (+VAT 10%)' hoặc tương tự.
+           - "VAT 10%": Lấy giá trị tương ứng của mức thuế 10%.
+           - "VAT 8%": Cột 'Giá Mới (VAT 8%)' hoặc 'Giá nhập (Bao gồm VAT)'.
+           - "Giá chưa VAT": Cột '- VAT' (giá cũ) hoặc '- VAT.1' (giá mới 8%). Ưu tiên lấy giá ở cột '- VAT.1' (cột sau) nếu có.
+        3. **LÀM TRÒN:** Luôn làm tròn số đến hàng nghìn (VD: 525909 -> 526.000).
         
         FORM TRẢ LỜI (Copy y nguyên):
-        📦 *[Mã SP]*
+        *📦 {found_item.get(key_ma, 'Mã SP')}*
         📅 Bảng giá tháng ({sheet_name})
-        💰 *Giá nhập:*
-        - *VAT 10%: * [Số tiền] VNĐ
-        - *VAT 8%: * [Số tiền] VNĐ
-        - *Giá niêm yết: * [Số tiền] VNĐ
-        - *Giá chưa VAT: * [Số tiền] VNĐ
+        *💰 - Giá nhập:*
+        - VAT 10%: [Số tiền] VNĐ
+        - VAT 8%: [Số tiền] VNĐ
+        - Giá niêm yết: [Số tiền] VNĐ
+        - Giá chưa VAT: [Số tiền] VNĐ
         """
 
         # 3. Xoay vòng Key
@@ -911,115 +933,6 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         logger.error(f"lỗi khi tra tồn: {e}")
         await update.message.reply_text(f"❌ lỗi khi tra tồn: {e}")
-
-
-# ---------------- Telegram Handlers ----------------
-async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat_id
-    register_chat_id(chat_id)
-
-    await update.message.reply_text("Đang kiểm tra kết nối odoo, xin chờ...")
-    uid, _, error_msg = connect_odoo()
-    if uid:
-        await update.message.reply_text(f"✅ Thành công! Kết nối Odoo DB: {ODOO_DB}")
-    else:
-        await update.message.reply_text(f"❌ Lỗi: {error_msg}")
-
-
-async def excel_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat_id
-    register_chat_id(chat_id)
-
-    await update.message.reply_text("⌛️ Iem đang xử lý dữ liệu và tạo báo cáo Excel...")
-    excel_buffer, item_count, error_msg = get_stock_data()
-
-    if excel_buffer is None:
-        await update.message.reply_text(f"❌ Lỗi: {error_msg}")
-        return
-
-    if item_count > 0:
-        await update.message.reply_document(
-            document=excel_buffer,
-            filename="de_xuat_keo_hang.xlsx",
-            caption=f"Đã tìm thấy {item_count} sản phẩm cần kéo hàng."
-        )
-    else:
-        await update.message.reply_text(
-            f"Không có sản phẩm nào cần kéo hàng (đủ tồn {TARGET_MIN_QTY})."
-        )
-
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat_id
-    register_chat_id(chat_id)
-
-    name = update.message.from_user.first_name
-    await update.message.reply_text(
-        f"Chào {name}!\n"
-        "1. Gõ mã sp để tra tồn.\n"
-        "2. Hỏi giá sản phẩm để iem báo giá.\n"
-        "3. Gửi file Excel bảng giá để cập nhật.\n"
-        "4. /keohang để tạo báo cáo Excel.\n"
-        "5. /ping để kiểm tra kết nối Odoo."
-    )
-
-
-async def checkpo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat_id
-    register_chat_id(chat_id)
-
-    context.user_data['waiting_for_po'] = True
-    await update.message.reply_text(
-        "Ok, gửi file PO Excel (.xlsx) để iem kiểm tra tồn kho theo mẫu đối tác gửi nha!"
-    )
-
-
-async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat_id
-    register_chat_id(chat_id)
-
-    document = update.message.document
-    if not document:
-        return
-
-    file_name = (document.file_name or "").lower()
-    if not file_name.endswith(".xlsx"):
-        await update.message.reply_text("Chỉ hỗ trợ file Excel định dạng .xlsx thôi nha.")
-        return
-
-    # --- PHÂN LOẠI FILE: PO hay Bảng Giá ---
-    if context.user_data.get('waiting_for_po'):
-        context.user_data['waiting_for_po'] = False
-        await update.message.reply_text("⌛️ Iem đang xử lý file PO, chờ em xíu xìu xiu nha...")
-
-        try:
-            file = await document.get_file()
-            file_bytes = await file.download_as_bytearray()
-            excel_buffer, error_msg = process_po_and_build_report(bytes(file_bytes))
-            if excel_buffer:
-                await update.message.reply_document(
-                    document=excel_buffer,
-                    filename="kiem_tra_po.xlsx",
-                    caption="❤️ Iem gửi chị file kiểm tra PO và đối chiếu tồn kho đây ạ!"
-                )
-            else:
-                await update.message.reply_text(f"❌ Lỗi: {error_msg}")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Lỗi khi tải file PO: {e}")
-        return
-    else:
-        # Mặc định là nạp Bảng Giá
-        await update.message.reply_text("📥 Đang nạp bảng giá mới cho AI...")
-        try:
-            file = await document.get_file()
-            file_bytes = await file.download_as_bytearray()
-            success, info = process_price_excel(bytes(file_bytes))
-            if success:
-                await update.message.reply_text(f"✅ Đã nạp thành công bảng giá ({info}). Chị có thể bắt đầu hỏi giá rồi nha!")
-            else:
-                await update.message.reply_text(f"❌ Lỗi nạp bảng giá: {info}")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Lỗi xử lý file: {e}")
 
 
 # ---------------- HTTP Ping Server ----------------
