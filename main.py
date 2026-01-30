@@ -21,7 +21,7 @@ from groq import Groq
 
 # ---------------- Config Environment ----------------
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
-GROQ_API_KEY = os.environ.get('GROQ_API_KEY') # Biến môi trường mới
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY') # Biến môi trường mới cho AI
 
 ODOO_URL_RAW = os.environ.get('ODOO_URL').rstrip('/') if os.environ.get('ODOO_URL') else None
 if ODOO_URL_RAW and ODOO_URL_RAW.lower().endswith('/odoo'):
@@ -60,19 +60,29 @@ logger = logging.getLogger(__name__)
 PRICE_LIST_CONTEXT = ""
 
 def process_price_excel(file_bytes):
-    """Hàm tự động mapping và nạp bảng giá - FIX LỖI ÉP KIỂU STRING"""
+    """Hàm nạp bảng giá: Tự động tìm header và nhận diện đủ dòng dữ liệu"""
     global PRICE_LIST_CONTEXT
     try:
-        df_tmp = pd.read_excel(io.BytesIO(file_bytes), header=None)
+        # Đọc sheet cuối cùng (thường là sheet mới nhất trong bảng giá của mày)
+        xl = pd.ExcelFile(io.BytesIO(file_bytes))
+        latest_sheet = xl.sheet_names[-1]
+        df_raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=latest_sheet, header=None)
+        
+        # Tìm dòng tiêu đề (quét 20 dòng đầu)
         header_row_idx = 0
-        for idx in range(min(len(df_tmp), 15)):
-            # Sửa lỗi: Đảm bảo mọi giá trị trong dòng là string trước khi xử lý
-            row_values = df_tmp.iloc[idx].astype(str).str.lower().fillna('')
+        for idx in range(min(len(df_raw), 20)):
+            # Ép kiểu string toàn bộ dòng để không lỗi float found khi quét header
+            row_values = df_raw.iloc[idx].astype(str).str.lower().fillna('')
             row_text = " ".join(row_values)
-            if any(key in row_text for key in ["model", "mã", "giá", "price"]):
+            if any(key in row_text for key in ["mã hàng", "model", "mã sp", "niêm yết"]):
                 header_row_idx = idx
                 break
-        df = pd.read_excel(io.BytesIO(file_bytes), header=header_row_idx)
+        
+        # Đọc lại với header đúng
+        df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=latest_sheet, header=header_row_idx)
+        # Loại bỏ các dòng hoàn toàn trống
+        df = df.dropna(how='all')
+        
         PRICE_LIST_CONTEXT = df.to_string(index=False)
         return True, len(df)
     except Exception as e:
@@ -80,12 +90,12 @@ def process_price_excel(file_bytes):
         return False, str(e)
 
 def ask_groq_ai(query):
-    """Hàm gọi AI Groq báo giá"""
+    """Hàm AI tra cứu giá"""
     if not GROQ_API_KEY: return "Chưa cấu hình GROQ_API_KEY."
-    if not PRICE_LIST_CONTEXT: return "Iem chưa có bảng giá. Hãy gửi file Excel để nạp nhé!"
+    if not PRICE_LIST_CONTEXT: return "Iem chưa có dữ liệu bảng giá."
     try:
         client = Groq(api_key=GROQ_API_KEY)
-        prompt = f"Bảng giá:\n{PRICE_LIST_CONTEXT}\n\nKhách hỏi: {query}\nTrả lời ngắn gọn giá của mã SP được hỏi."
+        prompt = f"Bảng giá hiện tại:\n{PRICE_LIST_CONTEXT}\n\nKhách hỏi: {query}\nTìm đúng mã sản phẩm và báo giá chính xác. Trả lời ngắn gọn."
         completion = client.chat.completions.create(
             model="llama-3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
@@ -108,7 +118,7 @@ def keep_port_open():
 
 threading.Thread(target=keep_port_open, daemon=True).start()
 
-# ---------------- Odoo connect (GIỮ NGUYÊN) ----------------
+# ---------------- Odoo connect (FIX DUY NHẤT) ----------------
 def connect_odoo():
     try:
         if not ODOO_URL_FINAL:
@@ -390,8 +400,7 @@ def _read_po_with_auto_header(file_bytes: bytes):
 
     header_row_idx = None
     for idx in range(len(df_tmp)):
-        # Ép kiểu string an toàn để không lỗi float found
-        row_values = df_tmp.iloc[idx].astype(str).str.lower().fillna('')
+        row_values = df_tmp.iloc[idx].astype(str).str.lower()
         row_text = " ".join(row_values)
         if any(key in row_text for key in [
             "model", "mã sp", "ma sp", "mã hàng", "ma hang",
@@ -614,15 +623,15 @@ def process_po_and_build_report(file_bytes: bytes):
         return None, f"Lỗi khi xử lý PO: {e}"
 
 
-# ---------------- Handle product code (BẮT ĐẦU TÍCH HỢP) ----------------
+# ---------------- Handle product code (TÍCH HỢP AI) ----------------
 async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
 
-    # --- ĐOẠN TÍCH HỢP GROQ: KHÔNG THAY ĐỔI GÌ BÊN DƯỚI ---
+    # --- ĐOẠN TÍCH HỢP GROQ: CHỈ CHÈN VÀO ĐẦU ---
     user_input = update.message.text.strip()
     if any(k in user_input.lower() for k in ['giá', 'bao nhiêu', 'vat', 'bảng giá', 'price']):
-        await update.message.reply_text("⌛️ Iem đang check bảng giá xíu...")
+        await update.message.reply_text("⌛️ Iem đang tra bảng giá xíu...")
         answer = ask_groq_ai(user_input)
         await update.message.reply_text(answer)
         return
@@ -870,7 +879,7 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_bytes = await file.download_as_bytearray()
             success, info = process_price_excel(bytes(file_bytes))
             if success:
-                await update.message.reply_text(f"✅ Đã nạp bảng giá ({info} dòng). Chị có thể hỏi giá bất cứ mã nào rồi nha!")
+                await update.message.reply_text(f"✅ Đã nạp thành công bảng giá ({info} dòng). Chị có thể hỏi giá bất kỳ mã nào rồi nha!")
             else:
                 await update.message.reply_text(f"❌ Lỗi nạp bảng giá: {info}")
         except Exception as e:
@@ -919,20 +928,6 @@ threading.Thread(target=keep_alive_ping, daemon=True).start()
 WATCH_INTERVAL = 60
 previous_snapshot = {}
 
-# Thêm cơ chế lưu trữ Chat ID để không mất thông báo Watchdog khi bot restart
-CHAT_STORAGE = "registered_chats.txt"
-
-def load_registered_chats():
-    if os.path.exists(CHAT_STORAGE):
-        with open(CHAT_STORAGE, "r") as f:
-            for line in f:
-                if line.strip():
-                    REGISTERED_CHAT_IDS.add(int(line.strip()))
-
-def save_chat_id_to_file(chat_id):
-    if chat_id not in REGISTERED_CHAT_IDS:
-        with open(CHAT_STORAGE, "a") as f:
-            f.write(f"{chat_id}\n")
 
 def watchdog_201():
     global previous_snapshot
@@ -1058,9 +1053,6 @@ def main():
     if not TELEGRAM_TOKEN or not ODOO_URL_RAW or not ODOO_DB or not ODOO_USERNAME or not ODOO_PASSWORD:
         logger.error("Thiếu cấu hình môi trường (token, url, db, user, pass).")
         return
-
-    # Tự động nạp lại Chat ID để không mất Watchdog
-    load_registered_chats()
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
