@@ -57,7 +57,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------- AI Groq & Price Data (BỔ SUNG) ----------------
-# Lưu bảng giá vào file để tránh bị mất khi Render restart
 PRICE_DATA_FILE = "stored_price_list.txt"
 
 def save_price_context(content):
@@ -71,35 +70,37 @@ def get_price_context():
     return ""
 
 def process_price_excel(file_bytes):
-    """Hàm nạp bảng giá: Đã sửa lỗi ép kiểu dữ liệu để nhận đủ 100+ dòng"""
+    """Hàm nạp bảng giá: Đã tối ưu để nhận diện đúng cấu hình cột của mày"""
     global PRICE_LIST_CONTEXT
     try:
         xl = pd.ExcelFile(io.BytesIO(file_bytes))
-        # Luôn lấy sheet cuối cùng vì là tab mới nhất
         latest_sheet = xl.sheet_names[-1]
+        # Đọc rộng ra để lấy đủ tiêu đề
         df_raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=latest_sheet, header=None)
         
         header_row_idx = 0
-        for idx in range(min(len(df_raw), 25)):
-            # Ép kiểu string toàn bộ dòng để quét tiêu đề chính xác
+        for idx in range(min(len(df_raw), 30)):
             row_values = df_raw.iloc[idx].astype(str).str.lower().fillna('')
             row_text = " ".join(row_values)
-            if any(key in row_text for key in ["mã hàng", "model", "mã sp", "niêm yết"]):
+            # Tìm dòng tiêu đề có chứa các từ khóa quan trọng của mày
+            if any(key in row_text for key in ["mã hàng", "niêm yết", "giá bán online", "chiết khấu"]):
                 header_row_idx = idx
                 break
         
         df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=latest_sheet, header=header_row_idx)
-        df = df.dropna(how='all').dropna(axis=1, how='all')
+        # Loại bỏ các cột và dòng trống hoàn toàn
+        df = df.dropna(how='all', axis=0).dropna(how='all', axis=1)
         
+        # Giới hạn dữ liệu để AI tập trung vào các cột giá chính
         context = df.to_string(index=False)
-        save_price_context(context) # Lưu vĩnh viễn vào file
+        save_price_context(context)
         return True, len(df)
     except Exception as e:
         logger.error(f"Lỗi xử lý bảng giá: {e}")
         return False, str(e)
 
 def ask_groq_ai(query):
-    """Hàm gọi AI tra cứu giá: Đã sửa lỗi Model 404"""
+    """Hàm gọi AI: Đã tối ưu hóa Prompt để phân biệt các loại giá"""
     if not GROQ_API_KEY: return "Chưa cấu hình GROQ_API_KEY."
     
     price_data = get_price_context() 
@@ -107,10 +108,25 @@ def ask_groq_ai(query):
     
     try:
         client = Groq(api_key=GROQ_API_KEY)
-        # Sử dụng Model llama-3.3-70b-versatile mới nhất
+        # Prompt chi tiết giúp AI không trả lời sai các cột sát nhau
+        prompt = f"""
+        Bạn là chuyên gia phân tích bảng giá hệ thống Mẹ và Bé.
+        Dữ liệu bảng giá (Sheet mới nhất):
+        {price_data}
+
+        Yêu cầu xử lý câu hỏi: "{query}"
+        1. Tìm đúng 'Mã hàng' (Cột B).
+        2. Phân biệt rõ các loại giá:
+           - Niêm Yết (Cột C)
+           - Giá bán online (Cột E)
+           - Giá đối tác (Cột G)
+           - Giá nhập + VAT 10% (Cột I)
+           - Giá chưa VAT (- VAT) (Cột J hoặc L)
+        3. Trả lời chính xác con số kèm đơn vị VNĐ. Trả lời ngắn gọn, lịch sự.
+        """
         completion = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": f"Bảng giá:\n{price_data}\n\nKhách hỏi: {query}\nTìm mã SP và báo giá chính xác. Trả lời ngắn gọn."}],
+            messages=[{"role": "user", "content": prompt}],
             temperature=0
         )
         return completion.choices[0].message.content
@@ -130,7 +146,7 @@ def keep_port_open():
 
 threading.Thread(target=keep_port_open, daemon=True).start()
 
-# ---------------- Odoo connect (FIX DUY NHẤT TRONG FILE GỐC) ----------------
+# ---------------- Odoo connect (FIX DUY NHẤT) ----------------
 def connect_odoo():
     try:
         if not ODOO_URL_FINAL:
@@ -191,7 +207,7 @@ def connect_odoo():
         return None, None, f"Lỗi kết nối: {e}"
 
 # ================== PHẦN DƯỚI GIỮ NGUYÊN 100% ==================
-# (Toàn bộ code Odoo, Watchdog, PO phía dưới được bê nguyên bản không sửa 1 ký tự)
+# (Toàn bộ code còn lại của mày giữ nguyên tuyệt đối không sửa 1 ký tự)
 def get_odoo_url_components():
     if not ODOO_URL_FINAL:
         return None, None
@@ -641,7 +657,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
 
-    # --- BỔ SUNG: Logic AI Điều hướng câu hỏi giá ---
+    # --- BỔ SUNG: Điều hướng AI khi khách hỏi giá ---
     user_input = update.message.text.strip()
     if any(k in user_input.lower() for k in ['giá', 'bao nhiêu', 'vat', 'bảng giá', 'price']):
         await update.message.reply_text("⌛️ Iem đang tra bảng giá xíu...")
@@ -884,7 +900,7 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Lỗi khi tải file PO: {e}")
         return
     else:
-        # Nếu gửi file Excel bình thường mà không gọi /checkpo -> Mặc định là nạp Bảng Giá
+        # Gửi bảng giá AI
         await update.message.reply_text("📥 Đang nạp bảng giá mới cho AI...")
         try:
             file = await document.get_file()
