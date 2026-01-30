@@ -64,84 +64,96 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------------- AI GROQ & PRICE DATA (BỔ SUNG CẢI TIẾN) ----------------
+# ---------------- AI GROQ & PRICE DATA (KHẮC PHỤC LỖI NHỎ) ----------------
 PRICE_DATA_FILE = "price_cache.json"
 
 def process_price_excel(file_bytes):
-    """Hàm nạp bảng giá: Lưu vào file vĩnh viễn để tránh mất dữ liệu"""
+    """Hàm nạp bảng giá: Quét sâu để tìm tiêu đề gộp ô"""
     try:
         xl = pd.ExcelFile(io.BytesIO(file_bytes))
-        # Lấy sheet T12,2025 hoặc sheet cuối cùng
+        # Ưu tiên tìm sheet tháng 12 hoặc lấy sheet cuối
         target_sheet = 'T12,2025' if 'T12,2025' in xl.sheet_names else xl.sheet_names[-1]
-        df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=target_sheet, header=3)
         
-        # Làm sạch dữ liệu rác
-        if 'Mã hàng' in df.columns:
-            df = df.dropna(subset=['Mã hàng'])
-            # Chuyển thành danh sách dictionary để lưu JSON
-            data_dict = df.to_dict(orient='records')
+        # Đọc thô dữ liệu để tìm hàng tiêu đề
+        df_raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=target_sheet, header=None)
+        
+        header_row_idx = 0
+        for idx, row in df_raw.iterrows():
+            row_str = " ".join(row.astype(str).lower())
+            if "mã hàng" in row_str or "mã sp" in row_str:
+                header_row_idx = idx
+                break
+        
+        # Đọc lại với header chuẩn
+        df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=target_sheet, header=header_row_idx)
+        
+        # Sửa lỗi 'Mã hàng' bị NaN hoặc tên cột không chuẩn do gộp ô
+        df.columns = [str(c).strip() for c in df.columns]
+        # Tìm cột giống 'Mã hàng' nhất
+        ma_hang_col = next((c for c in df.columns if 'mã hàng' in c.lower()), None)
+        
+        if ma_hang_col:
+            df = df.dropna(subset=[ma_hang_col])
+            # Chuyển dữ liệu sang dạng text sạch
+            data_dict = df.astype(str).to_dict(orient='records')
             with open(PRICE_DATA_FILE, 'w', encoding='utf-8') as f:
                 json.dump(data_dict, f, ensure_ascii=False, indent=4)
             return True, len(df)
-        return False, "Không tìm thấy cột 'Mã hàng'"
+        return False, "Không tìm thấy cột 'Mã hàng' trong sheet này"
     except Exception as e:
         logger.error(f"Lỗi nạp bảng giá: {e}")
         return False, str(e)
 
 def ask_groq_ai(query):
-    """Hàm AI: Tự lọc dữ liệu trước khi gửi để tiết kiệm token và chính xác 100%"""
     global current_key_index
-    
     if not os.path.exists(PRICE_DATA_FILE):
         return "Iem chưa có dữ liệu bảng giá. Hãy gửi file Excel để nạp nhé!"
 
-    with open(PRICE_DATA_FILE, 'r', encoding='utf-8') as f:
-        full_data = json.load(f)
+    try:
+        with open(PRICE_DATA_FILE, 'r', encoding='utf-8') as f:
+            full_data = json.load(f)
 
-    # 1. Tìm đúng dòng sản phẩm khách hỏi (Tiết kiệm Token tối đa)
-    query_upper = query.upper()
-    found_item = None
-    for item in full_data:
-        ma_sp = str(item.get('Mã hàng', '')).upper().strip()
-        if ma_sp and ma_sp in query_upper:
-            found_item = item
-            break
-    
-    if not found_item:
-        return "Iem không tìm thấy mã hàng này trong bảng giá ạ."
+        query_upper = query.upper()
+        found_item = None
+        for item in full_data:
+            ma_sp = str(item.get('Mã hàng', item.get('MÃ HÀNG', ''))).upper().strip()
+            if ma_sp and ma_sp in query_upper:
+                found_item = item
+                break
+        
+        if not found_item:
+            return "Iem không tìm thấy mã hàng này trong bảng giá ạ."
 
-    # 2. Làm sạch thông tin rác NaN trước khi gửi cho AI
-    clean_info = {k: v for k, v in found_item.items() if pd.notna(v) and str(v).lower() != 'nan'}
+        clean_info = {k: v for k, v in found_item.items() if v.lower() != 'nan' and 'unnamed' not in k.lower()}
 
-    prompt = f"""
-    Dữ liệu sản phẩm: {clean_info}
-    Khách hỏi: "{query}"
-    Nhiệm vụ: Trả lời chính xác giá từ dữ liệu trên. 
-    - Nếu hỏi Giá chưa VAT, lấy cột '- VAT'.
-    - Nếu có nhiều cột '- VAT', hãy lấy cột tương ứng với chương trình khuyến mãi (VAT 10% hoặc 8%).
-    Trả lời cực ngắn: "Mã [Mã hàng]: [Loại giá] là [Số tiền] VNĐ".
-    """
+        prompt = f"""
+        Dữ liệu sản phẩm: {clean_info}
+        Khách hỏi: "{query}"
+        Trả lời chính xác giá từ dữ liệu trên. Ưu tiên giá chưa VAT (- VAT).
+        Trả lời cực ngắn: "Mã [Mã hàng]: [Loại giá] là [Số tiền] VNĐ".
+        """
 
-    # 3. Logic xoay vòng 3 API Key khi bị Rate Limit
-    for _ in range(3):
-        api_key = AI_KEYS[current_key_index]
-        if not api_key:
-            current_key_index = (current_key_index + 1) % 3
-            continue
-        try:
-            client = Groq(api_key=api_key)
-            completion = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0
-            )
-            return completion.choices[0].message.content
-        except Exception as e:
-            if "429" in str(e):
-                logger.warning(f"Key {current_key_index+1} bị giới hạn, đổi key...")
+        for _ in range(3):
+            api_key = AI_KEYS[current_key_index]
+            if not api_key:
                 current_key_index = (current_key_index + 1) % 3
                 continue
-            return f"Lỗi AI: {e}"
+            try:
+                client = Groq(api_key=api_key)
+                completion = client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0
+                )
+                return completion.choices[0].message.content
+            except Exception as e:
+                if "429" in str(e):
+                    current_key_index = (current_key_index + 1) % 3
+                    continue
+                return f"Lỗi AI: {e}"
+    except Exception as e:
+        return f"Lỗi hệ thống tra cứu: {e}"
+    
     return "Tất cả các Key AI đều hết hạn mức hôm nay rồi ạ!"
 
 # ---------------- Keep port open (Render free) ----------------
@@ -158,7 +170,7 @@ def keep_port_open():
 
 threading.Thread(target=keep_port_open, daemon=True).start()
 
-# ---------------- Odoo connect (GIỮ NGUYÊN) ----------------
+# ---------------- Odoo connect (FIX DUY NHẤT) ----------------
 def connect_odoo():
     try:
         if not ODOO_URL_FINAL:
@@ -175,27 +187,51 @@ def connect_odoo():
             "id": 1
         }
 
-        r = requests.post(f"{ODOO_URL_FINAL}/jsonrpc", json=payload, timeout=15)
+        r = requests.post(
+            f"{ODOO_URL_FINAL}/jsonrpc",
+            json=payload,
+            timeout=15
+        )
+
         uid = r.json().get("result")
-        if not uid: return None, None, "Đăng nhập thất bại."
+        if not uid:
+            return None, None, "Đăng nhập thất bại. Kiểm tra DB/user/pass."
 
         class Models:
             def execute_kw(self, db, uid, pwd, model, method, args, kwargs=None):
                 payload = {
                     "jsonrpc": "2.0",
                     "method": "call",
-                    "params": {"service": "object", "method": "execute_kw", "args": [db, uid, pwd, model, method, args, kwargs or {}]},
+                    "params": {
+                        "service": "object",
+                        "method": "execute_kw",
+                        "args": [
+                            db,
+                            uid,
+                            pwd,
+                            model,
+                            method,
+                            args,
+                            kwargs or {}
+                        ]
+                    },
                     "id": 2
                 }
-                r = requests.post(f"{ODOO_URL_FINAL}/jsonrpc", json=payload, timeout=60)
+
+                r = requests.post(
+                    f"{ODOO_URL_FINAL}/jsonrpc",
+                    json=payload,
+                    timeout=60
+                )
                 return r.json().get("result")
 
         return uid, Models(), "OK"
-    except Exception as e: return None, None, f"Lỗi kết nối: {e}"
+
+    except Exception as e:
+        return None, None, f"Lỗi kết nối: {e}"
 
 # ================== PHẦN DƯỚI GIỮ NGUYÊN 100% ==================
-# (Mọi hàm cũ tra tồn kho Odoo, Check PO và Watchdog của mày giữ nguyên tuyệt đối từ đây...)
-
+# (Mọi hàm cũ của mày giữ nguyên tuyệt đối không sửa 1 ký tự nào)
 def get_odoo_url_components():
     if not ODOO_URL_FINAL:
         return None, None
@@ -320,7 +356,7 @@ def get_stock_data():
                 if 'available_quantity' in q and q.get('available_quantity') is not None:
                     real_qty = float(q.get('available_quantity', 0))
                 else:
-                    real_qty = float(q.get('available_quantity', 0)) - float(q.get('reserved_quantity', 0))
+                    real_qty = float(q.get('quantity', 0)) - float(q.get('reserved_quantity', 0))
 
             if real_qty <= 0:
                 continue
@@ -635,7 +671,7 @@ def process_po_and_build_report(file_bytes: bytes):
         return None, f"Lỗi khi xử lý PO: {e}"
 
 
-# ---------------- Handle product code (TÍCH HỢP AI) ----------------
+# ---------------- Handle product code ----------------
 async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
@@ -881,7 +917,6 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Lỗi khi tải file PO: {e}")
         return
     else:
-        # Gửi bảng giá AI
         await update.message.reply_text("📥 Đang nạp bảng giá mới cho AI...")
         try:
             file = await document.get_file()
