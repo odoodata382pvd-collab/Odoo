@@ -916,7 +916,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"Tồn kho HN: {int(hn_stock_qty)}\n"
             f"Tồn kho HCM: {int(hcm_stock_qty)}\n"
             f"Tồn kho nhập Hà Nội: {int(hn_transit_qty)}\n"
-            f"=> đề xuất nhập thêm {int(recommend)} sp để hn đủ tồn {TARGET_MIN_QTY} sản phẩm.\n\n"
+            f"=> Đề xuất nhập thêm {int(recommend)} sp để HN đủ tồn {TARGET_MIN_QTY} sản phẩm.\n\n"
             "2/ Tồn kho chi tiết(Có hàng):"
         )
 
@@ -977,7 +977,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Chào {name}!\n"
         "1. Gõ mã sp để tra tồn.\n"
-        "2. Hỏi giá sản phẩm để iem báo giá.\n"
+        "2. Hỏi giá sản phẩm để em báo giá.\n"
         "3. Gửi file Excel bảng giá để cập nhật.\n"
         "4. /keohang để tạo báo cáo Excel.\n"
         "5. /ping để kiểm tra kết nối Odoo."
@@ -990,7 +990,7 @@ async def checkpo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data['waiting_for_po'] = True
     await update.message.reply_text(
-        "Ok, gửi file PO Excel (.xlsx) để iem kiểm tra tồn kho theo mẫu đối tác gửi nha!"
+        "Ok, gửi file PO Excel (.xlsx) để em kiểm tra tồn kho theo mẫu đối tác gửi nha!"
     )
 
 
@@ -1021,7 +1021,7 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_document(
                     document=excel_buffer,
                     filename="kiem_tra_po.xlsx",
-                    caption="❤️ Iem gửi chị file kiểm tra PO và đối chiếu tồn kho đây ạ!"
+                    caption="❤️ Em gửi file kiểm tra PO và đối chiếu tồn kho đây ạ!"
                 )
             else:
                 await update.message.reply_text(f"❌ Lỗi: {error_msg}")
