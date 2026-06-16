@@ -20,12 +20,6 @@ import json
 import re
 from groq import Groq
 
-# --- [MỚI THÊM] Các thư viện cho nút bấm và đặt lịch ---
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import CallbackQueryHandler
-from datetime import time as dt_time
-# --------------------------------------------------------
-
 # ---------------- Config Environment ----------------
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 
@@ -940,6 +934,144 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ---------------- Telegram Handlers ----------------
+
+# ---> NEW FUNCTION: Hàm xử lý logic gọi Odoo và lọc vị trí Xuất/Nhập <---
+def get_daily_movement_report():
+    uid, models, error_msg = connect_odoo()
+    if not uid:
+        return None, error_msg
+
+    try:
+        # Lấy mốc thời gian ngày hiện tại (VN)
+        tz_vn = pytz.timezone("Asia/Ho_Chi_Minh")
+        now_vn = datetime.now(tz_vn)
+        start_date_vn = now_vn.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # Odoo lưu múi giờ UTC, convert ngược về UTC để lọc chính xác
+        start_date_utc = start_date_vn.astimezone(pytz.utc).strftime('%Y-%m-%d %H:%M:%S')
+        end_date_utc = now_vn.astimezone(pytz.utc).strftime('%Y-%m-%d %H:%M:%S')
+
+        # Dịch chuyển đã hoàn thành
+        domain = [
+            ('state', '=', 'done'),
+            ('date', '>=', start_date_utc),
+            ('date', '<=', end_date_utc)
+        ]
+        
+        moves = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'stock.move', 'search_read',
+            [domain],
+            {'fields': [
+                'product_id', 'product_uom_qty', 'date', 
+                'location_id', 'location_dest_id', 'picking_id', 'write_uid'
+            ]}
+        )
+
+        if not moves:
+            # Tạo Excel trống để không bị lỗi
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+                pd.DataFrame(columns=['Mã SP', 'Tên SP', 'Số lượng', 'Nhập từ đâu', 'Thời gian', 'Người thao tác', 'Mã lệnh']).to_excel(writer, index=False, sheet_name='NHẬP KHO')
+                pd.DataFrame(columns=['Mã SP', 'Tên SP', 'Số lượng', 'Xuất đi đâu', 'Thời gian', 'Người thao tác', 'Mã lệnh']).to_excel(writer, index=False, sheet_name='XUẤT KHO')
+            buf.seek(0)
+            return buf, "Không có giao dịch Nhập/Xuất nào trong ngày hôm nay."
+
+        # Fetch product code một lần duy nhất để tối ưu tốc độ
+        product_ids = list(set([m['product_id'][0] for m in moves if m.get('product_id')]))
+        product_map = {}
+        if product_ids:
+            products_info = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD,
+                'product.product', 'search_read',
+                [[('id', 'in', product_ids)]],
+                {'fields': ['display_name', PRODUCT_CODE_FIELD]}
+            )
+            product_map = {p['id']: p for p in products_info}
+
+        import_rows = []
+        export_rows = []
+        hn_stock_name = LOCATION_MAP.get('HN_STOCK_CODE', "201/201") 
+
+        for m in moves:
+            pid = m['product_id'][0] if m.get('product_id') else None
+            prod = product_map.get(pid, {})
+            
+            code = prod.get(PRODUCT_CODE_FIELD, "N/A")
+            name = prod.get('display_name', "Không tên")
+            qty = int(m.get('product_uom_qty') or 0)
+            
+            from_location = m['location_id'][1] if m.get('location_id') else "N/A"
+            to_location = m['location_dest_id'][1] if m.get('location_dest_id') else "N/A"
+            
+            picking_name = m['picking_id'][1] if m.get('picking_id') else "N/A"
+            actor = m['write_uid'][1] if m.get('write_uid') else "Hệ thống"
+            
+            utc_time = datetime.strptime(m['date'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=pytz.utc)
+            vn_time_str = utc_time.astimezone(tz_vn).strftime('%H:%M:%S')
+
+            row_data = {
+                'Mã SP': code,
+                'Tên SP': name,
+                'Số lượng': qty,
+                'Thời gian': vn_time_str,
+                'Người thao tác': actor,
+                'Mã lệnh': picking_name
+            }
+
+            if hn_stock_name.lower() in to_location.lower():
+                row_data['Nhập từ đâu'] = from_location
+                import_rows.append(row_data)
+            elif hn_stock_name.lower() in from_location.lower():
+                row_data['Xuất đi đâu'] = to_location
+                export_rows.append(row_data)
+
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+            # Ghi Sheet NHẬP KHO
+            df_in = pd.DataFrame(import_rows)
+            in_cols = ['Mã SP', 'Tên SP', 'Số lượng', 'Nhập từ đâu', 'Thời gian', 'Người thao tác', 'Mã lệnh']
+            if df_in.empty:
+                df_in = pd.DataFrame(columns=in_cols)
+            else:
+                df_in = df_in[in_cols]
+            df_in.to_excel(writer, index=False, sheet_name='NHẬP KHO')
+
+            # Ghi Sheet XUẤT KHO
+            df_out = pd.DataFrame(export_rows)
+            out_cols = ['Mã SP', 'Tên SP', 'Số lượng', 'Xuất đi đâu', 'Thời gian', 'Người thao tác', 'Mã lệnh']
+            if df_out.empty:
+                df_out = pd.DataFrame(columns=out_cols)
+            else:
+                df_out = df_out[out_cols]
+            df_out.to_excel(writer, index=False, sheet_name='XUẤT KHO')
+
+        buf.seek(0)
+        return buf, "Thành công"
+    except Exception as e:
+        logger.error(f"Lỗi tạo báo cáo ngày: {e}")
+        return None, str(e)
+
+# ---> NEW FUNCTION: Handler nhận lệnh /baocaongay <---
+async def daily_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    register_chat_id(chat_id)
+    
+    await update.message.reply_text("⌛️ Iem đang tổng hợp dữ liệu Xuất/Nhập kho hôm nay...")
+    
+    excel_buffer, error_msg = get_daily_movement_report()
+    
+    if excel_buffer:
+        today_str = datetime.now(pytz.timezone("Asia/Ho_Chi_Minh")).strftime("%d-%m-%Y")
+        await update.message.reply_document(
+            document=excel_buffer,
+            filename=f"Bao_cao_kho_ngay_{today_str}.xlsx",
+            caption=f"📊 Báo cáo luồng hàng Nhập/Xuất ngày {today_str} đã sẵn sàng ạ!"
+        )
+    else:
+        await update.message.reply_text(f"❌ Không thể tạo báo cáo. Chi tiết: {error_msg}")
+
+
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
@@ -986,7 +1118,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "2. Hỏi giá sản phẩm để em báo giá.\n"
         "3. Gửi file Excel bảng giá để cập nhật.\n"
         "4. /keohang để tạo báo cáo Excel.\n"
-        "5. /ping để kiểm tra kết nối Odoo."
+        "5. /checkpo để đối chiếu tồn kho.\n"
+        "6. /baocaongay để xuất báo cáo Nhập/Xuất cuối ngày.\n"
+        "7. /ping để kiểm tra kết nối Odoo."
     )
 
 
@@ -1211,247 +1345,6 @@ def watchdog_201():
 threading.Thread(target=watchdog_201, daemon=True).start()
 
 
-# ====================================================================================
-#                               CÁC HÀM TÍNH NĂNG MỚI ĐƯỢC THÊM VÀO
-# ====================================================================================
-
-# 1. Báo cáo Nhập / Xuất ngày
-def get_daily_movement_report():
-    uid, models, error_msg = connect_odoo()
-    if not uid:
-        return None, error_msg
-
-    try:
-        tz_vn = pytz.timezone("Asia/Ho_Chi_Minh")
-        now_vn = datetime.now(tz_vn)
-        start_date_vn = now_vn.replace(hour=0, minute=0, second=0, microsecond=0)
-        
-        start_date_utc = start_date_vn.astimezone(pytz.utc).strftime('%Y-%m-%d %H:%M:%S')
-        end_date_utc = now_vn.astimezone(pytz.utc).strftime('%Y-%m-%d %H:%M:%S')
-
-        domain = [
-            ('state', '=', 'done'),
-            ('date', '>=', start_date_utc),
-            ('date', '<=', end_date_utc)
-        ]
-        
-        moves = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD,
-            'stock.move', 'search_read',
-            [domain],
-            {'fields': [
-                'product_id', 'product_uom_qty', 'date', 
-                'location_id', 'location_dest_id', 'picking_id', 'write_uid'
-            ]}
-        )
-
-        if not moves:
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine='openpyxl') as writer:
-                pd.DataFrame(columns=['Mã SP', 'Tên SP', 'Số lượng', 'Nhập từ đâu', 'Thời gian', 'Người thao tác', 'Mã lệnh']).to_excel(writer, index=False, sheet_name='NHẬP KHO')
-                pd.DataFrame(columns=['Mã SP', 'Tên SP', 'Số lượng', 'Xuất đi đâu', 'Thời gian', 'Người thao tác', 'Mã lệnh']).to_excel(writer, index=False, sheet_name='XUẤT KHO')
-            buf.seek(0)
-            return buf, "Không có giao dịch Nhập/Xuất nào trong ngày hôm nay."
-
-        product_ids = list(set([m['product_id'][0] for m in moves if m.get('product_id')]))
-        product_map = {}
-        if product_ids:
-            products_info = models.execute_kw(
-                ODOO_DB, uid, ODOO_PASSWORD,
-                'product.product', 'search_read',
-                [[('id', 'in', product_ids)]],
-                {'fields': ['display_name', PRODUCT_CODE_FIELD]}
-            )
-            product_map = {p['id']: p for p in products_info}
-
-        import_rows = []
-        export_rows = []
-        hn_stock_name = LOCATION_MAP.get('HN_STOCK_CODE', "201/201") 
-
-        for m in moves:
-            pid = m['product_id'][0] if m.get('product_id') else None
-            prod = product_map.get(pid, {})
-            
-            code = prod.get(PRODUCT_CODE_FIELD, "N/A")
-            name = prod.get('display_name', "Không tên")
-            qty = int(m.get('product_uom_qty') or 0)
-            
-            from_location = m['location_id'][1] if m.get('location_id') else "N/A"
-            to_location = m['location_dest_id'][1] if m.get('location_dest_id') else "N/A"
-            
-            picking_name = m['picking_id'][1] if m.get('picking_id') else "N/A"
-            actor = m['write_uid'][1] if m.get('write_uid') else "Hệ thống"
-            
-            utc_time = datetime.strptime(m['date'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=pytz.utc)
-            vn_time_str = utc_time.astimezone(tz_vn).strftime('%H:%M:%S')
-
-            row_data = {
-                'Mã SP': code,
-                'Tên SP': name,
-                'Số lượng': qty,
-                'Thời gian': vn_time_str,
-                'Người thao tác': actor,
-                'Mã lệnh': picking_name
-            }
-
-            if hn_stock_name.lower() in to_location.lower():
-                row_data['Nhập từ đâu'] = from_location
-                import_rows.append(row_data)
-            elif hn_stock_name.lower() in from_location.lower():
-                row_data['Xuất đi đâu'] = to_location
-                export_rows.append(row_data)
-
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine='openpyxl') as writer:
-            df_in = pd.DataFrame(import_rows)
-            in_cols = ['Mã SP', 'Tên SP', 'Số lượng', 'Nhập từ đâu', 'Thời gian', 'Người thao tác', 'Mã lệnh']
-            if df_in.empty:
-                df_in = pd.DataFrame(columns=in_cols)
-            else:
-                df_in = df_in[in_cols]
-            df_in.to_excel(writer, index=False, sheet_name='NHẬP KHO')
-
-            df_out = pd.DataFrame(export_rows)
-            out_cols = ['Mã SP', 'Tên SP', 'Số lượng', 'Xuất đi đâu', 'Thời gian', 'Người thao tác', 'Mã lệnh']
-            if df_out.empty:
-                df_out = pd.DataFrame(columns=out_cols)
-            else:
-                df_out = df_out[out_cols]
-            df_out.to_excel(writer, index=False, sheet_name='XUẤT KHO')
-
-        buf.seek(0)
-        return buf, "Thành công"
-    except Exception as e:
-        logger.error(f"Lỗi tạo báo cáo ngày: {e}")
-        return None, str(e)
-
-async def daily_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat_id
-    register_chat_id(chat_id)
-    
-    await update.message.reply_text("⌛️ Iem đang tổng hợp dữ liệu Xuất/Nhập kho hôm nay...")
-    
-    excel_buffer, error_msg = get_daily_movement_report()
-    
-    if excel_buffer:
-        today_str = datetime.now(pytz.timezone("Asia/Ho_Chi_Minh")).strftime("%d-%m-%Y")
-        await update.message.reply_document(
-            document=excel_buffer,
-            filename=f"Bao_cao_kho_ngay_{today_str}.xlsx",
-            caption=f"📊 Báo cáo luồng hàng Nhập/Xuất ngày {today_str} đã sẵn sàng ạ!"
-        )
-    else:
-        await update.message.reply_text(f"❌ Không thể tạo báo cáo. Chi tiết: {error_msg}")
-
-# 2. AI Phân tích hôm nay
-async def ai_analysis_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    register_chat_id(chat_id)
-    
-    msg = await context.bot.send_message(chat_id, "🧠 *AI đang thu thập dữ liệu Odoo hôm nay, sếp chờ xíu...*", parse_mode='Markdown')
-    
-    uid, models, err = connect_odoo()
-    if not uid:
-        await msg.edit_text(f"❌ Lỗi kết nối Odoo: {err}")
-        return
-
-    try:
-        tz_vn = pytz.timezone("Asia/Ho_Chi_Minh")
-        now_vn = datetime.now(tz_vn)
-        start_date_utc = now_vn.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(pytz.utc).strftime('%Y-%m-%d %H:%M:%S')
-        end_date_utc = now_vn.astimezone(pytz.utc).strftime('%Y-%m-%d %H:%M:%S')
-
-        domain = [('state', '=', 'done'), ('date', '>=', start_date_utc), ('date', '<=', end_date_utc)]
-        moves = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'stock.move', 'search_read', [domain], 
-                                  {'fields': ['product_uom_qty', 'location_id', 'location_dest_id']})
-
-        hn_stock_name = LOCATION_MAP.get('HN_STOCK_CODE', "201/201")
-        total_in, total_out = 0, 0
-        for m in moves:
-            qty = m.get('product_uom_qty', 0)
-            from_loc = m['location_id'][1] if m.get('location_id') else ""
-            to_loc = m['location_dest_id'][1] if m.get('location_dest_id') else ""
-            
-            if hn_stock_name.lower() in to_loc.lower(): total_in += qty
-            elif hn_stock_name.lower() in from_loc.lower(): total_out += qty
-
-        prompt = (f"Số liệu kho hôm nay: Tổng nhập {total_in} sản phẩm, Tổng xuất {total_out} sản phẩm. "
-                  "Đóng vai một chuyên gia quản lý kho, hãy viết 1 đoạn ngắn (dưới 100 chữ) nhận xét về nhịp độ luân chuyển hàng hóa và 1 lời động viên ngắn gọn cho team.")
-        
-        global current_key_index
-        for _ in range(3):
-            api_key = AI_KEYS[current_key_index]
-            if not api_key:
-                current_key_index = (current_key_index + 1) % 3
-                continue
-            try:
-                client = Groq(api_key=api_key)
-                completion = client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.7
-                )
-                answer = completion.choices[0].message.content
-                await msg.edit_text(f"📊 **GIÁM ĐỐC KHO AI NHẬN XÉT:**\n\n{answer}", parse_mode='Markdown')
-                return
-            except Exception:
-                current_key_index = (current_key_index + 1) % 3
-                
-        await msg.edit_text("❌ AI hiện đang bận, sếp thử lại sau nhé.")
-    except Exception as e:
-        await msg.edit_text(f"❌ Lỗi xử lý: {e}")
-
-# 3. Chức năng Menu Nút Bấm Vật Lý (Tạo lệnh riêng)
-async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat_id
-    register_chat_id(chat_id)
-    
-    keyboard = [
-        [InlineKeyboardButton("📊 Báo cáo đề xuất kéo hàng", callback_data='btn_keohang')],
-        [InlineKeyboardButton("📅 Báo cáo xuất/nhập hôm nay", callback_data='btn_baocaongay')],
-        [InlineKeyboardButton("🧠 Nhờ AI đánh giá kho hôm nay", callback_data='btn_phantich')],
-        [InlineKeyboardButton("⚙️ Ping kiểm tra Odoo", callback_data='btn_ping')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(
-        "👇 Bảng điều khiển nhanh:",
-        reply_markup=reply_markup
-    )
-
-async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    
-    if data == 'btn_keohang':
-        await excel_report_command(update, context)
-    elif data == 'btn_baocaongay':
-        await daily_report_command(update, context)
-    elif data == 'btn_phantich':
-        await ai_analysis_command(update, context)
-    elif data == 'btn_ping':
-        await ping_command(update, context)
-
-# 4. Tự động chạy báo cáo kéo hàng vào 8h00 Sáng
-async def auto_morning_alert(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("Chạy cron-job báo cáo sáng...")
-    excel_buffer, item_count, error_msg = get_stock_data()
-    
-    if item_count > 0 and excel_buffer:
-        for chat_id in get_registered_chat_ids():
-            try:
-                excel_buffer.seek(0)
-                await context.bot.send_document(
-                    chat_id=chat_id, 
-                    document=excel_buffer, 
-                    filename="Canh_Bao_Keo_Hang_Sang.xlsx",
-                    caption=f"⏰ **BÁO CÁO SÁNG TỰ ĐỘNG:**\nHiện có {item_count} mã dưới định mức ({TARGET_MIN_QTY} sp). Team kho chú ý check file Excel để lên phương án kéo hàng từ HCM nhé!",
-                    parse_mode='Markdown'
-                )
-            except Exception as e:
-                logger.error(f"Lỗi gửi auto alert cho {chat_id}: {e}")
-
 # ---------------- MAIN ----------------
 def main():
     if not TELEGRAM_TOKEN or not ODOO_URL_RAW or not ODOO_DB or not ODOO_USERNAME or not ODOO_PASSWORD:
@@ -1467,24 +1360,12 @@ def main():
     except Exception as e:
         logger.warning(f"Lỗi xóa webhook: {e}")
 
-    # ================= [MỚI] CRON-JOB 8H SÁNG =================
-    target_time = dt_time(hour=8, minute=0, tzinfo=pytz.timezone("Asia/Ho_Chi_Minh"))
-    application.job_queue.run_daily(auto_morning_alert, target_time)
-    # ==========================================================
-
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", start_command))
     application.add_handler(CommandHandler("ping", ping_command))
     application.add_handler(CommandHandler("keohang", excel_report_command))
     application.add_handler(CommandHandler("checkpo", checkpo_command))
-
-    # ================= [MỚI] LỆNH TÍNH NĂNG =================
-    application.add_handler(CommandHandler("baocaongay", daily_report_command))
-    application.add_handler(CommandHandler("phantich", ai_analysis_command))
-    application.add_handler(CommandHandler("menu", menu_command))
-    application.add_handler(CallbackQueryHandler(button_callback_handler))
-    # ========================================================
-
+    application.add_handler(CommandHandler("baocaongay", daily_report_command))  # ---> ĐÃ ĐĂNG KÝ LỆNH MỚI <---
     application.add_handler(MessageHandler(filters.Document.ALL, handle_po_file))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_product_code))
 
