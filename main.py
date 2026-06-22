@@ -64,22 +64,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------------- TÍNH NĂNG MỚI: AI & XỬ LÝ EXCEL ----------------
+# ---------------- TÍNH NĂNG: AI & XỬ LÝ EXCEL ----------------
 PRICE_DATA_FILE = "price_cache.json"
 
 def process_price_excel(file_bytes):
-    """
-    Hàm nạp bảng giá: 
-    1. Tìm Sheet mới nhất theo thời gian (Txx,xxxx).
-    2. Quét tìm dòng tiêu đề chứa 'Niêm Yết' (chi tiết nhất) hoặc 'Mã hàng'.
-    3. Vá lỗi Header bị gộp dòng (Merged Cells).
-    4. Lưu dữ liệu sạch vào JSON.
-    """
     try:
         xl = pd.ExcelFile(io.BytesIO(file_bytes))
         sheet_names = xl.sheet_names
         
-        # 1. Tìm Sheet mới nhất theo tên (T12,2025...)
         target_sheet = None
         max_date = None
         pattern = re.compile(r'T(\d+)[\.,_\-\s](\d+)', re.IGNORECASE)
@@ -103,24 +95,19 @@ def process_price_excel(file_bytes):
         else:
             logger.info(f"Dùng sheet mới nhất: {target_sheet}")
 
-        # 2. Đọc thô để tìm Header chính xác
         df_raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=target_sheet, header=None)
         
         header_row_idx = 0
         found_header = False
         
-        # Quét 25 dòng đầu
         for idx, row in df_raw.iterrows():
             row_list = [str(val).lower() for val in row.values]
             row_str = " ".join(row_list)
             
-            # Ưu tiên tìm dòng có "niêm yết" (dòng header chi tiết giá)
             if "niêm yết" in row_str:
                 header_row_idx = idx
                 found_header = True
                 break
-            
-            # Nếu chưa thấy, tìm tạm dòng "mã hàng"
             elif "mã hàng" in row_str or "mã sp" in row_str:
                 if not found_header:
                     header_row_idx = idx
@@ -128,28 +115,21 @@ def process_price_excel(file_bytes):
         if not found_header:
             return False, f"Không tìm thấy dòng tiêu đề hợp lệ trong sheet {target_sheet}"
 
-        # 3. Đọc dữ liệu với header tìm được
         df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=target_sheet, header=header_row_idx)
         
-        # --- HEADER PATCHING (VÁ LỖI MERGE CELL) ---
-        # Nếu chọn dòng "Niêm Yết" làm header, tên cột "Mã hàng" có thể bị Unnamed do nằm ở dòng trên.
         if header_row_idx > 0:
             for i, col_name in enumerate(df.columns):
                 if str(col_name).startswith('Unnamed') or str(col_name).lower() == 'nan':
-                    # Lấy giá trị ở dòng ngay trên header
                     val_above = str(df_raw.iloc[header_row_idx - 1, i]).strip()
                     if val_above and val_above.lower() != 'nan':
                         df.columns.values[i] = val_above
 
-        # Chuẩn hóa tên cột
         df.columns = [str(c).strip() for c in df.columns]
         
-        # Tìm cột Mã hàng chính xác
         ma_hang_col = next((c for c in df.columns if 'mã hàng' in c.lower() or 'mã sp' in c.lower()), None)
         
         if ma_hang_col:
             df = df.dropna(subset=[ma_hang_col])
-            # Ép kiểu string toàn bộ
             data_dict = df.astype(str).to_dict(orient='records')
             
             cache_data = {
@@ -169,9 +149,6 @@ def process_price_excel(file_bytes):
         return False, str(e)
 
 def ask_groq_ai(query):
-    """
-    Hàm AI: Trả lời theo FORM BẮT BUỘC + Logic lọc giá
-    """
     global current_key_index
     
     if not os.path.exists(PRICE_DATA_FILE):
@@ -191,12 +168,10 @@ def ask_groq_ai(query):
         query_upper = query.upper()
         found_item = None
         
-        # 1. Tìm kiếm Python (Mapping Mã SP)
         for item in full_data:
             key_ma = next((k for k in item.keys() if "mã" in k.lower() and ("hàng" in k.lower() or "sp" in k.lower())), None)
             if key_ma:
                 ma_sp = str(item[key_ma]).upper().strip()
-                # Logic so sánh: Mã trong file (A-092) nằm trong câu hỏi
                 if ma_sp and ma_sp in query_upper:
                     found_item = item
                     break
@@ -206,7 +181,6 @@ def ask_groq_ai(query):
 
         clean_info = {k: v for k, v in found_item.items() if str(v).lower() != 'nan' and 'unnamed' not in str(k).lower()}
 
-        # 2. PROMPT FIX LỖI GIÁ & FORM TRẢ LỜI
         prompt = f"""
         Dữ liệu sản phẩm: {clean_info}
         Tên bảng giá: {sheet_name}
@@ -234,7 +208,6 @@ def ask_groq_ai(query):
         - *Giá chưa VAT: * [Số tiền] VNĐ
         """
 
-        # 3. Xoay vòng Key
         for _ in range(3):
             api_key = AI_KEYS[current_key_index]
             if not api_key:
@@ -273,7 +246,7 @@ def keep_port_open():
 
 threading.Thread(target=keep_port_open, daemon=True).start()
 
-# ---------------- Odoo connect (FIX DUY NHẤT) ----------------
+# ---------------- Odoo connect ----------------
 def connect_odoo():
     try:
         if not ODOO_URL_FINAL:
@@ -309,13 +282,7 @@ def connect_odoo():
                         "service": "object",
                         "method": "execute_kw",
                         "args": [
-                            db,
-                            uid,
-                            pwd,
-                            model,
-                            method,
-                            args,
-                            kwargs or {}
+                            db, uid, pwd, model, method, args, kwargs or {}
                         ]
                     },
                     "id": 2
@@ -333,7 +300,6 @@ def connect_odoo():
     except Exception as e:
         return None, None, f"Lỗi kết nối: {e}"
 
-# ================== PHẦN DƯỚI GIỮ NGUYÊN 100% CODE GỐC ==================
 def get_odoo_url_components():
     if not ODOO_URL_FINAL:
         return None, None
@@ -778,21 +744,121 @@ def process_po_and_build_report(file_bytes: bytes):
         return None, f"Lỗi khi xử lý PO: {e}"
 
 
-# ---------------- Handle product code (TÍCH HỢP AI) ----------------
+# =====================================================================
+# ---> [NEW FEATURE: ĐỔ TỒN KHO] TẠO FILE EXCEL TỒN KHO CHI TIẾT <---
+# =====================================================================
+async def process_export_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE, loc_id: int, loc_name: str):
+    uid, models, error_msg = connect_odoo()
+    if not uid:
+        await update.message.reply_text(f"❌ Lỗi kết nối Odoo: {error_msg}")
+        return
+
+    try:
+        # 1. Quét tất cả lượng tồn (quant) lớn hơn 0 tại kho đã chọn
+        quants = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'stock.quant', 'search_read',
+            [[('location_id', '=', loc_id), ('quantity', '>', 0)]],
+            {'fields': ['product_id', 'quantity', 'available_quantity', 'reserved_quantity']}
+        )
+
+        if not quants:
+            await update.message.reply_text(f"📭 Kho *{loc_name}* hiện đang trống, không có sản phẩm nào tồn kho.", parse_mode='Markdown')
+            return
+
+        # 2. Gom nhóm theo product_id để cộng dồn (tránh việc 1 SP chia thành nhiều dòng/lô)
+        stock_map = {}
+        for q in quants:
+            pid = q['product_id'][0]
+            if pid not in stock_map:
+                stock_map[pid] = {'qty': 0, 'available': 0, 'reserved': 0}
+            stock_map[pid]['qty'] += float(q.get('quantity', 0))
+            stock_map[pid]['available'] += float(q.get('available_quantity', 0))
+            stock_map[pid]['reserved'] += float(q.get('reserved_quantity', 0))
+
+        # 3. Lấy thông tin Tên, Mã SP
+        pids = list(stock_map.keys())
+        products = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'product.product', 'search_read',
+            [[('id', 'in', pids)]],
+            {'fields': ['id', 'display_name', PRODUCT_CODE_FIELD]}
+        )
+        product_map = {p['id']: p for p in products}
+
+        # 4. Ghi ra DataFrame
+        rows = []
+        for pid, qtys in stock_map.items():
+            prod = product_map.get(pid, {})
+            rows.append({
+                'Mã SP': prod.get(PRODUCT_CODE_FIELD, 'N/A'),
+                'Tên SP': prod.get('display_name', 'Không xác định'),
+                'Tồn thực tế (Quantity)': qtys['qty'],
+                'Có sẵn (Available)': qtys['available'],
+                'Đã giữ (Reserved)': qtys['reserved']
+            })
+
+        df = pd.DataFrame(rows)
+        # Sắp xếp theo mã SP cho đẹp mắt
+        df = df.sort_values(by='Mã SP')
+
+        # Ghi vào Buffer Excel
+        buf = io.BytesIO()
+        df.to_excel(buf, index=False, sheet_name='Ton_Kho')
+        buf.seek(0)
+
+        # Xử lý tên file tránh lỗi ký tự đặc biệt
+        safe_loc_name = "".join(c for c in loc_name if c.isalnum() or c in (' ', '_')).replace(' ', '_')
+        today_str = datetime.now().strftime('%d%m%Y')
+        filename = f"Ton_Kho_{safe_loc_name}_{today_str}.xlsx"
+
+        await update.message.reply_document(
+            document=buf,
+            filename=filename,
+            caption=f"📊 Iem gửi file thống kê tồn kho của *{loc_name}* ạ!\nTổng cộng có {len(df)} mã sản phẩm đang có hàng.",
+            parse_mode='Markdown'
+        )
+
+    except Exception as e:
+        logger.error(f"Lỗi khi đổ tồn kho: {e}")
+        await update.message.reply_text(f"❌ Lỗi khi xuất dữ liệu tồn kho: {e}")
+
+
+# =====================================================================
+# ---> [UPDATE FEATURE] XỬ LÝ LỆNH CHỌN KHO CHO ĐỔ TỒN & TÌM SẢN PHẨM <---
+# =====================================================================
 async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
 
     user_input = update.message.text.strip()
-    
-    # --- [NEW] LOGIC AI: Nếu hỏi giá thì dùng AI ---
+
+    # --- [NEW FEATURE: ĐỔ TỒN KHO] Bắt Lệnh Chọn ID Kho ---
+    if context.user_data.get('waiting_for_location'):
+        loc_dict = context.user_data.get('available_locations', {})
+        if user_input in loc_dict:
+            context.user_data['waiting_for_location'] = False  # Xóa trạng thái chờ
+            selected_loc = loc_dict[user_input]
+            await update.message.reply_text(f"⌛️ Iem đang gom số liệu tồn cho kho *{selected_loc['display_name']}*...", parse_mode='Markdown')
+            await process_export_inventory(update, context, selected_loc['id'], selected_loc['display_name'])
+            return
+        elif user_input.lower() in ['huy', 'hủy', 'cancel']:
+            context.user_data['waiting_for_location'] = False
+            await update.message.reply_text("✅ Đã hủy lệnh đổ tồn kho nha!")
+            return
+        else:
+            await update.message.reply_text("❌ Mã kho không hợp lệ. Chị vui lòng nhập đúng ID kho trong danh sách hoặc gõ 'hủy' để thoát ạ.")
+            return
+    # -------------------------------------------------------------
+
+    # --- LOGIC AI: Nếu hỏi giá thì dùng AI ---
     if any(k in user_input.lower() for k in ['giá', 'bao nhiêu', 'vat', 'bảng giá', 'price']):
         await update.message.reply_text("⌛️ Iem đang tra bảng giá xíu...")
         answer = ask_groq_ai(user_input)
         await update.message.reply_text(answer, parse_mode='Markdown')
         return
 
-    # --- [OLD] LOGIC ODOO: Tra tồn kho Odoo (Code cũ) ---
+    # --- LOGIC ODOO: Tra tồn kho Odoo ---
     product_code = user_input.upper()
     await update.message.reply_text(
         f"đang tra tồn cho `{product_code}`, vui lòng chờ!",
@@ -935,23 +1001,19 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # ---------------- Telegram Handlers ----------------
 
-# ---> NEW FUNCTION: Hàm xử lý logic gọi Odoo và lọc vị trí Xuất/Nhập <---
 def get_daily_movement_report():
     uid, models, error_msg = connect_odoo()
     if not uid:
         return None, error_msg
 
     try:
-        # Lấy mốc thời gian ngày hiện tại (VN)
         tz_vn = pytz.timezone("Asia/Ho_Chi_Minh")
         now_vn = datetime.now(tz_vn)
         start_date_vn = now_vn.replace(hour=0, minute=0, second=0, microsecond=0)
         
-        # Odoo lưu múi giờ UTC, convert ngược về UTC để lọc chính xác
         start_date_utc = start_date_vn.astimezone(pytz.utc).strftime('%Y-%m-%d %H:%M:%S')
         end_date_utc = now_vn.astimezone(pytz.utc).strftime('%Y-%m-%d %H:%M:%S')
 
-        # Dịch chuyển đã hoàn thành
         domain = [
             ('state', '=', 'done'),
             ('date', '>=', start_date_utc),
@@ -969,7 +1031,6 @@ def get_daily_movement_report():
         )
 
         if not moves:
-            # Tạo Excel trống để không bị lỗi
             buf = io.BytesIO()
             with pd.ExcelWriter(buf, engine='openpyxl') as writer:
                 pd.DataFrame(columns=['Mã SP', 'Tên SP', 'Số lượng', 'Nhập từ đâu', 'Thời gian', 'Người thao tác', 'Mã lệnh']).to_excel(writer, index=False, sheet_name='NHẬP KHO')
@@ -977,7 +1038,6 @@ def get_daily_movement_report():
             buf.seek(0)
             return buf, "Không có giao dịch Nhập/Xuất nào trong ngày hôm nay."
 
-        # Fetch product code một lần duy nhất để tối ưu tốc độ
         product_ids = list(set([m['product_id'][0] for m in moves if m.get('product_id')]))
         product_map = {}
         if product_ids:
@@ -1028,7 +1088,6 @@ def get_daily_movement_report():
 
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine='openpyxl') as writer:
-            # Ghi Sheet NHẬP KHO
             df_in = pd.DataFrame(import_rows)
             in_cols = ['Mã SP', 'Tên SP', 'Số lượng', 'Nhập từ đâu', 'Thời gian', 'Người thao tác', 'Mã lệnh']
             if df_in.empty:
@@ -1037,7 +1096,6 @@ def get_daily_movement_report():
                 df_in = df_in[in_cols]
             df_in.to_excel(writer, index=False, sheet_name='NHẬP KHO')
 
-            # Ghi Sheet XUẤT KHO
             df_out = pd.DataFrame(export_rows)
             out_cols = ['Mã SP', 'Tên SP', 'Số lượng', 'Xuất đi đâu', 'Thời gian', 'Người thao tác', 'Mã lệnh']
             if df_out.empty:
@@ -1052,7 +1110,7 @@ def get_daily_movement_report():
         logger.error(f"Lỗi tạo báo cáo ngày: {e}")
         return None, str(e)
 
-# ---> NEW FUNCTION: Handler nhận lệnh /baocaongay <---
+
 async def daily_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
@@ -1117,11 +1175,57 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. Gõ mã sp để tra tồn.\n"
         "2. Hỏi giá sản phẩm để em báo giá.\n"
         "3. Gửi file Excel bảng giá để cập nhật.\n"
-        "4. /keohang để tạo báo cáo Excel.\n"
-        "5. /checkpo để đối chiếu tồn kho.\n"
+        "4. /keohang để tạo báo cáo Excel kéo hàng.\n"
+        "5. /checkpo để đối chiếu tồn kho PO.\n"
         "6. /baocaongay để xuất báo cáo Nhập/Xuất cuối ngày.\n"
-        "7. /ping để kiểm tra kết nối Odoo."
+        "7. /dotonkho để xuất toàn bộ sản phẩm của 1 kho bất kỳ.\n"
+        "8. /ping để kiểm tra kết nối Odoo."
     )
+
+
+# =====================================================================
+# ---> [NEW FEATURE: ĐỔ TỒN KHO] HÀM QUÉT DANH SÁCH KHO TỪ ODOO <---
+# =====================================================================
+async def dotonkho_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    register_chat_id(chat_id)
+
+    await update.message.reply_text("⌛️ Iem đang quét danh sách kho trên hệ thống, chờ em xíu nha...")
+    uid, models, error_msg = connect_odoo()
+    if not uid:
+        await update.message.reply_text(f"❌ Lỗi kết nối Odoo: {error_msg}")
+        return
+
+    try:
+        # Lấy danh sách các kho nội bộ (Internal Location)
+        locations = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'stock.location', 'search_read',
+            [[('usage', '=', 'internal')]],
+            {'fields': ['id', 'display_name']}
+        )
+
+        if not locations:
+            await update.message.reply_text("❌ Không tìm thấy kho nội bộ nào trên hệ thống.")
+            return
+
+        # Lưu danh sách kho vào context để chờ người dùng chọn
+        loc_dict = {str(loc['id']): loc for loc in locations}
+        context.user_data['waiting_for_location'] = True
+        context.user_data['available_locations'] = loc_dict
+
+        # Format danh sách hiển thị
+        msg = "📦 *DANH SÁCH KHO HIỆN TẠI*\n\n"
+        for loc in locations:
+            msg += f"🔹 Gõ `{loc['id']}` - Để chọn kho: {loc['display_name']}\n"
+            
+        msg += "\n👉 *Vui lòng nhập ID kho (Ví dụ: 8) để iem xuất báo cáo ạ (Gõ 'hủy' để thoát).* "
+
+        await update.message.reply_text(msg, parse_mode='Markdown')
+
+    except Exception as e:
+        logger.error(f"Lỗi khi lấy danh sách kho: {e}")
+        await update.message.reply_text(f"❌ Lỗi quét danh sách kho: {e}")
 
 
 async def checkpo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1147,9 +1251,7 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Chỉ hỗ trợ file Excel định dạng .xlsx thôi nha.")
         return
 
-    # --- PHÂN LOẠI FILE: PO hay Bảng Giá ---
     if context.user_data.get('waiting_for_po'):
-        # Code cũ xử lý PO
         context.user_data['waiting_for_po'] = False
         await update.message.reply_text("⌛️ Iem đang xử lý file PO, chờ em xíu xìu xiu nha...")
 
@@ -1169,7 +1271,6 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Lỗi khi tải file PO: {e}")
         return
     else:
-        # Code mới nạp Bảng Giá cho AI
         await update.message.reply_text("📥 Đang nạp bảng giá mới cho AI...")
         try:
             file = await document.get_file()
@@ -1194,7 +1295,6 @@ class PingHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
-
 def start_http():
     try:
         server = HTTPServer(("0.0.0.0", 10001), PingHandler)
@@ -1202,7 +1302,6 @@ def start_http():
         server.serve_forever()
     except Exception as e:
         logger.error(f"Lỗi HTTP server: {e}")
-
 
 threading.Thread(target=start_http, daemon=True).start()
 
@@ -1218,13 +1317,11 @@ def keep_alive_ping():
             logger.warning(f"Keep-alive ping failed: {e}")
         time.sleep(300)
 
-
 threading.Thread(target=keep_alive_ping, daemon=True).start()
 
 # ---------------- WATCHDOG 201/201 ----------------
 WATCH_INTERVAL = 60
 previous_snapshot = {}
-
 
 def watchdog_201():
     global previous_snapshot
@@ -1341,9 +1438,7 @@ def watchdog_201():
             logger.error(f"Lỗi watchdog: {e}")
             time.sleep(WATCH_INTERVAL)
 
-
 threading.Thread(target=watchdog_201, daemon=True).start()
-
 
 # ---------------- MAIN ----------------
 def main():
@@ -1365,7 +1460,11 @@ def main():
     application.add_handler(CommandHandler("ping", ping_command))
     application.add_handler(CommandHandler("keohang", excel_report_command))
     application.add_handler(CommandHandler("checkpo", checkpo_command))
-    application.add_handler(CommandHandler("baocaongay", daily_report_command))  # ---> ĐÃ ĐĂNG KÝ LỆNH MỚI <---
+    application.add_handler(CommandHandler("baocaongay", daily_report_command))
+    
+    # ---> [NEW FEATURE: ĐỔ TỒN KHO] Đăng ký lệnh bot <---
+    application.add_handler(CommandHandler("dotonkho", dotonkho_command))  
+    
     application.add_handler(MessageHandler(filters.Document.ALL, handle_po_file))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_product_code))
 
