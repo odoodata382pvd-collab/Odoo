@@ -754,7 +754,7 @@ async def process_export_inventory(update: Update, context: ContextTypes.DEFAULT
         return
 
     try:
-        # 1. Quét tất cả lượng tồn (quant) lớn hơn 0 tại kho đã chọn
+        # Quét tất cả lượng tồn (quant) lớn hơn 0 tại kho đã chọn
         quants = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'stock.quant', 'search_read',
@@ -766,7 +766,7 @@ async def process_export_inventory(update: Update, context: ContextTypes.DEFAULT
             await update.message.reply_text(f"📭 Kho *{loc_name}* hiện đang trống, không có sản phẩm nào tồn kho.", parse_mode='Markdown')
             return
 
-        # 2. Gom nhóm theo product_id để cộng dồn (tránh việc 1 SP chia thành nhiều dòng/lô)
+        # Gom nhóm theo product_id để cộng dồn
         stock_map = {}
         for q in quants:
             pid = q['product_id'][0]
@@ -776,7 +776,6 @@ async def process_export_inventory(update: Update, context: ContextTypes.DEFAULT
             stock_map[pid]['available'] += float(q.get('available_quantity', 0))
             stock_map[pid]['reserved'] += float(q.get('reserved_quantity', 0))
 
-        # 3. Lấy thông tin Tên, Mã SP
         pids = list(stock_map.keys())
         products = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
@@ -786,7 +785,6 @@ async def process_export_inventory(update: Update, context: ContextTypes.DEFAULT
         )
         product_map = {p['id']: p for p in products}
 
-        # 4. Ghi ra DataFrame
         rows = []
         for pid, qtys in stock_map.items():
             prod = product_map.get(pid, {})
@@ -799,15 +797,12 @@ async def process_export_inventory(update: Update, context: ContextTypes.DEFAULT
             })
 
         df = pd.DataFrame(rows)
-        # Sắp xếp theo mã SP cho đẹp mắt
         df = df.sort_values(by='Mã SP')
 
-        # Ghi vào Buffer Excel
         buf = io.BytesIO()
         df.to_excel(buf, index=False, sheet_name='Ton_Kho')
         buf.seek(0)
 
-        # Xử lý tên file tránh lỗi ký tự đặc biệt
         safe_loc_name = "".join(c for c in loc_name if c.isalnum() or c in (' ', '_')).replace(' ', '_')
         today_str = datetime.now().strftime('%d%m%Y')
         filename = f"Ton_Kho_{safe_loc_name}_{today_str}.xlsx"
@@ -833,11 +828,11 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     user_input = update.message.text.strip()
 
-    # --- [NEW FEATURE: ĐỔ TỒN KHO] Bắt Lệnh Chọn ID Kho ---
+    # --- Bắt Lệnh Chọn ID Kho cho tính năng Đổ Tồn Kho ---
     if context.user_data.get('waiting_for_location'):
         loc_dict = context.user_data.get('available_locations', {})
         if user_input in loc_dict:
-            context.user_data['waiting_for_location'] = False  # Xóa trạng thái chờ
+            context.user_data['waiting_for_location'] = False
             selected_loc = loc_dict[user_input]
             await update.message.reply_text(f"⌛️ Iem đang gom số liệu tồn cho kho *{selected_loc['display_name']}*...", parse_mode='Markdown')
             await process_export_inventory(update, context, selected_loc['id'], selected_loc['display_name'])
@@ -849,7 +844,6 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             await update.message.reply_text("❌ Mã kho không hợp lệ. Chị vui lòng nhập đúng ID kho trong danh sách hoặc gõ 'hủy' để thoát ạ.")
             return
-    # -------------------------------------------------------------
 
     # --- LOGIC AI: Nếu hỏi giá thì dùng AI ---
     if any(k in user_input.lower() for k in ['giá', 'bao nhiêu', 'vat', 'bảng giá', 'price']):
@@ -1185,6 +1179,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # =====================================================================
 # ---> [NEW FEATURE: ĐỔ TỒN KHO] HÀM QUÉT DANH SÁCH KHO TỪ ODOO <---
+# ---> (Đã tích hợp Chunking để fix lỗi Text is too long của Telegram)
 # =====================================================================
 async def dotonkho_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
@@ -1214,14 +1209,30 @@ async def dotonkho_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['waiting_for_location'] = True
         context.user_data['available_locations'] = loc_dict
 
-        # Format danh sách hiển thị
-        msg = "📦 *DANH SÁCH KHO HIỆN TẠI*\n\n"
+        # Format danh sách hiển thị và chia nhỏ nếu tin nhắn quá dài (Giới hạn Telegram: 4096 ký tự)
+        msg_header = "📦 *DANH SÁCH KHO HIỆN TẠI*\n\n"
+        msg_footer = "\n👉 *Vui lòng nhập ID kho (Ví dụ: 8) để iem xuất báo cáo ạ (Gõ 'hủy' để thoát).* "
+        
+        current_msg = msg_header
+        
         for loc in locations:
-            msg += f"🔹 Gõ `{loc['id']}` - Để chọn kho: {loc['display_name']}\n"
+            line = f"🔹 Gõ `{loc['id']}` - Để chọn kho: {loc['display_name']}\n"
             
-        msg += "\n👉 *Vui lòng nhập ID kho (Ví dụ: 8) để iem xuất báo cáo ạ (Gõ 'hủy' để thoát).* "
+            # Kiểm tra xem nếu thêm dòng này có vượt ngưỡng an toàn (3800 ký tự) không
+            if len(current_msg) + len(line) > 3800:
+                # Gửi phần tin nhắn hiện tại đi và làm trống biến để gom tiếp
+                await update.message.reply_text(current_msg, parse_mode='Markdown')
+                current_msg = "" 
+            
+            current_msg += line
 
-        await update.message.reply_text(msg, parse_mode='Markdown')
+        # Xử lý phần footer (hướng dẫn nhập ID) ở đoạn tin nhắn cuối cùng
+        if len(current_msg) + len(msg_footer) > 4000:
+            await update.message.reply_text(current_msg, parse_mode='Markdown')
+            await update.message.reply_text(msg_footer, parse_mode='Markdown')
+        else:
+            current_msg += msg_footer
+            await update.message.reply_text(current_msg, parse_mode='Markdown')
 
     except Exception as e:
         logger.error(f"Lỗi khi lấy danh sách kho: {e}")
@@ -1462,7 +1473,7 @@ def main():
     application.add_handler(CommandHandler("checkpo", checkpo_command))
     application.add_handler(CommandHandler("baocaongay", daily_report_command))
     
-    # ---> [NEW FEATURE: ĐỔ TỒN KHO] Đăng ký lệnh bot <---
+    # ---> Đăng ký lệnh bot (Đã fix lỗi Text is too long) <---
     application.add_handler(CommandHandler("dotonkho", dotonkho_command))  
     
     application.add_handler(MessageHandler(filters.Document.ALL, handle_po_file))
