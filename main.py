@@ -820,7 +820,74 @@ async def process_export_inventory(update: Update, context: ContextTypes.DEFAULT
 
 
 # =====================================================================
-# ---> [UPDATE FEATURE] XỬ LÝ LỆNH CHỌN KHO CHO ĐỔ TỒN & TÌM SẢN PHẨM <---
+# ---> [UPGRADED] HÀM TÌM VÀ QUÉT KHO THEO TỪ KHÓA (TỐI ƯU TỐC ĐỘ) <---
+# =====================================================================
+async def dotonkho_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    register_chat_id(chat_id)
+
+    # Lấy từ khóa người dùng nhập sau lệnh (VD: /dotonkho 201 -> keyword = "201")
+    keyword = " ".join(context.args).strip()
+
+    # Nếu người dùng không nhập từ khóa, hướng dẫn cách dùng
+    if not keyword:
+        msg = (
+            "💡 Danh sách kho trên Odoo thường rất dài. Để tìm và xuất dữ liệu nhanh nhất, "
+            "chị vui lòng gõ lệnh kèm theo **từ khóa** tên kho nhé!\n\n"
+            "👉 *Ví dụ:* `/dotonkho 201` hoặc `/dotonkho hcm`"
+        )
+        await update.message.reply_text(msg, parse_mode='Markdown')
+        return
+
+    await update.message.reply_text(f"🔍 Đang tìm các kho chứa từ khóa `*{keyword}*`...", parse_mode='Markdown')
+    
+    uid, models, error_msg = connect_odoo()
+    if not uid:
+        await update.message.reply_text(f"❌ Lỗi kết nối Odoo: {error_msg}")
+        return
+
+    try:
+        # Tìm kho nội bộ VÀ chứa từ khóa (ilike = không phân biệt chữ hoa/thường)
+        domain = [('usage', '=', 'internal'), ('display_name', 'ilike', keyword)]
+        locations = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'stock.location', 'search_read',
+            [domain],
+            {'fields': ['id', 'display_name']}
+        )
+
+        if not locations:
+            await update.message.reply_text(f"📭 Không tìm thấy kho nào có tên chứa từ khóa `*{keyword}*`.", parse_mode='Markdown')
+            return
+
+        # NẾU CHỈ TÌM THẤY 1 KHO -> AUTO ĐỔ TỒN LUÔN (Bỏ qua bước bắt gõ ID)
+        if len(locations) == 1:
+            loc = locations[0]
+            await update.message.reply_text(f"✅ Tìm thấy đúng 1 kho: *{loc['display_name']}*\n⌛️ Iem đang gom số liệu tồn...", parse_mode='Markdown')
+            # Gọi thẳng hàm xuất Excel
+            await process_export_inventory(update, context, loc['id'], loc['display_name'])
+            return
+
+        # NẾU TÌM THẤY NHIỀU KHO -> Hiển thị danh sách ngắn để chọn
+        loc_dict = {str(loc['id']): loc for loc in locations}
+        context.user_data['waiting_for_location'] = True
+        context.user_data['available_locations'] = loc_dict
+
+        msg = f"📦 *TÌM THẤY {len(locations)} KHO PHÙ HỢP:*\n\n"
+        for loc in locations:
+            msg += f"🔹 Gõ `{loc['id']}` - Kho: {loc['display_name']}\n"
+
+        msg += "\n👉 *Vui lòng gõ ID kho mà chị muốn xem (Gõ 'hủy' để thoát).* "
+
+        await update.message.reply_text(msg, parse_mode='Markdown')
+
+    except Exception as e:
+        logger.error(f"Lỗi khi lấy danh sách kho: {e}")
+        await update.message.reply_text(f"❌ Lỗi quét danh sách kho: {e}")
+
+
+# =====================================================================
+# ---> XỬ LÝ LỆNH CHỌN KHO CHO ĐỔ TỒN & TÌM SẢN PHẨM <---
 # =====================================================================
 async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
@@ -1169,74 +1236,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. Gõ mã sp để tra tồn.\n"
         "2. Hỏi giá sản phẩm để em báo giá.\n"
         "3. Gửi file Excel bảng giá để cập nhật.\n"
-        "4. /keohang để tạo báo cáo Excel kéo hàng.\n"
-        "5. /checkpo để đối chiếu tồn kho PO.\n"
-        "6. /baocaongay để xuất báo cáo Nhập/Xuất cuối ngày.\n"
-        "7. /dotonkho để xuất toàn bộ sản phẩm của 1 kho bất kỳ.\n"
-        "8. /ping để kiểm tra kết nối Odoo."
+        "4. `/keohang` để tạo báo cáo Excel kéo hàng.\n"
+        "5. `/checkpo` để đối chiếu tồn kho PO.\n"
+        "6. `/baocaongay` để xuất báo cáo Nhập/Xuất cuối ngày.\n"
+        "7. `/dotonkho <tên kho>` để xuất toàn bộ sản phẩm của 1 kho bất kỳ.\n"
+        "8. `/ping` để kiểm tra kết nối Odoo.",
+        parse_mode='Markdown'
     )
-
-
-# =====================================================================
-# ---> [NEW FEATURE: ĐỔ TỒN KHO] HÀM QUÉT DANH SÁCH KHO TỪ ODOO <---
-# ---> (Đã tích hợp Chunking để fix lỗi Text is too long của Telegram)
-# =====================================================================
-async def dotonkho_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat_id
-    register_chat_id(chat_id)
-
-    await update.message.reply_text("⌛️ Iem đang quét danh sách kho trên hệ thống, chờ em xíu nha...")
-    uid, models, error_msg = connect_odoo()
-    if not uid:
-        await update.message.reply_text(f"❌ Lỗi kết nối Odoo: {error_msg}")
-        return
-
-    try:
-        # Lấy danh sách các kho nội bộ (Internal Location)
-        locations = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD,
-            'stock.location', 'search_read',
-            [[('usage', '=', 'internal')]],
-            {'fields': ['id', 'display_name']}
-        )
-
-        if not locations:
-            await update.message.reply_text("❌ Không tìm thấy kho nội bộ nào trên hệ thống.")
-            return
-
-        # Lưu danh sách kho vào context để chờ người dùng chọn
-        loc_dict = {str(loc['id']): loc for loc in locations}
-        context.user_data['waiting_for_location'] = True
-        context.user_data['available_locations'] = loc_dict
-
-        # Format danh sách hiển thị và chia nhỏ nếu tin nhắn quá dài (Giới hạn Telegram: 4096 ký tự)
-        msg_header = "📦 *DANH SÁCH KHO HIỆN TẠI*\n\n"
-        msg_footer = "\n👉 *Vui lòng nhập ID kho (Ví dụ: 8) để iem xuất báo cáo ạ (Gõ 'hủy' để thoát).* "
-        
-        current_msg = msg_header
-        
-        for loc in locations:
-            line = f"🔹 Gõ `{loc['id']}` - Để chọn kho: {loc['display_name']}\n"
-            
-            # Kiểm tra xem nếu thêm dòng này có vượt ngưỡng an toàn (3800 ký tự) không
-            if len(current_msg) + len(line) > 3800:
-                # Gửi phần tin nhắn hiện tại đi và làm trống biến để gom tiếp
-                await update.message.reply_text(current_msg, parse_mode='Markdown')
-                current_msg = "" 
-            
-            current_msg += line
-
-        # Xử lý phần footer (hướng dẫn nhập ID) ở đoạn tin nhắn cuối cùng
-        if len(current_msg) + len(msg_footer) > 4000:
-            await update.message.reply_text(current_msg, parse_mode='Markdown')
-            await update.message.reply_text(msg_footer, parse_mode='Markdown')
-        else:
-            current_msg += msg_footer
-            await update.message.reply_text(current_msg, parse_mode='Markdown')
-
-    except Exception as e:
-        logger.error(f"Lỗi khi lấy danh sách kho: {e}")
-        await update.message.reply_text(f"❌ Lỗi quét danh sách kho: {e}")
 
 
 async def checkpo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1473,7 +1479,7 @@ def main():
     application.add_handler(CommandHandler("checkpo", checkpo_command))
     application.add_handler(CommandHandler("baocaongay", daily_report_command))
     
-    # ---> Đăng ký lệnh bot (Đã fix lỗi Text is too long) <---
+    # ---> Đăng ký lệnh bot (Chấp nhận arg để lọc từ khóa) <---
     application.add_handler(CommandHandler("dotonkho", dotonkho_command))  
     
     application.add_handler(MessageHandler(filters.Document.ALL, handle_po_file))
