@@ -152,7 +152,7 @@ def ask_groq_ai(query):
     global current_key_index
     
     if not os.path.exists(PRICE_DATA_FILE):
-        return "Em chưa có dữ liệu bảng giá. Hãy gửi file Excel để nạp nhé!"
+        return "Iem chưa có dữ liệu bảng giá. Hãy gửi file Excel để nạp nhé!"
 
     try:
         with open(PRICE_DATA_FILE, 'r', encoding='utf-8') as f:
@@ -177,7 +177,7 @@ def ask_groq_ai(query):
                     break
         
         if not found_item:
-            return "Em không tìm thấy mã hàng này trong bảng giá ạ."
+            return "Iem không tìm thấy mã hàng này trong bảng giá ạ."
 
         clean_info = {k: v for k, v in found_item.items() if str(v).lower() != 'nan' and 'unnamed' not in str(k).lower()}
 
@@ -808,7 +808,7 @@ async def process_export_inventory(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_document(
             document=buf,
             filename=filename,
-            caption=f"📊 Em gửi file thống kê tồn kho của *{loc_name}* ạ!\nTổng cộng có {len(df)} mã sản phẩm đang có hàng.",
+            caption=f"📊 Iem gửi file thống kê tồn kho của *{loc_name}* ạ!\nTổng cộng có {len(df)} mã sản phẩm đang có hàng.",
             parse_mode='Markdown'
         )
 
@@ -829,7 +829,7 @@ async def dotonkho_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not keyword:
         msg = (
             "💡 Danh sách kho trên Odoo thường rất dài. Để tìm và xuất dữ liệu nhanh nhất, "
-            "Anh/chị vui lòng gõ lệnh kèm theo **từ khóa** tên kho nhé!\n\n"
+            "chị vui lòng gõ lệnh kèm theo **từ khóa** tên kho nhé!\n\n"
             "👉 *Ví dụ:* `/dotonkho 201` hoặc `/dotonkho hcm`"
         )
         await update.message.reply_text(msg, parse_mode='Markdown')
@@ -857,7 +857,7 @@ async def dotonkho_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if len(locations) == 1:
             loc = locations[0]
-            await update.message.reply_text(f"✅ Tìm thấy đúng 1 kho: *{loc['display_name']}*\n⌛️ Em đang gom số liệu tồn...", parse_mode='Markdown')
+            await update.message.reply_text(f"✅ Tìm thấy đúng 1 kho: *{loc['display_name']}*\n⌛️ Iem đang gom số liệu tồn...", parse_mode='Markdown')
             await process_export_inventory(update, context, loc['id'], loc['display_name'])
             return
 
@@ -869,7 +869,7 @@ async def dotonkho_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for loc in locations:
             msg += f"🔹 Gõ `{loc['id']}` - Kho: {loc['display_name']}\n"
 
-        msg += "\n👉 *Vui lòng gõ ID kho mà Anh/chị muốn xem (Gõ 'hủy' để thoát).* "
+        msg += "\n👉 *Vui lòng gõ ID kho mà chị muốn xem (Gõ 'hủy' để thoát).* "
 
         await update.message.reply_text(msg, parse_mode='Markdown')
 
@@ -879,48 +879,231 @@ async def dotonkho_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =====================================================================
-# ---> XỬ LÝ LỆNH CHỌN KHO CHO ĐỔ TỒN & TÌM SẢN PHẨM <---
+# ---> [NEW FEATURE] KIỂM TRA ĐƠN HÀNG <---
+# =====================================================================
+async def check_single_order(update: Update, context: ContextTypes.DEFAULT_TYPE, order_code: str):
+    await update.message.reply_text(f"🔍 Đang truy xuất thông tin đơn hàng `*{order_code}*`...", parse_mode='Markdown')
+    uid, models, error_msg = connect_odoo()
+    if not uid:
+        await update.message.reply_text(f"❌ Lỗi kết nối Odoo: {error_msg}")
+        return
+
+    try:
+        orders = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'sale.order', 'search_read',
+            [[('name', 'ilike', order_code)]],
+            {'fields': ['name', 'partner_id', 'state', 'date_order', 'amount_total', 'order_line']}
+        )
+
+        if not orders:
+            await update.message.reply_text(f"📭 Iem không tìm thấy đơn hàng nào khớp với mã `*{order_code}*` trên hệ thống ạ.", parse_mode='Markdown')
+            return
+
+        o = orders[0]
+        state_map = {
+            'draft': 'Nháp / Báo giá',
+            'sent': 'Đã gửi báo giá',
+            'sale': 'Đã chốt (Sale Order)',
+            'done': 'Đã khóa / Hoàn thành',
+            'cancel': 'Đã hủy'
+        }
+        state_vn = state_map.get(o['state'], o['state'])
+        
+        lines = []
+        if o.get('order_line'):
+            lines = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD,
+                'sale.order.line', 'read',
+                [o['order_line']],
+                {'fields': ['product_id', 'product_uom_qty', 'qty_delivered', 'price_subtotal']}
+            )
+
+        msg = f"🧾 **THÔNG TIN ĐƠN HÀNG: {o['name']}**\n"
+        msg += f"👤 Khách hàng: {o['partner_id'][1] if o.get('partner_id') else 'Không xác định'}\n"
+        msg += f"📅 Ngày lập: {o['date_order']}\n"
+        msg += f"✅ Trạng thái: {state_vn}\n"
+        msg += f"💰 Tổng tiền: {o['amount_total']:,.0f} VNĐ\n\n"
+        msg += "📦 **CHI TIẾT SẢN PHẨM:**\n"
+        
+        if not lines:
+            msg += "Đơn hàng chưa có sản phẩm nào."
+        else:
+            for i, l in enumerate(lines, 1):
+                pname = l['product_id'][1] if l.get('product_id') else 'Không rõ'
+                qty = l.get('product_uom_qty', 0)
+                deliv = l.get('qty_delivered', 0)
+                msg += f"{i}. {pname}\n   ▫️ SL đặt: {qty} | Đã giao: {deliv}\n"
+
+        await update.message.reply_text(msg, parse_mode='Markdown')
+
+    except Exception as e:
+        logger.error(f"Lỗi kiểm tra đơn hàng: {e}")
+        await update.message.reply_text(f"❌ Lỗi truy xuất đơn hàng: {e}")
+
+
+async def export_customer_orders(update: Update, context: ContextTypes.DEFAULT_TYPE, customer_name: str):
+    await update.message.reply_text(f"🔍 Iem đang tìm kiếm tối đa 20 đơn hàng gần nhất của khách hàng `*{customer_name}*`...", parse_mode='Markdown')
+    uid, models, error_msg = connect_odoo()
+    if not uid:
+        await update.message.reply_text(f"❌ Lỗi kết nối Odoo: {error_msg}")
+        return
+
+    try:
+        # 1. Tìm thông tin khách hàng
+        partners = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'res.partner', 'search_read',
+            [[('name', 'ilike', customer_name)]],
+            {'fields': ['id', 'name']}
+        )
+        
+        if not partners:
+            await update.message.reply_text(f"📭 Iem không tìm thấy khách hàng nào tên là `*{customer_name}*` trên hệ thống ạ.", parse_mode='Markdown')
+            return
+            
+        p_ids = [p['id'] for p in partners]
+
+        # 2. Tìm Sale Orders của khách
+        orders = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'sale.order', 'search_read',
+            [[('partner_id', 'in', p_ids)]],
+            {'fields': ['name', 'partner_id', 'state', 'date_order', 'amount_total', 'order_line'], 'limit': 20, 'order': 'date_order desc'}
+        )
+
+        if not orders:
+            await update.message.reply_text(f"📭 Khách hàng `*{customer_name}*` chưa có đơn đặt hàng nào.", parse_mode='Markdown')
+            return
+
+        # 3. Lấy chi tiết line của các đơn
+        line_ids = []
+        for o in orders:
+            line_ids.extend(o.get('order_line', []))
+
+        lines_dict = {}
+        if line_ids:
+            lines_info = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD,
+                'sale.order.line', 'read',
+                [line_ids],
+                {'fields': ['order_id', 'product_id', 'product_uom_qty', 'qty_delivered', 'price_unit', 'price_subtotal']}
+            )
+            for l in lines_info:
+                oid = l['order_id'][0] if l.get('order_id') else 0
+                if oid not in lines_dict: 
+                    lines_dict[oid] = []
+                lines_dict[oid].append(l)
+
+        state_map = {'draft': 'Nháp', 'sent': 'Đã gửi BG', 'sale': 'Đã chốt', 'done': 'Hoàn thành', 'cancel': 'Đã hủy'}
+
+        rows = []
+        for o in orders:
+            oid = o['id']
+            oname = o['name']
+            cname = o['partner_id'][1] if o.get('partner_id') else ''
+            date_str = o['date_order']
+            st = state_map.get(o['state'], o['state'])
+            total_amount = o.get('amount_total', 0)
+
+            o_lines = lines_dict.get(oid, [])
+            if not o_lines:
+                rows.append({
+                    'Mã Đơn': oname, 'Khách Hàng': cname, 'Ngày Đặt': date_str, 'Trạng Thái': st,
+                    'Sản Phẩm': 'Không có SP', 'SL Đặt': 0, 'SL Đã Giao': 0, 'Đơn Giá': 0, 'Thành Tiền': 0, 'Tổng Đơn': total_amount
+                })
+            else:
+                for l in o_lines:
+                    pname = l['product_id'][1] if l.get('product_id') else ''
+                    rows.append({
+                        'Mã Đơn': oname, 'Khách Hàng': cname, 'Ngày Đặt': date_str, 'Trạng Thái': st,
+                        'Sản Phẩm': pname, 
+                        'SL Đặt': l.get('product_uom_qty', 0), 
+                        'SL Đã Giao': l.get('qty_delivered', 0), 
+                        'Đơn Giá': l.get('price_unit', 0), 
+                        'Thành Tiền': l.get('price_subtotal', 0),
+                        'Tổng Đơn': total_amount
+                    })
+
+        df = pd.DataFrame(rows)
+        buf = io.BytesIO()
+        df.to_excel(buf, index=False, sheet_name='Lich_Su_Don_Hang')
+        buf.seek(0)
+
+        safe_name = "".join(c for c in customer_name if c.isalnum() or c in (' ', '_')).replace(' ', '_')
+        await update.message.reply_document(
+            document=buf,
+            filename=f"Don_Hang_{safe_name}.xlsx",
+            caption=f"📊 Iem đã tổng hợp xong {len(orders)} đơn hàng gần nhất của khách `*{customer_name}*` rồi ạ!",
+            parse_mode='Markdown'
+        )
+
+    except Exception as e:
+        logger.error(f"Lỗi xuất đơn hàng khách hàng: {e}")
+        await update.message.reply_text(f"❌ Lỗi khi xuất Excel: {e}")
+
+
+# =====================================================================
+# ---> XỬ LÝ TEXT: NLP & CHỌN KHO & KIỂM TRA ĐƠN HÀNG <---
 # =====================================================================
 async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
 
     user_input = update.message.text.strip()
+    user_input_lower = user_input.lower()
 
+    # --- 1. Lọc Lệnh Chọn ID Kho cho Đổ Tồn Kho ---
     if context.user_data.get('waiting_for_location'):
         loc_dict = context.user_data.get('available_locations', {})
         if user_input in loc_dict:
             context.user_data['waiting_for_location'] = False
             selected_loc = loc_dict[user_input]
-            await update.message.reply_text(f"⌛️ Em đang gom số liệu tồn cho kho *{selected_loc['display_name']}*...", parse_mode='Markdown')
+            await update.message.reply_text(f"⌛️ Iem đang gom số liệu tồn cho kho *{selected_loc['display_name']}*...", parse_mode='Markdown')
             await process_export_inventory(update, context, selected_loc['id'], selected_loc['display_name'])
             return
-        elif user_input.lower() in ['huy', 'hủy', 'cancel']:
+        elif user_input_lower in ['huy', 'hủy', 'cancel']:
             context.user_data['waiting_for_location'] = False
             await update.message.reply_text("✅ Đã hủy lệnh đổ tồn kho nha!")
             return
         else:
-            await update.message.reply_text("❌ Mã kho không hợp lệ. Anh/Chị vui lòng nhập đúng ID kho trong danh sách hoặc gõ 'hủy' để thoát ạ.")
+            await update.message.reply_text("❌ Mã kho không hợp lệ. Chị vui lòng nhập đúng ID kho trong danh sách hoặc gõ 'hủy' để thoát ạ.")
             return
 
-    if any(k in user_input.lower() for k in ['giá', 'bao nhiêu', 'vat', 'bảng giá', 'price']):
-        await update.message.reply_text("⌛️ Em đang tra bảng giá xíu...")
+    # --- 2. LOGIC AI Báo Giá ---
+    if any(k in user_input_lower for k in ['giá', 'bao nhiêu', 'vat', 'bảng giá', 'price']):
+        await update.message.reply_text("⌛️ Iem đang tra bảng giá xíu...")
         answer = ask_groq_ai(user_input)
         await update.message.reply_text(answer, parse_mode='Markdown')
         return
 
+    # --- 3. [NEW] LOGIC TÌM KIẾM ĐƠN HÀNG QUA NLP ---
+    # 3.1. Tìm đơn hàng theo Tên Khách Hàng
+    if "đơn hàng" in user_input_lower and "của" in user_input_lower:
+        khach_hang = user_input_lower.split("của")[-1].strip()
+        if khach_hang:
+            await export_customer_orders(update, context, khach_hang)
+            return
+
+    # 3.2. Tìm 1 đơn hàng cụ thể theo Mã (Sale Order)
+    if user_input_lower.startswith("kiểm tra đơn") or user_input_lower.startswith("check đơn") or user_input_lower.startswith("đơn hàng "):
+        # Loại bỏ các tiền tố để lấy mã đơn
+        ma_don = user_input_lower.replace("kiểm tra đơn hàng", "").replace("kiểm tra đơn", "").replace("check đơn", "")
+        if user_input_lower.startswith("đơn hàng "):
+            ma_don = user_input_lower.replace("đơn hàng", "")
+            
+        ma_don = ma_don.strip().split()[0].upper() # Lấy từ đầu tiên viết hoa
+        if ma_don:
+            await check_single_order(update, context, ma_don)
+            return
+
+    # --- 4. LOGIC ODOO: Tra tồn kho sản phẩm ---
     product_code = user_input.upper()
-    await update.message.reply_text(
-        f"Đang tra tồn cho `{product_code}`, vui lòng chờ!",
-        parse_mode='Markdown'
-    )
+    await update.message.reply_text(f"đang tra tồn cho `{product_code}`, vui lòng chờ!", parse_mode='Markdown')
 
     uid, models, error_msg = connect_odoo()
     if not uid:
-        await update.message.reply_text(
-            f"❌ lỗi kết nối odoo. chi tiết: `{escape_markdown(error_msg)}`",
-            parse_mode='Markdown'
-        )
+        await update.message.reply_text(f"❌ lỗi kết nối odoo. chi tiết: `{escape_markdown(error_msg)}`", parse_mode='Markdown')
         return
 
     try:
@@ -938,7 +1121,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
         if not products:
-            await update.message.reply_text(f"❌ Đồ ngOO, không có sản phẩm nào có mã `{product_code}`")
+            await update.message.reply_text(f"❌ Không tìm thấy sản phẩm nào có mã `{product_code}`")
             return
 
         product = products[0]
@@ -1196,7 +1379,7 @@ async def excel_report_command(update: Update, context: ContextTypes.DEFAULT_TYP
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
 
-    await update.message.reply_text("⌛️ Em đang xử lý dữ liệu và tạo báo cáo Excel...")
+    await update.message.reply_text("⌛️ Iem đang xử lý dữ liệu và tạo báo cáo Excel...")
     excel_buffer, item_count, error_msg = get_stock_data()
 
     if excel_buffer is None:
@@ -1228,8 +1411,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "4. `/keohang` để tạo báo cáo Excel kéo hàng.\n"
         "5. `/checkpo` để đối chiếu tồn kho PO.\n"
         "6. `/baocaongay` để xuất báo cáo Nhập/Xuất cuối ngày.\n"
-        "7. `/dotonkho` <tên kho> để xuất toàn bộ sản phẩm của 1 kho bất kỳ.\n"
-        "8. `/ping` để kiểm tra kết nối Odoo.",
+        "7. `/dotonkho <tên kho>` để xuất tồn 1 kho.\n"
+        "8. Gõ `kiểm tra đơn hàng S...` để xem chi tiết 1 đơn.\n"
+        "9. Gõ `đơn hàng của [Tên]` để xuất Excel đơn của khách.\n"
+        "10. `/ping` để kiểm tra kết nối Odoo.",
         parse_mode='Markdown'
     )
 
@@ -1259,7 +1444,7 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get('waiting_for_po'):
         context.user_data['waiting_for_po'] = False
-        await update.message.reply_text("⌛️ Em đang xử lý file PO, chờ em nha...")
+        await update.message.reply_text("⌛️ Iem đang xử lý file PO, chờ em xíu xìu xiu nha...")
 
         try:
             file = await document.get_file()
@@ -1283,7 +1468,7 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_bytes = await file.download_as_bytearray()
             success, info = process_price_excel(bytes(file_bytes))
             if success:
-                await update.message.reply_text(f"✅ Đã nạp thành công bảng giá ({info}). Anh/Chị có thể bắt đầu hỏi giá rồi nha!")
+                await update.message.reply_text(f"✅ Đã nạp thành công bảng giá ({info}). Chị có thể bắt đầu hỏi giá rồi nha!")
             else:
                 await update.message.reply_text(f"❌ Lỗi nạp bảng giá: {info}")
         except Exception as e:
@@ -1538,7 +1723,7 @@ def watchdog_batch():
                         f"{icon} Biến động: {diff_str}  |  📦 Tồn mới: {new_ton} SP\n\n"
                     )
 
-                    # Băm nhỏ tin nhắn nếu quá dài (Tránh lỗi Text is too long)
+                    # Băm nhỏ tin nhắn nếu quá dài
                     if len(current_msg) + len(line) > 3800:
                         for chat_id in get_registered_chat_ids():
                             try:
