@@ -745,7 +745,7 @@ def process_po_and_build_report(file_bytes: bytes):
 
 
 # =====================================================================
-# ---> [NEW FEATURE: ĐỔ TỒN KHO] TẠO FILE EXCEL TỒN KHO CHI TIẾT <---
+# ---> TẠO FILE EXCEL TỒN KHO CHI TIẾT <---
 # =====================================================================
 async def process_export_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE, loc_id: int, loc_name: str):
     uid, models, error_msg = connect_odoo()
@@ -820,7 +820,7 @@ async def process_export_inventory(update: Update, context: ContextTypes.DEFAULT
 
 
 # =====================================================================
-# ---> [UPGRADED] HÀM TÌM VÀ QUÉT KHO THEO TỪ KHÓA (TỐI ƯU TỐC ĐỘ) <---
+# ---> HÀM TÌM VÀ QUÉT KHO THEO TỪ KHÓA (TỐI ƯU TỐC ĐỘ) <---
 # =====================================================================
 async def dotonkho_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
@@ -1399,14 +1399,22 @@ def watchdog_201():
                     ODOO_DB, uid, ODOO_PASSWORD,
                     "stock.move", "search_read",
                     [[("product_id", "=", pid)]],
-                    {"fields": ["id", "picking_id"], "limit": 1, "order": "id desc"}
+                    {"fields": ["id", "picking_id", "location_dest_id", "state"], "limit": 1, "order": "id desc"}
                 )
 
                 picking_name = "N/A"
                 actor = "Không xác định"
+                dest_loc_name = "Không xác định"
+                state_vn = "Không xác định"
 
                 if move_data:
-                    picking_field = move_data[0].get("picking_id")
+                    move = move_data[0]
+                    picking_field = move.get("picking_id")
+                    
+                    # Lấy mặc định từ stock.move (đề phòng không có picking như trường hợp kiểm kê kho)
+                    if move.get("location_dest_id"):
+                        dest_loc_name = move["location_dest_id"][1]
+                    raw_state = move.get("state")
 
                     if picking_field:
                         picking_id = picking_field[0]
@@ -1414,18 +1422,37 @@ def watchdog_201():
                             ODOO_DB, uid, ODOO_PASSWORD,
                             "stock.picking", "read",
                             [[picking_id]],
-                            {"fields": ["name", "write_uid", "create_uid"]}
-                        )[0]
+                            {"fields": ["name", "write_uid", "create_uid", "location_dest_id", "state"]}
+                        )
+                        
+                        if picking_info:
+                            p_info = picking_info[0]
+                            picking_name = p_info.get("name", "N/A")
+                            
+                            # Ưu tiên lấy từ picking
+                            if p_info.get("location_dest_id"):
+                                dest_loc_name = p_info["location_dest_id"][1]
+                            if p_info.get("state"):
+                                raw_state = p_info["state"]
 
-                        picking_name = picking_info.get("name", "N/A")
+                            w_uid = p_info.get("write_uid")
+                            c_uid = p_info.get("create_uid")
 
-                        w_uid = picking_info.get("write_uid")
-                        c_uid = picking_info.get("create_uid")
-
-                        if w_uid:
-                            actor = w_uid[1]
-                        elif c_uid:
-                            actor = c_uid[1]
+                            if w_uid:
+                                actor = w_uid[1]
+                            elif c_uid:
+                                actor = c_uid[1]
+                    
+                    # Dịch trạng thái sang tiếng Việt
+                    state_map = {
+                        'draft': 'Nháp (Chưa duyệt)',
+                        'waiting': 'Đang chờ (Chưa duyệt)',
+                        'confirmed': 'Chờ có hàng (Chưa duyệt)',
+                        'assigned': 'Sẵn sàng (Chưa duyệt)',
+                        'done': 'Đã duyệt (Hoàn thành)',
+                        'cancel': 'Đã hủy'
+                    }
+                    state_vn = state_map.get(raw_state, raw_state) if raw_state else "Không xác định"
 
                 status = "NHẬP KHO" if diff > 0 else "XUẤT KHO"
                 now_vn = datetime.now(tz).strftime('%H:%M %d/%m/%Y')
@@ -1437,6 +1464,8 @@ def watchdog_201():
                     f"*Biến động:* {'+' if diff > 0 else ''}{diff} SP\n"
                     f"*Tổng tồn mới:* {new_qty} SP\n\n"
                     f"*Mã lệnh:* {picking_name}\n"
+                    f"*Lệnh đi cho kho:* {dest_loc_name}\n"
+                    f"*Trạng thái lệnh:* {state_vn}\n"
                     f"*Người thao tác:* {actor}\n"
                     f"*Thời gian:* {now_vn}"
                 )
@@ -1478,8 +1507,6 @@ def main():
     application.add_handler(CommandHandler("keohang", excel_report_command))
     application.add_handler(CommandHandler("checkpo", checkpo_command))
     application.add_handler(CommandHandler("baocaongay", daily_report_command))
-    
-    # ---> Đăng ký lệnh bot (Chấp nhận arg để lọc từ khóa) <---
     application.add_handler(CommandHandler("dotonkho", dotonkho_command))  
     
     application.add_handler(MessageHandler(filters.Document.ALL, handle_po_file))
