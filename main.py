@@ -152,7 +152,7 @@ def ask_groq_ai(query):
     global current_key_index
     
     if not os.path.exists(PRICE_DATA_FILE):
-        return "Iem chưa có dữ liệu bảng giá. Hãy gửi file Excel để nạp nhé!"
+        return "Em chưa có dữ liệu bảng giá. Hãy gửi file Excel để nạp nhé!"
 
     try:
         with open(PRICE_DATA_FILE, 'r', encoding='utf-8') as f:
@@ -177,7 +177,7 @@ def ask_groq_ai(query):
                     break
         
         if not found_item:
-            return "Iem không tìm thấy mã hàng này trong bảng giá ạ."
+            return "Em không tìm thấy mã hàng này trong bảng giá ạ."
 
         clean_info = {k: v for k, v in found_item.items() if str(v).lower() != 'nan' and 'unnamed' not in str(k).lower()}
 
@@ -808,7 +808,7 @@ async def process_export_inventory(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_document(
             document=buf,
             filename=filename,
-            caption=f"📊 Iem gửi file thống kê tồn kho của *{loc_name}* ạ!\nTổng cộng có {len(df)} mã sản phẩm đang có hàng.",
+            caption=f"📊 Em gửi file thống kê tồn kho của *{loc_name}* ạ!\nTổng cộng có {len(df)} mã sản phẩm đang có hàng.",
             parse_mode='Markdown'
         )
 
@@ -829,7 +829,7 @@ async def dotonkho_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not keyword:
         msg = (
             "💡 Danh sách kho trên Odoo thường rất dài. Để tìm và xuất dữ liệu nhanh nhất, "
-            "chị vui lòng gõ lệnh kèm theo **từ khóa** tên kho nhé!\n\n"
+            "Anh/chị vui lòng gõ lệnh kèm theo **từ khóa** tên kho nhé!\n\n"
             "👉 *Ví dụ:* `/dotonkho 201` hoặc `/dotonkho hcm`"
         )
         await update.message.reply_text(msg, parse_mode='Markdown')
@@ -857,7 +857,7 @@ async def dotonkho_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if len(locations) == 1:
             loc = locations[0]
-            await update.message.reply_text(f"✅ Tìm thấy đúng 1 kho: *{loc['display_name']}*\n⌛️ Iem đang gom số liệu tồn...", parse_mode='Markdown')
+            await update.message.reply_text(f"✅ Tìm thấy đúng 1 kho: *{loc['display_name']}*\n⌛️ Em đang gom số liệu tồn...", parse_mode='Markdown')
             await process_export_inventory(update, context, loc['id'], loc['display_name'])
             return
 
@@ -869,7 +869,7 @@ async def dotonkho_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for loc in locations:
             msg += f"🔹 Gõ `{loc['id']}` - Kho: {loc['display_name']}\n"
 
-        msg += "\n👉 *Vui lòng gõ ID kho mà chị muốn xem (Gõ 'hủy' để thoát).* "
+        msg += "\n👉 *Vui lòng gõ ID kho mà Anh/chị muốn xem (Gõ 'hủy' để thoát).* "
 
         await update.message.reply_text(msg, parse_mode='Markdown')
 
@@ -892,7 +892,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         if user_input in loc_dict:
             context.user_data['waiting_for_location'] = False
             selected_loc = loc_dict[user_input]
-            await update.message.reply_text(f"⌛️ Iem đang gom số liệu tồn cho kho *{selected_loc['display_name']}*...", parse_mode='Markdown')
+            await update.message.reply_text(f"⌛️ Em đang gom số liệu tồn cho kho *{selected_loc['display_name']}*...", parse_mode='Markdown')
             await process_export_inventory(update, context, selected_loc['id'], selected_loc['display_name'])
             return
         elif user_input.lower() in ['huy', 'hủy', 'cancel']:
@@ -900,18 +900,18 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("✅ Đã hủy lệnh đổ tồn kho nha!")
             return
         else:
-            await update.message.reply_text("❌ Mã kho không hợp lệ. Chị vui lòng nhập đúng ID kho trong danh sách hoặc gõ 'hủy' để thoát ạ.")
+            await update.message.reply_text("❌ Mã kho không hợp lệ. Anh/Chị vui lòng nhập đúng ID kho trong danh sách hoặc gõ 'hủy' để thoát ạ.")
             return
 
     if any(k in user_input.lower() for k in ['giá', 'bao nhiêu', 'vat', 'bảng giá', 'price']):
-        await update.message.reply_text("⌛️ Iem đang tra bảng giá xíu...")
+        await update.message.reply_text("⌛️ Em đang tra bảng giá xíu...")
         answer = ask_groq_ai(user_input)
         await update.message.reply_text(answer, parse_mode='Markdown')
         return
 
     product_code = user_input.upper()
     await update.message.reply_text(
-        f"đang tra tồn cho `{product_code}`, vui lòng chờ!",
+        f"Đang tra tồn cho `{product_code}`, vui lòng chờ!",
         parse_mode='Markdown'
     )
 
@@ -938,7 +938,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
         if not products:
-            await update.message.reply_text(f"❌ Không tìm thấy sản phẩm nào có mã `{product_code}`")
+            await update.message.reply_text(f"❌ Đồ ngOO, không có sản phẩm nào có mã `{product_code}`")
             return
 
         product = products[0]
@@ -1196,7 +1196,7 @@ async def excel_report_command(update: Update, context: ContextTypes.DEFAULT_TYP
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
 
-    await update.message.reply_text("⌛️ Iem đang xử lý dữ liệu và tạo báo cáo Excel...")
+    await update.message.reply_text("⌛️ Em đang xử lý dữ liệu và tạo báo cáo Excel...")
     excel_buffer, item_count, error_msg = get_stock_data()
 
     if excel_buffer is None:
@@ -1228,7 +1228,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "4. `/keohang` để tạo báo cáo Excel kéo hàng.\n"
         "5. `/checkpo` để đối chiếu tồn kho PO.\n"
         "6. `/baocaongay` để xuất báo cáo Nhập/Xuất cuối ngày.\n"
-        "7. `/dotonkho <tên kho>` để xuất toàn bộ sản phẩm của 1 kho bất kỳ.\n"
+        "7. `/dotonkho` <tên kho> để xuất toàn bộ sản phẩm của 1 kho bất kỳ.\n"
         "8. `/ping` để kiểm tra kết nối Odoo.",
         parse_mode='Markdown'
     )
@@ -1259,7 +1259,7 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get('waiting_for_po'):
         context.user_data['waiting_for_po'] = False
-        await update.message.reply_text("⌛️ Iem đang xử lý file PO, chờ em xíu xìu xiu nha...")
+        await update.message.reply_text("⌛️ Em đang xử lý file PO, chờ em nha...")
 
         try:
             file = await document.get_file()
@@ -1283,7 +1283,7 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_bytes = await file.download_as_bytearray()
             success, info = process_price_excel(bytes(file_bytes))
             if success:
-                await update.message.reply_text(f"✅ Đã nạp thành công bảng giá ({info}). Chị có thể bắt đầu hỏi giá rồi nha!")
+                await update.message.reply_text(f"✅ Đã nạp thành công bảng giá ({info}). Anh/Chị có thể bắt đầu hỏi giá rồi nha!")
             else:
                 await update.message.reply_text(f"❌ Lỗi nạp bảng giá: {info}")
         except Exception as e:
