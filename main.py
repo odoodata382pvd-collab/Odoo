@@ -754,7 +754,6 @@ async def process_export_inventory(update: Update, context: ContextTypes.DEFAULT
         return
 
     try:
-        # Quét tất cả lượng tồn (quant) lớn hơn 0 tại kho đã chọn
         quants = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'stock.quant', 'search_read',
@@ -766,7 +765,6 @@ async def process_export_inventory(update: Update, context: ContextTypes.DEFAULT
             await update.message.reply_text(f"📭 Kho *{loc_name}* hiện đang trống, không có sản phẩm nào tồn kho.", parse_mode='Markdown')
             return
 
-        # Gom nhóm theo product_id để cộng dồn
         stock_map = {}
         for q in quants:
             pid = q['product_id'][0]
@@ -820,16 +818,14 @@ async def process_export_inventory(update: Update, context: ContextTypes.DEFAULT
 
 
 # =====================================================================
-# ---> HÀM TÌM VÀ QUÉT KHO THEO TỪ KHÓA (TỐI ƯU TỐC ĐỘ) <---
+# ---> HÀM TÌM VÀ QUÉT KHO THEO TỪ KHÓA <---
 # =====================================================================
 async def dotonkho_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
 
-    # Lấy từ khóa người dùng nhập sau lệnh (VD: /dotonkho 201 -> keyword = "201")
     keyword = " ".join(context.args).strip()
 
-    # Nếu người dùng không nhập từ khóa, hướng dẫn cách dùng
     if not keyword:
         msg = (
             "💡 Danh sách kho trên Odoo thường rất dài. Để tìm và xuất dữ liệu nhanh nhất, "
@@ -847,7 +843,6 @@ async def dotonkho_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        # Tìm kho nội bộ VÀ chứa từ khóa (ilike = không phân biệt chữ hoa/thường)
         domain = [('usage', '=', 'internal'), ('display_name', 'ilike', keyword)]
         locations = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
@@ -860,15 +855,12 @@ async def dotonkho_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"📭 Không tìm thấy kho nào có tên chứa từ khóa `*{keyword}*`.", parse_mode='Markdown')
             return
 
-        # NẾU CHỈ TÌM THẤY 1 KHO -> AUTO ĐỔ TỒN LUÔN (Bỏ qua bước bắt gõ ID)
         if len(locations) == 1:
             loc = locations[0]
             await update.message.reply_text(f"✅ Tìm thấy đúng 1 kho: *{loc['display_name']}*\n⌛️ Iem đang gom số liệu tồn...", parse_mode='Markdown')
-            # Gọi thẳng hàm xuất Excel
             await process_export_inventory(update, context, loc['id'], loc['display_name'])
             return
 
-        # NẾU TÌM THẤY NHIỀU KHO -> Hiển thị danh sách ngắn để chọn
         loc_dict = {str(loc['id']): loc for loc in locations}
         context.user_data['waiting_for_location'] = True
         context.user_data['available_locations'] = loc_dict
@@ -895,7 +887,6 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     user_input = update.message.text.strip()
 
-    # --- Bắt Lệnh Chọn ID Kho cho tính năng Đổ Tồn Kho ---
     if context.user_data.get('waiting_for_location'):
         loc_dict = context.user_data.get('available_locations', {})
         if user_input in loc_dict:
@@ -912,14 +903,12 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("❌ Mã kho không hợp lệ. Chị vui lòng nhập đúng ID kho trong danh sách hoặc gõ 'hủy' để thoát ạ.")
             return
 
-    # --- LOGIC AI: Nếu hỏi giá thì dùng AI ---
     if any(k in user_input.lower() for k in ['giá', 'bao nhiêu', 'vat', 'bảng giá', 'price']):
         await update.message.reply_text("⌛️ Iem đang tra bảng giá xíu...")
         answer = ask_groq_ai(user_input)
         await update.message.reply_text(answer, parse_mode='Markdown')
         return
 
-    # --- LOGIC ODOO: Tra tồn kho Odoo ---
     product_code = user_input.upper()
     await update.message.reply_text(
         f"đang tra tồn cho `{product_code}`, vui lòng chờ!",
@@ -1336,13 +1325,16 @@ def keep_alive_ping():
 
 threading.Thread(target=keep_alive_ping, daemon=True).start()
 
-# ---------------- WATCHDOG 201/201 ----------------
-WATCH_INTERVAL = 60
-previous_snapshot = {}
 
-def watchdog_201():
-    global previous_snapshot
+# =====================================================================
+# ---> WATCHDOG GOM NHÓM (BATCHING) CHO TẤT CẢ CÁC KHO HÀ NỘI <---
+# =====================================================================
+last_move_id = 0
+
+def watchdog_batch():
+    global last_move_id
     tz = pytz.timezone("Asia/Ho_Chi_Minh")
+    WATCH_INTERVAL = 60
 
     while True:
         try:
@@ -1352,139 +1344,229 @@ def watchdog_201():
                 time.sleep(WATCH_INTERVAL)
                 continue
 
-            location_ids = find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD)
-            hn_id = location_ids.get("HN_STOCK", {}).get("id")
-
-            if not hn_id:
-                logger.error("Watchdog: Không tìm thấy kho 201/201")
+            # 1. Khởi tạo mốc ID mới nhất khi Bot vừa chạy
+            if last_move_id == 0:
+                latest_move = models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD,
+                    'stock.move', 'search_read',
+                    [[('state', '=', 'done')]],
+                    {'fields': ['id'], 'limit': 1, 'order': 'id desc'}
+                )
+                if latest_move:
+                    last_move_id = latest_move[0]['id']
+                else:
+                    last_move_id = -1
                 time.sleep(WATCH_INTERVAL)
                 continue
 
-            quant_data = models.execute_kw(
+            # 2. Tìm các lệnh Done mới sinh ra sau mốc ID
+            new_moves = models.execute_kw(
                 ODOO_DB, uid, ODOO_PASSWORD,
-                "stock.quant", "search_read",
-                [[("location_id", "=", hn_id)]],
-                {"fields": ["product_id", "available_quantity"]}
+                'stock.move', 'search_read',
+                [[('id', '>', last_move_id), ('state', '=', 'done')]],
+                {'fields': ['id', 'product_id', 'product_uom_qty', 'location_id', 'location_dest_id', 'picking_id', 'write_uid', 'date']}
             )
 
-            current_snapshot = {}
-            for q in quant_data:
-                pid = q["product_id"][0]
-                qty = int(q.get("available_quantity") or 0)
-                current_snapshot[pid] = qty
-
-            if not previous_snapshot:
-                previous_snapshot = current_snapshot
+            if not new_moves:
                 time.sleep(WATCH_INTERVAL)
                 continue
 
-            for pid, new_qty in current_snapshot.items():
-                old_qty = previous_snapshot.get(pid, 0)
-                if new_qty == old_qty:
-                    continue
+            # Cập nhật ID lớn nhất
+            max_id = max(m['id'] for m in new_moves)
+            last_move_id = max(last_move_id, max_id)
 
-                diff = new_qty - old_qty
+            # Hàm nhận diện kho Hà Nội (Chứa 201 hoặc chữ HN)
+            def is_hn_loc(name):
+                n = str(name).upper()
+                return '201' in n or 'HN' in n or 'HÀ NỘI' in n or 'HA NOI' in n
 
-                product_info = models.execute_kw(
+            # 3. Gom nhóm theo Picking (Phiếu)
+            groups = {}
+            for m in new_moves:
+                src = m.get('location_id')
+                dest = m.get('location_dest_id')
+                if not src or not dest: continue
+
+                src_name = src[1]
+                dest_name = dest[1]
+
+                is_src_hn = is_hn_loc(src_name)
+                is_dest_hn = is_hn_loc(dest_name)
+
+                # Chỉ lấy giao dịch dính dáng tới kho Hà Nội
+                if not is_src_hn and not is_dest_hn:
+                    continue 
+
+                pick = m.get('picking_id')
+                pick_id = pick[0] if pick else f"NOPICK_{src[0]}_{dest[0]}"
+                pick_name = pick[1] if pick else "N/A"
+
+                group_key = (pick_id, pick_name, src[0], src_name, dest[0], dest_name)
+                if group_key not in groups:
+                    groups[group_key] = []
+                groups[group_key].append(m)
+
+            if not groups:
+                time.sleep(WATCH_INTERVAL)
+                continue
+
+            # 4. Xử lý từng nhóm Phiếu và gửi thông báo
+            for g_key, moves in groups.items():
+                pick_id, pick_name, src_id, src_name, dest_id, dest_name = g_key
+                is_src_hn = is_hn_loc(src_name)
+                is_dest_hn = is_hn_loc(dest_name)
+
+                # Xét hướng biến động của kho HN
+                if is_src_hn and not is_dest_hn:
+                    direction = "XUẤT KHO"
+                    target_loc_id = src_id
+                    target_loc_name = src_name
+                    sign = -1
+                elif is_dest_hn and not is_src_hn:
+                    direction = "NHẬP KHO"
+                    target_loc_id = dest_id
+                    target_loc_name = dest_name
+                    sign = 1
+                else: 
+                    direction = "ĐIỀU CHUYỂN NỘI BỘ"
+                    target_loc_id = dest_id 
+                    target_loc_name = f"{src_name} ➡️ {dest_name}"
+                    sign = 1
+
+                # Tính tổng biến động từng mã SP
+                prod_qtys = {}
+                for m in moves:
+                    pid = m['product_id'][0]
+                    pname = m['product_id'][1]
+                    qty = float(m.get('product_uom_qty') or 0.0)
+                    if pid not in prod_qtys:
+                        prod_qtys[pid] = {'name': pname, 'qty': 0}
+                    prod_qtys[pid]['qty'] += qty
+
+                # Lấy chi tiết thông tin Phiếu (Trạng thái & Người thao tác)
+                state_vn = "Đã duyệt (Hoàn thành)"
+                w_uid = moves[0].get('write_uid')
+                actor = w_uid[1] if isinstance(w_uid, list) and len(w_uid) > 1 else "Hệ thống"
+                
+                move_date = moves[0].get('date')
+                if move_date:
+                    utc_time = datetime.strptime(move_date, '%Y-%m-%d %H:%M:%S').replace(tzinfo=pytz.utc)
+                    vn_time_str = utc_time.astimezone(tz).strftime('%H:%M %d/%m/%Y')
+                else:
+                    vn_time_str = datetime.now(tz).strftime('%H:%M %d/%m/%Y')
+
+                if pick_id and isinstance(pick_id, int):
+                    p_info = models.execute_kw(
+                        ODOO_DB, uid, ODOO_PASSWORD,
+                        "stock.picking", "read",
+                        [[pick_id]],
+                        {"fields": ["state", "write_uid"]}
+                    )
+                    if p_info:
+                        raw_state = p_info[0].get('state')
+                        state_map = {
+                            'draft': 'Nháp (Chưa duyệt)',
+                            'waiting': 'Đang chờ (Chưa duyệt)',
+                            'confirmed': 'Chờ có hàng (Chưa duyệt)',
+                            'assigned': 'Sẵn sàng (Chưa duyệt)',
+                            'done': 'Đã duyệt (Hoàn thành)',
+                            'cancel': 'Đã hủy'
+                        }
+                        state_vn = state_map.get(raw_state, raw_state) if raw_state else state_vn
+                        p_w_uid = p_info[0].get('write_uid')
+                        if p_w_uid: actor = p_w_uid[1]
+
+                # Truy vấn tồn kho Odoo để lấy Tồn Mới
+                pids = list(prod_qtys.keys())
+                prod_info = models.execute_kw(
                     ODOO_DB, uid, ODOO_PASSWORD,
-                    "product.product", "read",
-                    [[pid]],
-                    {"fields": ["display_name", PRODUCT_CODE_FIELD]}
-                )[0]
+                    'product.product', 'search_read',
+                    [[('id', 'in', pids)]],
+                    {'fields': ['id', PRODUCT_CODE_FIELD]}
+                )
+                pcode_map = {p['id']: p.get(PRODUCT_CODE_FIELD, 'N/A') for p in prod_info}
 
-                code = product_info.get(PRODUCT_CODE_FIELD, "???")
-                name = product_info.get("display_name", "Không tên")
-
-                move_data = models.execute_kw(
+                loc_to_check = target_loc_id if sign == 1 or direction == "XUẤT KHO" else dest_id
+                quants = models.execute_kw(
                     ODOO_DB, uid, ODOO_PASSWORD,
-                    "stock.move", "search_read",
-                    [[("product_id", "=", pid)]],
-                    {"fields": ["id", "picking_id", "location_dest_id", "state"], "limit": 1, "order": "id desc"}
+                    'stock.quant', 'search_read',
+                    [[('location_id', '=', loc_to_check), ('product_id', 'in', pids)]],
+                    {'fields': ['product_id', 'available_quantity']}
+                )
+                
+                quant_map = {}
+                for q in quants:
+                    pid = q['product_id'][0]
+                    quant_map[pid] = quant_map.get(pid, 0) + float(q.get('available_quantity', 0))
+
+                # Build nội dung thông báo
+                msg_header = (
+                    f"📦 **Cập nhật tồn kho {target_loc_name} – {direction}**\n\n"
+                    f"🔖 **Mã lệnh:** {pick_name}\n"
+                    f"🏢 **Lệnh đi cho kho:** {dest_name}\n"
+                    f"✅ **Trạng thái lệnh:** {state_vn}\n"
+                    f"👤 **Người thao tác:** {actor}\n"
+                    f"🕒 **Thời gian:** {vn_time_str}\n\n"
+                    f"📝 **CHI TIẾT BIẾN ĐỘNG ({len(prod_qtys)} Mã sản phẩm):**\n\n"
                 )
 
-                picking_name = "N/A"
-                actor = "Không xác định"
-                dest_loc_name = "Không xác định"
-                state_vn = "Không xác định"
-
-                if move_data:
-                    move = move_data[0]
-                    picking_field = move.get("picking_id")
+                number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+                
+                current_msg = msg_header
+                idx = 1
+                
+                for pid, data in prod_qtys.items():
+                    code = pcode_map.get(pid, 'N/A')
+                    name = data['name']
+                    qty_diff = data['qty']
+                    new_ton = int(quant_map.get(pid, 0))
                     
-                    # Lấy mặc định từ stock.move (đề phòng không có picking như trường hợp kiểm kê kho)
-                    if move.get("location_dest_id"):
-                        dest_loc_name = move["location_dest_id"][1]
-                    raw_state = move.get("state")
+                    emoji = number_emojis[idx-1] if idx <= 10 else f"{idx}."
+                    
+                    if direction == "XUẤT KHO":
+                        diff_str = f"-{int(qty_diff)} SP"
+                        icon = "🔻"
+                    elif direction == "NHẬP KHO":
+                        diff_str = f"+{int(qty_diff)} SP"
+                        icon = "🔺"
+                    else:
+                        diff_str = f"Chuyển {int(qty_diff)} SP"
+                        icon = "🔄"
 
-                    if picking_field:
-                        picking_id = picking_field[0]
-                        picking_info = models.execute_kw(
-                            ODOO_DB, uid, ODOO_PASSWORD,
-                            "stock.picking", "read",
-                            [[picking_id]],
-                            {"fields": ["name", "write_uid", "create_uid", "location_dest_id", "state"]}
-                        )
+                    line = (
+                        f"{emoji} **[{code}]** {name}\n"
+                        f"{icon} Biến động: {diff_str}  |  📦 Tồn mới: {new_ton} SP\n\n"
+                    )
+
+                    # Băm nhỏ tin nhắn nếu quá dài (Tránh lỗi Text is too long)
+                    if len(current_msg) + len(line) > 3800:
+                        for chat_id in get_registered_chat_ids():
+                            try:
+                                bot = Bot(token=TELEGRAM_TOKEN)
+                                asyncio.run(bot.send_message(chat_id, current_msg, parse_mode="Markdown"))
+                            except Exception as e:
+                                logger.error(f"Lỗi gửi thông báo: {e}")
+                        current_msg = "" 
                         
-                        if picking_info:
-                            p_info = picking_info[0]
-                            picking_name = p_info.get("name", "N/A")
-                            
-                            # Ưu tiên lấy từ picking
-                            if p_info.get("location_dest_id"):
-                                dest_loc_name = p_info["location_dest_id"][1]
-                            if p_info.get("state"):
-                                raw_state = p_info["state"]
+                    current_msg += line
+                    idx += 1
 
-                            w_uid = p_info.get("write_uid")
-                            c_uid = p_info.get("create_uid")
+                # Gửi đoạn tin nhắn cuối cùng
+                if current_msg:
+                    for chat_id in get_registered_chat_ids():
+                        try:
+                            bot = Bot(token=TELEGRAM_TOKEN)
+                            asyncio.run(bot.send_message(chat_id, current_msg, parse_mode="Markdown"))
+                        except Exception as e:
+                            logger.error(f"Lỗi gửi thông báo: {e}")
 
-                            if w_uid:
-                                actor = w_uid[1]
-                            elif c_uid:
-                                actor = c_uid[1]
-                    
-                    # Dịch trạng thái sang tiếng Việt
-                    state_map = {
-                        'draft': 'Nháp (Chưa duyệt)',
-                        'waiting': 'Đang chờ (Chưa duyệt)',
-                        'confirmed': 'Chờ có hàng (Chưa duyệt)',
-                        'assigned': 'Sẵn sàng (Chưa duyệt)',
-                        'done': 'Đã duyệt (Hoàn thành)',
-                        'cancel': 'Đã hủy'
-                    }
-                    state_vn = state_map.get(raw_state, raw_state) if raw_state else "Không xác định"
-
-                status = "NHẬP KHO" if diff > 0 else "XUẤT KHO"
-                now_vn = datetime.now(tz).strftime('%H:%M %d/%m/%Y')
-
-                msg = (
-                    f"📦 *Cập nhật tồn kho 201/201 – {status}*\n\n"
-                    f"*Mã SP:* {code}\n"
-                    f"*Tên SP:* {name}\n"
-                    f"*Biến động:* {'+' if diff > 0 else ''}{diff} SP\n"
-                    f"*Tổng tồn mới:* {new_qty} SP\n\n"
-                    f"*Mã lệnh:* {picking_name}\n"
-                    f"*Lệnh đi cho kho:* {dest_loc_name}\n"
-                    f"*Trạng thái lệnh:* {state_vn}\n"
-                    f"*Người thao tác:* {actor}\n"
-                    f"*Thời gian:* {now_vn}"
-                )
-
-                for chat_id in get_registered_chat_ids():
-                    try:
-                        bot = Bot(token=TELEGRAM_TOKEN)
-                        asyncio.run(bot.send_message(chat_id, msg, parse_mode="Markdown"))
-                    except Exception as e:
-                        logger.error(f"Lỗi gửi thông báo tới {chat_id}: {e}")
-
-            previous_snapshot = current_snapshot
             time.sleep(WATCH_INTERVAL)
 
         except Exception as e:
-            logger.error(f"Lỗi watchdog: {e}")
+            logger.error(f"Lỗi watchdog batch: {e}")
             time.sleep(WATCH_INTERVAL)
 
-threading.Thread(target=watchdog_201, daemon=True).start()
+threading.Thread(target=watchdog_batch, daemon=True).start()
 
 # ---------------- MAIN ----------------
 def main():
