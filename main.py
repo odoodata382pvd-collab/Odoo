@@ -1930,7 +1930,7 @@ def watchdog_batch():
                     for chat_id in get_registered_chat_ids():
                         try:
                             bot = Bot(token=TELEGRAM_TOKEN)
-                            async asyncio.run(bot.send_message(chat_id, current_msg, parse_mode="Markdown"))
+                             asyncio.run(bot.send_message(chat_id, current_msg, parse_mode="Markdown"))
                         except Exception as e:
                             logger.error(f"Lỗi gửi thông báo: {e}")
 
