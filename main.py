@@ -234,12 +234,12 @@ def ask_groq_ai(query):
         return f"Lỗi hệ thống: {e}"
 
 
-# ---------------- CÁC HÀM HỖ TRỢ REAL-TIME CHO AI (ĐÃ NÂNG CẤP) ----------------
+# ---------------- CÁC HÀM HỖ TRỢ REAL-TIME CHO AI (ĐÃ NÂNG CẤP LẦN 2) ----------------
 
 def get_realtime_weather(location="Hà Nội"):
     try:
-        # Lấy đầy đủ thông tin: %C (điều kiện), %t (nhiệt độ thực), %f (cảm giác như)
-        url = f"https://wttr.in/{urllib.parse.quote(location)}?format=%l:+%C,+Nhiệt+độ:+%t,+Cảm+giác+như:+%f,+Độ+ẩm:+%h"
+        # Thêm &m để bắt buộc trả về hệ Metric (Độ C, km/h) tránh server Render IP Mỹ bị thành độ F
+        url = f"https://wttr.in/{urllib.parse.quote(location)}?format=%l:+%C,+Nhiệt+độ:+%t,+Cảm+giác+như:+%f,+Độ+ẩm:+%h&m"
         res = requests.get(url, timeout=5)
         if res.status_code == 200:
             return res.text.strip()
@@ -273,7 +273,7 @@ def analyze_chat_intent(user_input):
     current_time_str = datetime.now(tz_vn).strftime("%Y-%m-%d %H:%M:%S")
     
     system_prompt = f"""
-    Bạn là bộ não điều hướng. Thời gian hiện tại: {current_time_str}.
+    Bạn là bộ脑 điều hướng. Thời gian hiện tại: {current_time_str}.
     Nhiệm vụ của bạn là phân tích câu nói của người dùng và trả về DUY NHẤT một chuỗi JSON hợp lệ. KHÔNG giải thích.
     
     Quy tắc phân loại:
@@ -323,16 +323,17 @@ def generate_witty_response(user_input, topic, real_data):
     system_prompt = f"""
     Bạn là một trợ lý AI thông minh, dí dỏm, xì tin và biết cách chiều sếp.
     Người dùng vừa hỏi về: {topic}. 
-    Dưới đây là THÔNG TIN THỰC TẾ CHÍNH XÁC 100% được cào từ Internet ở thời điểm hiện tại:
+    Dưới đây là THÔNG TIN THỰC TẾ CHÍNH XÁC 100% được lấy từ Internet ở thời điểm hiện tại:
     ---
     {real_data}
     ---
     Nhiệm vụ: Trả lời câu hỏi '{user_input}'.
     
-    LUẬT THÉP BẮT BUỘC PHẢI TUÂN THEO:
-    1. TUYỆT ĐỐI tôn trọng dữ liệu internet cung cấp. Không được phép tự bịa kết quả.
-    2. VỀ THỜI TIẾT: Nếu thấy nhiệt độ tại Việt Nam > 34 độ C, PHẢI dùng từ ngữ than vãn về cái nóng "cháy da thịt", "đổ mồ hôi hột", "chảo lửa". TUYỆT ĐỐI KHÔNG BAO GIỜ được dùng các từ "ấm áp", "dễ chịu", "mát mẻ".
-    3. Giọng điệu phải cực kỳ tự nhiên, hài hước, có thể dùng ngôn ngữ gen Z hoặc giang hồ mạng để nịnh sếp. 
+    LUẬT THÉP BẮT BUỘC PHẢI TUÂN THEO ĐỂ KHÔNG BỊ SẾP CHỬI:
+    1. DỮ LIỆU ĐO LƯỜNG CHUẨN: Bắt buộc gọi đúng ĐỘ C (°C) và KM/H. (Dữ liệu trả về mặc định đã là độ C rồi). Không bao giờ được dùng độ F hay dặm.
+    2. NẾU THỜI TIẾT > 34 ĐỘ: Phải than vãn về cái nóng "cháy da thịt", "đổ mồ hôi hột". CẤM TUYỆT ĐỐI dùng các từ "ấm áp", "dễ chịu" khi nhiệt độ cao.
+    3. CỰC KỲ NGẮN GỌN & VÀO VIỆC: Trả lời trực tiếp vào trọng tâm, KHÔNG viết văn tế dài dòng. Tối đa 3-4 câu.
+    4. NỊNH SẾP NHƯNG TINH TẾ: Dùng khiếu hài hước để châm biếm hoặc nịnh sếp thật NGẮN GỌN ở cuối câu (ví dụ 1 câu chốt mặn mòi), không lải nhải giả tạo.
     """
     for _ in range(3):
         api_key = AI_KEYS[current_key_index]
@@ -351,7 +352,7 @@ def generate_witty_response(user_input, topic, real_data):
             if "429" in str(Exception):
                 current_key_index = (current_key_index + 1) % 3
                 continue
-            return f"Thông tin cập nhật: \n{real_data}"
+            return f"Thông tin mới nhất đây sếp ơi: \n{real_data}"
     return real_data
 
 # ---------------- Keep port open (Render free) ----------------
