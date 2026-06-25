@@ -234,11 +234,10 @@ def ask_groq_ai(query):
         return f"Lỗi hệ thống: {e}"
 
 
-# ---------------- CÁC HÀM HỖ TRỢ REAL-TIME CHO AI (ĐÃ NÂNG CẤP LẦN 2) ----------------
+# ---------------- CÁC HÀM HỖ TRỢ REAL-TIME CHO AI ----------------
 
 def get_realtime_weather(location="Hà Nội"):
     try:
-        # Thêm &m để bắt buộc trả về hệ Metric (Độ C, km/h) tránh server Render IP Mỹ bị thành độ F
         url = f"https://wttr.in/{urllib.parse.quote(location)}?format=%l:+%C,+Nhiệt+độ:+%t,+Cảm+giác+như:+%f,+Độ+ẩm:+%h&m"
         res = requests.get(url, timeout=5)
         if res.status_code == 200:
@@ -248,19 +247,28 @@ def get_realtime_weather(location="Hà Nội"):
         return "Lỗi kết nối khi lấy thời tiết."
 
 def perform_web_search(query):
-    """Sử dụng duckduckgo-search để lấy tin tức/sự kiện thực tế (như World Cup, giá cả...)"""
+    """Sử dụng duckduckgo-search phiên bản mở rộng để lấy nhiều tin tức hơn"""
     try:
         from duckduckgo_search import DDGS
+        info = ""
         with DDGS() as ddgs:
-            # Tìm kiếm kết quả trong 1 ngày qua (timelimit='d') để cập nhật nóng hổi nhất
-            results = [r for r in ddgs.text(query, region='wt-wt', safesearch='off', timelimit='d', max_results=3)]
+            # Ưu tiên lấy News (Tin tức) trước, tối đa 5 bài mới nhất
+            news_results = list(ddgs.news(query, region='wt-wt', safesearch='off', timelimit='d', max_results=5))
+            if news_results:
+                info += "📰 **TIN TỨC MỚI NHẤT:**\n"
+                for res in news_results:
+                    info += f"- {res.get('title', '')}: {res.get('body', '')}\n"
+            
+            # Cào thêm Web thông thường (Web Search) để lấy thêm ngữ cảnh chung
+            web_results = list(ddgs.text(query, region='wt-wt', safesearch='off', timelimit='d', max_results=3))
+            if web_results:
+                info += "\n🌐 **THÔNG TIN WEB BỔ SUNG:**\n"
+                for res in web_results:
+                    info += f"- {res.get('title', '')}: {res.get('body', '')}\n"
         
-        if not results:
+        if not info.strip():
             return "Không tìm thấy thông tin mới nhất trên mạng cho từ khóa này."
         
-        info = ""
-        for res in results:
-            info += f"- {res['title']}: {res['body']}\n"
         return info
     except ImportError:
         return "Sếp ơi, em chưa lướt web được! Sếp nhớ thêm 'duckduckgo-search' vào file requirements.txt rồi deploy lại nhé."
@@ -273,24 +281,30 @@ def analyze_chat_intent(user_input):
     current_time_str = datetime.now(tz_vn).strftime("%Y-%m-%d %H:%M:%S")
     
     system_prompt = f"""
-    Bạn là bộ脑 điều hướng. Thời gian hiện tại: {current_time_str}.
+    Bạn là bộ não điều hướng. Thời gian hiện tại: {current_time_str}.
     Nhiệm vụ của bạn là phân tích câu nói của người dùng và trả về DUY NHẤT một chuỗi JSON hợp lệ. KHÔNG giải thích.
     
-    Quy tắc phân loại:
+    Quy tắc phân loại (QUAN TRỌNG):
     1. Nếu yêu cầu THỐNG KÊ / BÁO CÁO ĐƠN HÀNG từ ngày này đến ngày khác:
     -> {{"action": "export_report", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD"}}
     
-    2. Nếu người dùng hỏi về THỜI TIẾT:
+    2. Nếu yêu cầu XUẤT ĐƠN HÀNG của MỘT KHÁCH HÀNG cụ thể (VD: "Đơn hàng HC", "Đơn hàng của anh Tuấn", "Cho xem đơn VHC"):
+    -> {{"action": "export_customer_orders", "customer_name": "Tên khách hàng cần tìm (VD: HC, VHC, Tuấn)"}}
+    
+    3. Nếu yêu cầu KIỂM TRA CHI TIẾT 1 MÃ ĐƠN HÀNG cụ thể (VD: "Kiểm tra đơn SO001", "Check đơn S12345"):
+    -> {{"action": "check_single_order", "order_code": "Mã đơn hàng"}}
+    
+    4. Nếu người dùng hỏi về THỜI TIẾT:
     -> {{"action": "weather", "location": "Tên địa phương"}} (mặc định là 'Hà Nội' nếu không rõ)
     
-    3. Nếu người dùng hỏi TIN TỨC, thời sự, thể thao (như World Cup), bóng đá, sự kiện nổi bật, hoặc cần tra cứu kiến thức mạng:
-    -> {{"action": "web_search", "query": "Từ khóa tìm kiếm tối ưu cho công cụ search (VD: Kết quả World Cup hôm nay)"}}
+    5. Nếu người dùng hỏi TIN TỨC, thời sự, thể thao, giá vàng, hoặc cần tra cứu kiến thức mạng:
+    -> {{"action": "web_search", "query": "Từ khóa tìm kiếm tối ưu (ngắn gọn, tập trung)"}}
     
-    4. Nếu câu lệnh CHỈ LÀ MÃ SẢN PHẨM (chuỗi ngắn, liền nhau, vd: 'SP01', 'IPHONE12', 'A123'):
+    6. Nếu câu lệnh CHỈ LÀ MÃ SẢN PHẨM (chuỗi ngắn, liền nhau, vd: 'SP01', 'IPHONE12', 'A123'):
     -> {{"action": "stock_search"}}
     
-    5. Nếu là câu giao tiếp bình thường (chào hỏi, tâm sự, trêu đùa không cần tìm kiếm mạng):
-    -> {{"action": "chat", "response": "Câu trả lời dí dỏm, thông minh, hài hước của bạn"}}
+    7. Nếu là câu giao tiếp bình thường (chào hỏi, tâm sự, trêu đùa không cần cào mạng):
+    -> {{"action": "chat", "response": "Câu trả lời dí dỏm, thông minh của bạn"}}
     """
 
     for _ in range(3):
@@ -321,19 +335,20 @@ def analyze_chat_intent(user_input):
 def generate_witty_response(user_input, topic, real_data):
     global current_key_index
     system_prompt = f"""
-    Bạn là một trợ lý AI thông minh, dí dỏm, xì tin và biết cách chiều sếp.
+    Bạn là một trợ lý AI thông minh, dí dỏm, làm việc cho sếp.
     Người dùng vừa hỏi về: {topic}. 
-    Dưới đây là THÔNG TIN THỰC TẾ CHÍNH XÁC 100% được lấy từ Internet ở thời điểm hiện tại:
+    Dưới đây là THÔNG TIN THỰC TẾ CHÍNH XÁC được cào từ Internet:
     ---
     {real_data}
     ---
     Nhiệm vụ: Trả lời câu hỏi '{user_input}'.
     
-    LUẬT THÉP BẮT BUỘC PHẢI TUÂN THEO ĐỂ KHÔNG BỊ SẾP CHỬI:
-    1. DỮ LIỆU ĐO LƯỜNG CHUẨN: Bắt buộc gọi đúng ĐỘ C (°C) và KM/H. (Dữ liệu trả về mặc định đã là độ C rồi). Không bao giờ được dùng độ F hay dặm.
-    2. NẾU THỜI TIẾT > 34 ĐỘ: Phải than vãn về cái nóng "cháy da thịt", "đổ mồ hôi hột". CẤM TUYỆT ĐỐI dùng các từ "ấm áp", "dễ chịu" khi nhiệt độ cao.
-    3. CỰC KỲ NGẮN GỌN & VÀO VIỆC: Trả lời trực tiếp vào trọng tâm, KHÔNG viết văn tế dài dòng. Tối đa 3-4 câu.
-    4. NỊNH SẾP NHƯNG TINH TẾ: Dùng khiếu hài hước để châm biếm hoặc nịnh sếp thật NGẮN GỌN ở cuối câu (ví dụ 1 câu chốt mặn mòi), không lải nhải giả tạo.
+    LUẬT THÉP:
+    1. Tổng hợp thông tin từ dữ liệu được cung cấp một cách khéo léo, tự nhiên như người thật đang đọc báo cho sếp nghe. KHÔNG copy paste nguyên xi.
+    2. Nếu thông tin cào được bị thiếu hoặc không rõ ràng, hãy trả lời dựa trên những gì tốt nhất có được và thành thật báo sếp là tin này chưa đầy đủ.
+    3. Nếu là THỜI TIẾT: Phải bắt buộc dùng đúng ĐỘ C (°C). Tùy vào nhiệt độ mà than vãn hoặc trêu đùa.
+    4. Giọng văn dí dỏm, chuyên nghiệp nhưng thân thiện. Có thể nịnh sếp nhẹ nhàng 1 câu ở cuối.
+    5. KHÔNG VIẾT DÀI DÒNG. Tối đa 4-5 câu.
     """
     for _ in range(3):
         api_key = AI_KEYS[current_key_index]
@@ -352,7 +367,7 @@ def generate_witty_response(user_input, topic, real_data):
             if "429" in str(Exception):
                 current_key_index = (current_key_index + 1) % 3
                 continue
-            return f"Thông tin mới nhất đây sếp ơi: \n{real_data}"
+            return f"Thông tin nguyên bản đây sếp ơi: \n{real_data}"
     return real_data
 
 # ---------------- Keep port open (Render free) ----------------
@@ -422,20 +437,6 @@ def connect_odoo():
 
     except Exception as e:
         return None, None, f"Lỗi kết nối: {e}"
-
-def get_odoo_url_components():
-    if not ODOO_URL_FINAL:
-        return None, None
-    parsed = urlparse(ODOO_URL_FINAL)
-    scheme = parsed.scheme
-    netloc = parsed.netloc
-    if scheme == 'http':
-        port = parsed.port or 80
-    elif scheme == 'https':
-        port = parsed.port or 443
-    else:
-        port = None
-    return netloc, port
 
 # ---------------- Location helpers ----------------
 def find_required_location_ids(models, uid, ODOO_DB, ODOO_PASSWORD):
@@ -633,7 +634,6 @@ def get_stock_data():
     except Exception as e:
         logger.error(f"lỗi khi xử lý kéo hàng: {e}")
         return None, 0, f"lỗi khi xử lý kéo hàng: {e}"
-
 
 # ---------------- PO /checkpo helpers ----------------
 def _read_po_with_auto_header(file_bytes: bytes):
@@ -1125,7 +1125,6 @@ async def export_customer_orders(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     try:
-        # 1. Tìm thông vị trí khách hàng
         partners = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'res.partner', 'search_read',
@@ -1139,7 +1138,6 @@ async def export_customer_orders(update: Update, context: ContextTypes.DEFAULT_T
             
         p_ids = [p['id'] for p in partners]
 
-        # 2. Tìm Sale Orders của khách
         orders = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'sale.order', 'search_read',
@@ -1151,7 +1149,6 @@ async def export_customer_orders(update: Update, context: ContextTypes.DEFAULT_T
             await update.message.reply_text(f"📭 Khách hàng `*{customer_name}*` chưa có đơn đặt hàng nào.", parse_mode='Markdown')
             return
 
-        # 3. Lấy chi tiết line của các đơn
         line_ids = []
         for o in orders:
             line_ids.extend(o.get('order_line', []))
@@ -1219,7 +1216,7 @@ async def export_customer_orders(update: Update, context: ContextTypes.DEFAULT_T
 
 
 # =====================================================================
-# ---> XỬ LÝ TEXT: NLP & CHỌN KHO & KIỂM TRA ĐƠN HÀNG <---
+# ---> XỬ LÝ TEXT CHÍNH: CỔNG ĐIỀU HƯỚNG AI & TÌM KẾM <---
 # =====================================================================
 async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
@@ -1252,28 +1249,27 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(answer, parse_mode='Markdown')
         return
 
-    # --- 3. TÌM KIẾM ĐƠN HÀNG QUA TỪ KHÓA TĨNH (Luồng ưu tiên) ---
-    if "đơn hàng" in user_input_lower and "của" in user_input_lower:
-        khach_hang = user_input_lower.split("của")[-1].strip()
-        if khach_hang:
-            await export_customer_orders(update, context, khach_hang)
-            return
-
-    if user_input_lower.startswith("kiểm tra đơn") or user_input_lower.startswith("check đơn") or user_input_lower.startswith("đơn hàng "):
-        ma_don = user_input_lower.replace("kiểm tra đơn hàng", "").replace("kiểm tra đơn", "").replace("check đơn", "")
-        if user_input_lower.startswith("đơn hàng "):
-            ma_don = user_input_lower.replace("đơn hàng", "")
-            
-        ma_don = ma_don.strip().split()[0].upper()
-        if ma_don:
-            await check_single_order(update, context, ma_don)
-            return
-
-    # --- 4. GIAO CHO AI PHÂN TÍCH Ý ĐỊNH VÀ GỌI DỮ LIỆU REAL-TIME ---
+    # --- 3. GIAO CHO AI PHÂN TÍCH Ý ĐỊNH VÀ ĐIỀU HƯỚNG ---
     ai_intent = analyze_chat_intent(user_input)
     action = ai_intent.get("action")
     
-    if action == "export_report":
+    if action == "export_customer_orders":
+        customer_name = ai_intent.get("customer_name", "").strip()
+        if customer_name:
+            await export_customer_orders(update, context, customer_name)
+        else:
+            await update.message.reply_text("Sếp muốn tra đơn của khách nào ạ? Gõ tên khách cho iem với nhé!")
+        return
+        
+    elif action == "check_single_order":
+        order_code = ai_intent.get("order_code", "").strip().upper()
+        if order_code:
+            await check_single_order(update, context, order_code)
+        else:
+            await update.message.reply_text("Sếp ném mã đơn (VD: SO001) đây để iem check cho nóng!")
+        return
+
+    elif action == "export_report":
         start_d = ai_intent.get("start_date")
         end_d = ai_intent.get("end_date")
         await export_orders_by_date_range(update, context, start_d, end_d)
@@ -1299,7 +1295,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(ai_intent.get("response", "Lỗi rồi sếp ơi!"))
         return
 
-    # --- 5. LOGIC ODOO: Tra tồn kho sản phẩm (Fallback nếu AI xác nhận là mã SP hoặc không rõ ý định) ---
+    # --- 4. LOGIC ODOO: Tra tồn kho sản phẩm (Fallback) ---
     product_code = user_input.upper()
     await update.message.reply_text(f"Đang tra tồn cho `{product_code}`, vui lòng chờ!", parse_mode='Markdown')
 
@@ -1614,8 +1610,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "5. `/checkpo` để đối chiếu tồn kho PO.\n"
         "6. `/baocaongay` để xuất báo cáo Nhập/Xuất cuối ngày.\n"
         "7. `/dotonkho <tên kho>` để xuất tồn 1 kho.\n"
-        "8. Gõ `kiểm tra đơn hàng S...` để xem chi tiết 1 đơn.\n"
-        "9. Gõ `đơn hàng của [Tên]` để xuất Excel đơn của khách.\n"
+        "8. Gõ tên khách (VD: Đơn hàng HC) để xuất Excel đơn của khách.\n"
+        "9. Gõ mã đơn (VD: Kiểm tra đơn SO001) để xem chi tiết.\n"
         "10. Hỏi bất cứ thông tin nào (World Cup, tin tức, thời tiết...).\n"
         "11. Hoặc yêu cầu: 'Tổng hợp đơn hàng từ ngày 2 đến ngày 20'\n"
         "12. `/ping` để kiểm tra kết nối Odoo.",
