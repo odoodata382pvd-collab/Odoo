@@ -19,7 +19,6 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import pytz
 import json
 import re
-import xml.etree.ElementTree as ET
 from groq import Groq
 
 # ---------------- Config Environment ----------------
@@ -235,10 +234,12 @@ def ask_groq_ai(query):
         return f"Lỗi hệ thống: {e}"
 
 
-# ---------------- CÁC HÀM HỖ TRỢ REAL-TIME CHO AI ----------------
+# ---------------- CÁC HÀM HỖ TRỢ REAL-TIME CHO AI (ĐÃ NÂNG CẤP) ----------------
+
 def get_realtime_weather(location="Hà Nội"):
     try:
-        url = f"https://wttr.in/{urllib.parse.quote(location)}?format=%l:+%c+%t,+%w,+%h"
+        # Lấy đầy đủ thông tin: %C (điều kiện), %t (nhiệt độ thực), %f (cảm giác như)
+        url = f"https://wttr.in/{urllib.parse.quote(location)}?format=%l:+%C,+Nhiệt+độ:+%t,+Cảm+giác+như:+%f,+Độ+ẩm:+%h"
         res = requests.get(url, timeout=5)
         if res.status_code == 200:
             return res.text.strip()
@@ -246,19 +247,25 @@ def get_realtime_weather(location="Hà Nội"):
     except Exception:
         return "Lỗi kết nối khi lấy thời tiết."
 
-def get_realtime_news():
+def perform_web_search(query):
+    """Sử dụng duckduckgo-search để lấy tin tức/sự kiện thực tế (như World Cup, giá cả...)"""
     try:
-        res = requests.get("https://vnexpress.net/rss/tin-moi-nhat.rss", timeout=5)
-        if res.status_code == 200:
-            root = ET.fromstring(res.content)
-            news_items = []
-            for item in root.findall('./channel/item')[:5]:
-                title = item.find('title').text
-                news_items.append(f"- {title}")
-            return "\n".join(news_items)
-        return "Không lấy được tin tức mới nhất từ hệ thống."
-    except Exception:
-        return "Lỗi kết nối khi lấy tin tức."
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            # Tìm kiếm kết quả trong 1 ngày qua (timelimit='d') để cập nhật nóng hổi nhất
+            results = [r for r in ddgs.text(query, region='wt-wt', safesearch='off', timelimit='d', max_results=3)]
+        
+        if not results:
+            return "Không tìm thấy thông tin mới nhất trên mạng cho từ khóa này."
+        
+        info = ""
+        for res in results:
+            info += f"- {res['title']}: {res['body']}\n"
+        return info
+    except ImportError:
+        return "Sếp ơi, em chưa lướt web được! Sếp nhớ thêm 'duckduckgo-search' vào file requirements.txt rồi deploy lại nhé."
+    except Exception as e:
+        return f"Lỗi khi lướt web tìm kiếm: {e}"
 
 def analyze_chat_intent(user_input):
     global current_key_index
@@ -276,13 +283,13 @@ def analyze_chat_intent(user_input):
     2. Nếu người dùng hỏi về THỜI TIẾT:
     -> {{"action": "weather", "location": "Tên địa phương"}} (mặc định là 'Hà Nội' nếu không rõ)
     
-    3. Nếu người dùng hỏi TIN TỨC, thời sự:
-    -> {{"action": "news"}}
+    3. Nếu người dùng hỏi TIN TỨC, thời sự, thể thao (như World Cup), bóng đá, sự kiện nổi bật, hoặc cần tra cứu kiến thức mạng:
+    -> {{"action": "web_search", "query": "Từ khóa tìm kiếm tối ưu cho công cụ search (VD: Kết quả World Cup hôm nay)"}}
     
-    4. Nếu câu lệnh CHỈ LÀ MÃ SẢN PHẨM (chuỗi ngắn, liền nhau, hoặc từ khóa kho, vd: 'SP01', 'IPHONE12', 'A123', '201'):
+    4. Nếu câu lệnh CHỈ LÀ MÃ SẢN PHẨM (chuỗi ngắn, liền nhau, vd: 'SP01', 'IPHONE12', 'A123'):
     -> {{"action": "stock_search"}}
     
-    5. Nếu là câu giao tiếp bình thường (chào hỏi, tâm sự, trêu đùa):
+    5. Nếu là câu giao tiếp bình thường (chào hỏi, tâm sự, trêu đùa không cần tìm kiếm mạng):
     -> {{"action": "chat", "response": "Câu trả lời dí dỏm, thông minh, hài hước của bạn"}}
     """
 
@@ -314,12 +321,18 @@ def analyze_chat_intent(user_input):
 def generate_witty_response(user_input, topic, real_data):
     global current_key_index
     system_prompt = f"""
-    Bạn là một trợ lý AI thông minh, dí dỏm và rất biết cách giao tiếp hài hước.
-    Người dùng vừa hỏi về {topic}. Dưới đây là THÔNG TIN THỰC TẾ CHÍNH XÁC 100% vừa được hệ thống lấy về:
+    Bạn là một trợ lý AI thông minh, dí dỏm, xì tin và biết cách chiều sếp.
+    Người dùng vừa hỏi về: {topic}. 
+    Dưới đây là THÔNG TIN THỰC TẾ CHÍNH XÁC 100% được cào từ Internet ở thời điểm hiện tại:
     ---
     {real_data}
     ---
-    Nhiệm vụ: Hãy trả lời câu hỏi '{user_input}' của người dùng dựa vào thông tin trên một cách tự nhiên. Bạn có thể dùng ngôn ngữ gen Z, trêu đùa hoặc chúc một câu năng lượng. TUYỆT ĐỐI KHÔNG bịa đặt sai lệch dữ liệu thực tế đã cung cấp ở trên.
+    Nhiệm vụ: Trả lời câu hỏi '{user_input}'.
+    
+    LUẬT THÉP BẮT BUỘC PHẢI TUÂN THEO:
+    1. TUYỆT ĐỐI tôn trọng dữ liệu internet cung cấp. Không được phép tự bịa kết quả.
+    2. VỀ THỜI TIẾT: Nếu thấy nhiệt độ tại Việt Nam > 34 độ C, PHẢI dùng từ ngữ than vãn về cái nóng "cháy da thịt", "đổ mồ hôi hột", "chảo lửa". TUYỆT ĐỐI KHÔNG BAO GIỜ được dùng các từ "ấm áp", "dễ chịu", "mát mẻ".
+    3. Giọng điệu phải cực kỳ tự nhiên, hài hước, có thể dùng ngôn ngữ gen Z hoặc giang hồ mạng để nịnh sếp. 
     """
     for _ in range(3):
         api_key = AI_KEYS[current_key_index]
@@ -338,7 +351,7 @@ def generate_witty_response(user_input, topic, real_data):
             if "429" in str(Exception):
                 current_key_index = (current_key_index + 1) % 3
                 continue
-            return f"Thông tin cập nhật: {real_data}"
+            return f"Thông tin cập nhật: \n{real_data}"
     return real_data
 
 # ---------------- Keep port open (Render free) ----------------
@@ -1267,16 +1280,17 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         
     elif action == "weather":
         loc = ai_intent.get("location", "Hà Nội")
-        await update.message.reply_text("🌤 Iem đang ngó nghiêng bầu trời lấy thông tin thời tiết thực tế...")
+        await update.message.reply_text("🌤 Đang đưa mặt ra ngoài cửa sổ đo thời tiết cho sếp...")
         weather_data = get_realtime_weather(loc)
         final_answer = generate_witty_response(user_input, f"Thời tiết tại {loc}", weather_data)
         await update.message.reply_text(final_answer)
         return
         
-    elif action == "news":
-        await update.message.reply_text("📰 Đang hóng hớt lướt báo lấy tin nóng nhất cho sếp...")
-        news_data = get_realtime_news()
-        final_answer = generate_witty_response(user_input, "Tin tức mới nhất", news_data)
+    elif action == "news" or action == "web_search":
+        search_query = ai_intent.get("query", user_input)
+        await update.message.reply_text(f"📰 Đang lướt mạng tra cứu '{search_query}' cho sếp...")
+        news_data = perform_web_search(search_query)
+        final_answer = generate_witty_response(user_input, "Thông tin mạng hiện tại", news_data)
         await update.message.reply_text(final_answer)
         return
         
@@ -1601,7 +1615,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "7. `/dotonkho <tên kho>` để xuất tồn 1 kho.\n"
         "8. Gõ `kiểm tra đơn hàng S...` để xem chi tiết 1 đơn.\n"
         "9. Gõ `đơn hàng của [Tên]` để xuất Excel đơn của khách.\n"
-        "10. Hỏi bất cứ thông tin nào như thời tiết, tin tức hiện tại.\n"
+        "10. Hỏi bất cứ thông tin nào (World Cup, tin tức, thời tiết...).\n"
         "11. Hoặc yêu cầu: 'Tổng hợp đơn hàng từ ngày 2 đến ngày 20'\n"
         "12. `/ping` để kiểm tra kết nối Odoo.",
         parse_mode='Markdown'
