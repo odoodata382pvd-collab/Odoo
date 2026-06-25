@@ -9,6 +9,7 @@ import socket
 import threading
 import time
 import urllib.request
+import urllib.parse
 import requests
 from datetime import datetime
 from urllib.parse import urlparse
@@ -18,6 +19,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import pytz
 import json
 import re
+import xml.etree.ElementTree as ET
 from groq import Groq
 
 # ---------------- Config Environment ----------------
@@ -231,6 +233,113 @@ def ask_groq_ai(query):
 
     except Exception as e:
         return f"Lỗi hệ thống: {e}"
+
+
+# ---------------- CÁC HÀM HỖ TRỢ REAL-TIME CHO AI ----------------
+def get_realtime_weather(location="Hà Nội"):
+    try:
+        url = f"https://wttr.in/{urllib.parse.quote(location)}?format=%l:+%c+%t,+%w,+%h"
+        res = requests.get(url, timeout=5)
+        if res.status_code == 200:
+            return res.text.strip()
+        return "Hiện tại không lấy được dữ liệu thời tiết thực tế."
+    except Exception:
+        return "Lỗi kết nối khi lấy thời tiết."
+
+def get_realtime_news():
+    try:
+        res = requests.get("https://vnexpress.net/rss/tin-moi-nhat.rss", timeout=5)
+        if res.status_code == 200:
+            root = ET.fromstring(res.content)
+            news_items = []
+            for item in root.findall('./channel/item')[:5]:
+                title = item.find('title').text
+                news_items.append(f"- {title}")
+            return "\n".join(news_items)
+        return "Không lấy được tin tức mới nhất từ hệ thống."
+    except Exception:
+        return "Lỗi kết nối khi lấy tin tức."
+
+def analyze_chat_intent(user_input):
+    global current_key_index
+    tz_vn = pytz.timezone("Asia/Ho_Chi_Minh")
+    current_time_str = datetime.now(tz_vn).strftime("%Y-%m-%d %H:%M:%S")
+    
+    system_prompt = f"""
+    Bạn là bộ não điều hướng. Thời gian hiện tại: {current_time_str}.
+    Nhiệm vụ của bạn là phân tích câu nói của người dùng và trả về DUY NHẤT một chuỗi JSON hợp lệ. KHÔNG giải thích.
+    
+    Quy tắc phân loại:
+    1. Nếu yêu cầu THỐNG KÊ / BÁO CÁO ĐƠN HÀNG từ ngày này đến ngày khác:
+    -> {{"action": "export_report", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD"}}
+    
+    2. Nếu người dùng hỏi về THỜI TIẾT:
+    -> {{"action": "weather", "location": "Tên địa phương"}} (mặc định là 'Hà Nội' nếu không rõ)
+    
+    3. Nếu người dùng hỏi TIN TỨC, thời sự:
+    -> {{"action": "news"}}
+    
+    4. Nếu câu lệnh CHỈ LÀ MÃ SẢN PHẨM (chuỗi ngắn, liền nhau, hoặc từ khóa kho, vd: 'SP01', 'IPHONE12', 'A123', '201'):
+    -> {{"action": "stock_search"}}
+    
+    5. Nếu là câu giao tiếp bình thường (chào hỏi, tâm sự, trêu đùa):
+    -> {{"action": "chat", "response": "Câu trả lời dí dỏm, thông minh, hài hước của bạn"}}
+    """
+
+    for _ in range(3):
+        api_key = AI_KEYS[current_key_index]
+        if not api_key:
+            current_key_index = (current_key_index + 1) % 3
+            continue
+        try:
+            client = Groq(api_key=api_key)
+            completion = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_input}
+                ],
+                temperature=0.1,
+                response_format={"type": "json_object"}
+            )
+            return json.loads(completion.choices[0].message.content)
+        except Exception as e:
+            if "429" in str(e):
+                current_key_index = (current_key_index + 1) % 3
+                continue
+            return {"action": "error", "response": f"Lỗi phân tích AI: {e}"}
+            
+    return {"action": "error", "response": "Server AI đang quá tải, sếp thử lại sau nhé!"}
+
+def generate_witty_response(user_input, topic, real_data):
+    global current_key_index
+    system_prompt = f"""
+    Bạn là một trợ lý AI thông minh, dí dỏm và rất biết cách giao tiếp hài hước.
+    Người dùng vừa hỏi về {topic}. Dưới đây là THÔNG TIN THỰC TẾ CHÍNH XÁC 100% vừa được hệ thống lấy về:
+    ---
+    {real_data}
+    ---
+    Nhiệm vụ: Hãy trả lời câu hỏi '{user_input}' của người dùng dựa vào thông tin trên một cách tự nhiên. Bạn có thể dùng ngôn ngữ gen Z, trêu đùa hoặc chúc một câu năng lượng. TUYỆT ĐỐI KHÔNG bịa đặt sai lệch dữ liệu thực tế đã cung cấp ở trên.
+    """
+    for _ in range(3):
+        api_key = AI_KEYS[current_key_index]
+        if not api_key:
+            current_key_index = (current_key_index + 1) % 3
+            continue
+        try:
+            client = Groq(api_key=api_key)
+            completion = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "system", "content": system_prompt}],
+                temperature=0.5
+            )
+            return completion.choices[0].message.content
+        except Exception:
+            if "429" in str(Exception):
+                current_key_index = (current_key_index + 1) % 3
+                continue
+            return f"Thông tin cập nhật: {real_data}"
+    return real_data
 
 # ---------------- Keep port open (Render free) ----------------
 def keep_port_open():
@@ -743,7 +852,6 @@ def process_po_and_build_report(file_bytes: bytes):
     except Exception as e:
         return None, f"Lỗi khi xử lý PO: {e}"
 
-
 # =====================================================================
 # ---> TẠO FILE EXCEL TỒN KHO CHI TIẾT <---
 # =====================================================================
@@ -877,6 +985,59 @@ async def dotonkho_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Lỗi khi lấy danh sách kho: {e}")
         await update.message.reply_text(f"❌ Lỗi quét danh sách kho: {e}")
 
+# =====================================================================
+# ---> HÀM XUẤT ĐƠN HÀNG THEO TỪ NGÀY TỚI NGÀY <---
+# =====================================================================
+async def export_orders_by_date_range(update: Update, context: ContextTypes.DEFAULT_TYPE, start_date: str, end_date: str):
+    await update.message.reply_text(f"🔍 Đang tổng hợp các đơn hàng từ `{start_date}` đến `{end_date}`...", parse_mode='Markdown')
+    uid, models, error_msg = connect_odoo()
+    if not uid:
+        await update.message.reply_text(f"❌ Lỗi kết nối Odoo: {error_msg}")
+        return
+
+    try:
+        domain = [
+            ('date_order', '>=', f"{start_date} 00:00:00"),
+            ('date_order', '<=', f"{end_date} 23:59:59")
+        ]
+        
+        orders = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'sale.order', 'search_read',
+            [domain],
+            {'fields': ['name', 'partner_id', 'state', 'date_order', 'amount_total'], 'order': 'date_order asc'}
+        )
+
+        if not orders:
+            await update.message.reply_text(f"📭 Iem không tìm thấy đơn hàng nào trong khoảng từ {start_date} đến {end_date} ạ.")
+            return
+
+        rows = []
+        state_map = {'draft': 'Nháp', 'sent': 'Đã gửi báo giá', 'sale': 'Đã chốt', 'done': 'Hoàn thành', 'cancel': 'Đã hủy'}
+        
+        for o in orders:
+            rows.append({
+                'Mã Đơn Hàng': o['name'],
+                'Khách Hàng': o['partner_id'][1] if o.get('partner_id') else 'N/A',
+                'Ngày Lên Đơn': o['date_order'],
+                'Trạng Thái': state_map.get(o['state'], o['state']),
+                'Tổng Tiền': o.get('amount_total', 0)
+            })
+
+        df = pd.DataFrame(rows)
+        buf = io.BytesIO()
+        df.to_excel(buf, index=False, sheet_name='Thống Kê Đơn Hàng')
+        buf.seek(0)
+
+        await update.message.reply_document(
+            document=buf,
+            filename=f"Thong_Ke_Don_Hang_{start_date}_den_{end_date}.xlsx",
+            caption=f"📊 Iem đã tổng hợp xong! Tổng cộng có {len(orders)} đơn hàng trong khoảng thời gian này nhé."
+        )
+
+    except Exception as e:
+        logger.error(f"Lỗi xuất đơn hàng theo ngày: {e}")
+        await update.message.reply_text(f"❌ Lỗi xuất Excel: {e}")
 
 # =====================================================================
 # ---> [NEW FEATURE] KIỂM TRA ĐƠN HÀNG <---
@@ -950,7 +1111,7 @@ async def export_customer_orders(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     try:
-        # 1. Tìm thông tin khách hàng
+        # 1. Tìm thông vị trí khách hàng
         partners = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'res.partner', 'search_read',
@@ -1070,36 +1231,62 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("❌ Mã kho không hợp lệ. Chị vui lòng nhập đúng ID kho trong danh sách hoặc gõ 'hủy' để thoát ạ.")
             return
 
-    # --- 2. LOGIC AI Báo Giá ---
+    # --- 2. Báo Giá (Luồng tĩnh ưu tiên) ---
     if any(k in user_input_lower for k in ['giá', 'bao nhiêu', 'vat', 'bảng giá', 'price']):
         await update.message.reply_text("⌛️ Iem đang tra bảng giá xíu...")
         answer = ask_groq_ai(user_input)
         await update.message.reply_text(answer, parse_mode='Markdown')
         return
 
-    # --- 3. [NEW] LOGIC TÌM KIẾM ĐƠN HÀNG QUA NLP ---
-    # 3.1. Tìm đơn hàng theo Tên Khách Hàng
+    # --- 3. TÌM KIẾM ĐƠN HÀNG QUA TỪ KHÓA TĨNH (Luồng ưu tiên) ---
     if "đơn hàng" in user_input_lower and "của" in user_input_lower:
         khach_hang = user_input_lower.split("của")[-1].strip()
         if khach_hang:
             await export_customer_orders(update, context, khach_hang)
             return
 
-    # 3.2. Tìm 1 đơn hàng cụ thể theo Mã (Sale Order)
     if user_input_lower.startswith("kiểm tra đơn") or user_input_lower.startswith("check đơn") or user_input_lower.startswith("đơn hàng "):
-        # Loại bỏ các tiền tố để lấy mã đơn
         ma_don = user_input_lower.replace("kiểm tra đơn hàng", "").replace("kiểm tra đơn", "").replace("check đơn", "")
         if user_input_lower.startswith("đơn hàng "):
             ma_don = user_input_lower.replace("đơn hàng", "")
             
-        ma_don = ma_don.strip().split()[0].upper() # Lấy từ đầu tiên viết hoa
+        ma_don = ma_don.strip().split()[0].upper()
         if ma_don:
             await check_single_order(update, context, ma_don)
             return
 
-    # --- 4. LOGIC ODOO: Tra tồn kho sản phẩm ---
+    # --- 4. GIAO CHO AI PHÂN TÍCH Ý ĐỊNH VÀ GỌI DỮ LIỆU REAL-TIME ---
+    ai_intent = analyze_chat_intent(user_input)
+    action = ai_intent.get("action")
+    
+    if action == "export_report":
+        start_d = ai_intent.get("start_date")
+        end_d = ai_intent.get("end_date")
+        await export_orders_by_date_range(update, context, start_d, end_d)
+        return
+        
+    elif action == "weather":
+        loc = ai_intent.get("location", "Hà Nội")
+        await update.message.reply_text("🌤 Iem đang ngó nghiêng bầu trời lấy thông tin thời tiết thực tế...")
+        weather_data = get_realtime_weather(loc)
+        final_answer = generate_witty_response(user_input, f"Thời tiết tại {loc}", weather_data)
+        await update.message.reply_text(final_answer)
+        return
+        
+    elif action == "news":
+        await update.message.reply_text("📰 Đang hóng hớt lướt báo lấy tin nóng nhất cho sếp...")
+        news_data = get_realtime_news()
+        final_answer = generate_witty_response(user_input, "Tin tức mới nhất", news_data)
+        await update.message.reply_text(final_answer)
+        return
+        
+    elif action == "chat":
+        await update.message.reply_text(ai_intent.get("response", "Lỗi rồi sếp ơi!"))
+        return
+
+    # --- 5. LOGIC ODOO: Tra tồn kho sản phẩm (Fallback nếu AI xác nhận là mã SP hoặc không rõ ý định) ---
     product_code = user_input.upper()
-    await update.message.reply_text(f"đang tra tồn cho `{product_code}`, vui lòng chờ!", parse_mode='Markdown')
+    await update.message.reply_text(f"Đang tra tồn cho `{product_code}`, vui lòng chờ!", parse_mode='Markdown')
 
     uid, models, error_msg = connect_odoo()
     if not uid:
@@ -1414,7 +1601,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "7. `/dotonkho <tên kho>` để xuất tồn 1 kho.\n"
         "8. Gõ `kiểm tra đơn hàng S...` để xem chi tiết 1 đơn.\n"
         "9. Gõ `đơn hàng của [Tên]` để xuất Excel đơn của khách.\n"
-        "10. `/ping` để kiểm tra kết nối Odoo.",
+        "10. Hỏi bất cứ thông tin nào như thời tiết, tin tức hiện tại.\n"
+        "11. Hoặc yêu cầu: 'Tổng hợp đơn hàng từ ngày 2 đến ngày 20'\n"
+        "12. `/ping` để kiểm tra kết nối Odoo.",
         parse_mode='Markdown'
     )
 
@@ -1741,7 +1930,7 @@ def watchdog_batch():
                     for chat_id in get_registered_chat_ids():
                         try:
                             bot = Bot(token=TELEGRAM_TOKEN)
-                            asyncio.run(bot.send_message(chat_id, current_msg, parse_mode="Markdown"))
+                            async asyncio.run(bot.send_message(chat_id, current_msg, parse_mode="Markdown"))
                         except Exception as e:
                             logger.error(f"Lỗi gửi thông báo: {e}")
 
