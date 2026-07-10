@@ -19,6 +19,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import pytz
 import json
 import re
+import html
 import google.generativeai as genai
 
 # ---------------- Config Environment ----------------
@@ -1869,15 +1870,22 @@ def watchdog_batch():
                     pid = q['product_id'][0]
                     quant_map[pid] = quant_map.get(pid, 0) + float(q.get('available_quantity', 0))
 
-                # Build nội dung thông báo
+                # --- BẮT ĐẦU ĐOẠN CODE THAY THẾ (HTML FORMAT) ---
+                safe_loc_name = html.escape(str(target_loc_name))
+                safe_dest_name = html.escape(str(dest_name))
+                safe_pick_name = html.escape(str(pick_name))
+                safe_actor = html.escape(str(actor))
+
+                # Build nội dung thông báo (Dùng chuẩn HTML để format phân cấp cực nét)
                 msg_header = (
-                    f"📦 **Cập nhật tồn kho {target_loc_name} – {direction}**\n\n"
-                    f"🔖 **Mã lệnh:** {pick_name}\n"
-                    f"🏢 **Lệnh đi cho kho:** {dest_name}\n"
-                    f"✅ **Trạng thái lệnh:** {state_vn}\n"
-                    f"👤 **Người thao tác:** {actor}\n"
-                    f"🕒 **Thời gian:** {vn_time_str}\n\n"
-                    f"📝 **CHI TIẾT BIẾN ĐỘNG ({len(prod_qtys)} Mã sản phẩm):**\n\n"
+                    f"📦 <b>CẬP NHẬT TỒN KHO: {direction}</b>\n"
+                    f"🏢 <b>Tuyến:</b> {safe_loc_name} ➔ {safe_dest_name}\n\n"
+                    f"🔖 <b>Mã lệnh:</b> <code>{safe_pick_name}</code>\n"
+                    f"✅ <b>Trạng thái:</b> {state_vn}\n"
+                    f"👤 <b>Thao tác:</b> {safe_actor}\n"
+                    f"🕒 <b>Thời gian:</b> {vn_time_str}\n"
+                    f"〰️〰️〰️〰️〰️〰️〰️〰️〰️\n"
+                    f"📝 <b>CHI TIẾT BIẾN ĐỘNG ({len(prod_qtys)} SP):</b>\n\n"
                 )
 
                 number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
@@ -1886,8 +1894,8 @@ def watchdog_batch():
                 idx = 1
                 
                 for pid, data in prod_qtys.items():
-                    code = pcode_map.get(pid, 'N/A')
-                    name = data['name']
+                    code = html.escape(str(pcode_map.get(pid, 'N/A')))
+                    name = html.escape(str(data['name']))
                     qty_diff = data['qty']
                     new_ton = int(quant_map.get(pid, 0))
                     
@@ -1903,17 +1911,18 @@ def watchdog_batch():
                         diff_str = f"Chuyển {int(qty_diff)} SP"
                         icon = "🔄"
 
+                    # Đóng khung Mã SP và tạo cấu trúc thụt đầu dòng (L-shape)
                     line = (
-                        f"{emoji} **[{code}]** {name}\n"
-                        f"{icon} Biến động: {diff_str}  |  📦 Tồn mới: {new_ton} SP\n\n"
+                        f"{emoji} <code>[{code}]</code> <b>{name}</b>\n"
+                        f" └ {icon} Biến động: <b>{diff_str}</b>  |  📦 Tồn mới: <b>{new_ton} SP</b>\n\n"
                     )
 
-                    # Băm nhỏ tin nhắn nếu quá dài
+                    # Băm nhỏ tin nhắn nếu quá dài (Lưu ý: parse_mode đã được đổi thành HTML)
                     if len(current_msg) + len(line) > 3800:
                         for chat_id in get_registered_chat_ids():
                             try:
                                 bot = Bot(token=TELEGRAM_TOKEN)
-                                asyncio.run(bot.send_message(chat_id, current_msg, parse_mode="Markdown"))
+                                asyncio.run(bot.send_message(chat_id, current_msg, parse_mode="HTML"))
                             except Exception as e:
                                 logger.error(f"Lỗi gửi thông báo: {e}")
                         current_msg = "" 
@@ -1921,14 +1930,15 @@ def watchdog_batch():
                     current_msg += line
                     idx += 1
 
-                # Gửi đoạn tin nhắn cuối cùng
+                # Gửi đoạn tin nhắn cuối cùng (Lưu ý: parse_mode đã được đổi thành HTML)
                 if current_msg:
                     for chat_id in get_registered_chat_ids():
                         try:
                             bot = Bot(token=TELEGRAM_TOKEN)
-                            asyncio.run(bot.send_message(chat_id, current_msg, parse_mode="Markdown"))
+                            asyncio.run(bot.send_message(chat_id, current_msg, parse_mode="HTML"))
                         except Exception as e:
                             logger.error(f"Lỗi gửi thông báo: {e}")
+                # --- KẾT THÚC ĐOẠN CODE THAY THẾ ---
 
             time.sleep(WATCH_INTERVAL)
 
