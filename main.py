@@ -125,7 +125,7 @@ async def save_cloud_db(context=None, chat_id=None):
                 if context and chat_id:
                     msg = (
                         f"☁️ **HỆ THỐNG ĐÃ TẠO Ổ ĐĨA MÂY MỚI!**\n\n"
-                        f"Sếp hãy copy đoạn mã ID này: `{JSONBIN_BIN_ID}`\n"
+                        f"Hãy copy đoạn mã ID này: `{JSONBIN_BIN_ID}`\n"
                         f"Và thêm vào Environment trên Render với tên biến là `JSONBIN_BIN_ID` nhé.\n"
                         f"*(Thêm xong thì Render khởi động lại vô tư, không bao giờ mất Bảng giá hay Báo danh nữa!)*"
                     )
@@ -222,7 +222,7 @@ def ask_groq_ai(query):
     global current_key_index
     
     if not os.path.exists(PRICE_DATA_FILE):
-        return "Iem chưa có dữ liệu bảng giá. Hãy gửi file Excel để nạp nhé!"
+        return "Chưa có dữ liệu bảng giá. Hãy gửi file Excel để nạp!"
 
     try:
         with open(PRICE_DATA_FILE, 'r', encoding='utf-8') as f:
@@ -247,7 +247,7 @@ def ask_groq_ai(query):
                     break
         
         if not found_item:
-            return "Iem không tìm thấy mã hàng này trong bảng giá ạ."
+            return "Không tìm thấy mã hàng này trong bảng giá."
 
         clean_info = {k: v for k, v in found_item.items() if str(v).lower() != 'nan' and 'unnamed' not in str(k).lower()}
 
@@ -999,7 +999,7 @@ async def process_export_inventory(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_document(
             document=buf,
             filename=filename,
-            caption=f"📊 Iem gửi file thống kê tồn kho của *{loc_name}* ạ!\nTổng cộng có {len(df)} mã sản phẩm đang có hàng.",
+            caption=f"📊 Em gửi file thống kê tồn kho của *{loc_name}* ạ!\nTổng cộng có {len(df)} mã sản phẩm đang có hàng.",
             parse_mode='Markdown'
         )
 
@@ -1020,7 +1020,7 @@ async def dotonkho_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not keyword:
         msg = (
             "💡 Danh sách kho trên Odoo thường rất dài. Để tìm và xuất dữ liệu nhanh nhất, "
-            "chị vui lòng gõ lệnh kèm theo **từ khóa** tên kho nhé!\n\n"
+            "Vui lòng gõ lệnh kèm theo **từ khóa** tên kho!\n\n"
             "👉 *Ví dụ:* `/dotonkho 201` hoặc `/dotonkho hcm`"
         )
         await update.message.reply_text(msg, parse_mode='Markdown')
@@ -1048,7 +1048,7 @@ async def dotonkho_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if len(locations) == 1:
             loc = locations[0]
-            await update.message.reply_text(f"✅ Tìm thấy đúng 1 kho: *{loc['display_name']}*\n⌛️ Iem đang gom số liệu tồn...", parse_mode='Markdown')
+            await update.message.reply_text(f"✅ Tìm thấy đúng 1 kho: *{loc['display_name']}*\n⌛️ Em đang gom số liệu tồn...", parse_mode='Markdown')
             await process_export_inventory(update, context, loc['id'], loc['display_name'])
             return
 
@@ -1060,7 +1060,7 @@ async def dotonkho_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for loc in locations:
             msg += f"🔹 Gõ `{loc['id']}` - Kho: {loc['display_name']}\n"
 
-        msg += "\n👉 *Vui lòng gõ ID kho mà chị muốn xem (Gõ 'hủy' để thoát).* "
+        msg += "\n👉 *Vui lòng gõ ID kho muốn xem (Gõ 'hủy' để thoát).* "
 
         await update.message.reply_text(msg, parse_mode='Markdown')
 
@@ -1092,7 +1092,7 @@ async def export_orders_by_date_range(update: Update, context: ContextTypes.DEFA
         )
 
         if not orders:
-            await update.message.reply_text(f"📭 Iem không tìm thấy đơn hàng nào trong khoảng từ {start_date} đến {end_date} ạ.")
+            await update.message.reply_text(f"📭 Em không tìm thấy đơn hàng nào trong khoảng từ {start_date} đến {end_date} ạ.")
             return
 
         rows = []
@@ -1115,7 +1115,7 @@ async def export_orders_by_date_range(update: Update, context: ContextTypes.DEFA
         await update.message.reply_document(
             document=buf,
             filename=f"Thong_Ke_Don_Hang_{start_date}_den_{end_date}.xlsx",
-            caption=f"📊 Iem đã tổng hợp xong! Tổng cộng có {len(orders)} đơn hàng trong khoảng thời gian này nhé."
+            caption=f"📊 Em đã tổng hợp xong! Tổng cộng có {len(orders)} đơn hàng trong khoảng thời gian này nhé."
         )
 
     except Exception as e:
@@ -1141,7 +1141,7 @@ async def check_single_order(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
 
         if not orders:
-            await update.message.reply_text(f"📭 Iem không tìm thấy đơn hàng nào khớp với mã `*{order_code}*` trên hệ thống ạ.", parse_mode='Markdown')
+            await update.message.reply_text(f"📭 Em không tìm thấy đơn hàng nào khớp với mã `*{order_code}*` trên hệ thống ạ.", parse_mode='Markdown')
             return
 
         o = orders[0]
@@ -1187,7 +1187,7 @@ async def check_single_order(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 
 async def export_customer_orders(update: Update, context: ContextTypes.DEFAULT_TYPE, customer_name: str):
-    await update.message.reply_text(f"🔍 Iem đang tìm kiếm tối đa 20 đơn hàng gần nhất của khách hàng `*{customer_name}*`...", parse_mode='Markdown')
+    await update.message.reply_text(f"🔍 Em đang tìm kiếm tối đa 20 đơn hàng gần nhất của khách hàng `*{customer_name}*`...", parse_mode='Markdown')
     uid, models, error_msg = connect_odoo()
     if not uid:
         await update.message.reply_text(f"❌ Lỗi kết nối Odoo: {error_msg}")
@@ -1202,7 +1202,7 @@ async def export_customer_orders(update: Update, context: ContextTypes.DEFAULT_T
         )
         
         if not partners:
-            await update.message.reply_text(f"📭 Iem không tìm thấy khách hàng nào tên là `*{customer_name}*` trên hệ thống ạ.", parse_mode='Markdown')
+            await update.message.reply_text(f"📭 Em không tìm thấy khách hàng nào tên là `*{customer_name}*` trên hệ thống ạ.", parse_mode='Markdown')
             return
             
         p_ids = [p['id'] for p in partners]
@@ -1275,7 +1275,7 @@ async def export_customer_orders(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_document(
             document=buf,
             filename=f"Don_Hang_{safe_name}.xlsx",
-            caption=f"📊 Iem đã tổng hợp xong {len(orders)} đơn hàng gần nhất của khách `*{customer_name}*` rồi ạ!",
+            caption=f"📊 Em đã tổng hợp xong {len(orders)} đơn hàng gần nhất của khách `*{customer_name}*` rồi ạ!",
             parse_mode='Markdown'
         )
 
@@ -1293,8 +1293,8 @@ async def baodanh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
         await update.message.reply_text(
-            "💡 **Hướng dẫn Báo Danh:**\nSếp vui lòng gõ lệnh kèm theo **Email đăng nhập Odoo** của sếp nhé.\n"
-            "👉 *Ví dụ:* `/baodanh nguyenthithang@nsv.vn`", 
+            "💡 **Hướng dẫn Báo Danh:**\nVui lòng gõ lệnh kèm theo **Email đăng nhập Odoo** của Sếp.\n"
+            "👉 *Ví dụ:* `/baodanh kinhdoanh09@nguonsongviet.vn`", 
             parse_mode='Markdown'
         )
         return
@@ -1326,7 +1326,7 @@ async def baodanh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ **BÁO DANH THÀNH CÔNG!**\n\n"
             f"Hệ thống đã kết nối tài khoản Telegram này với hồ sơ Chuyên viên Sales: **{odoo_user['name']}** (Odoo ID: {odoo_user['id']}).\n"
-            f"Từ giờ sếp có thể dùng lệnh `/lendon` được rồi nhé!", 
+            f"Từ giờ Sếp có thể dùng lệnh `/lendon` được rồi nhé!", 
             parse_mode='Markdown'
         )
         
@@ -1352,7 +1352,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         if user_input in loc_dict:
             context.user_data['waiting_for_location'] = False
             selected_loc = loc_dict[user_input]
-            await update.message.reply_text(f"⌛️ Iem đang gom số liệu tồn cho kho *{selected_loc['display_name']}*...", parse_mode='Markdown')
+            await update.message.reply_text(f"⌛️ Em đang gom số liệu tồn cho kho *{selected_loc['display_name']}*...", parse_mode='Markdown')
             await process_export_inventory(update, context, selected_loc['id'], selected_loc['display_name'])
             return
         elif user_input_lower in ['huy', 'hủy', 'cancel']:
@@ -1360,12 +1360,12 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("✅ Đã hủy lệnh đổ tồn kho nha!")
             return
         else:
-            await update.message.reply_text("❌ Mã kho không hợp lệ. Chị vui lòng nhập đúng ID kho trong danh sách hoặc gõ 'hủy' để thoát ạ.")
+            await update.message.reply_text("❌ Mã kho không hợp lệ. NGU. Nhập đúng ID kho trong danh sách hoặc gõ 'hủy' để thoát.")
             return
 
     # --- 2. Báo Giá (Luồng tĩnh ưu tiên) ---
     if any(k in user_input_lower for k in ['giá', 'bao nhiêu', 'vat', 'bảng giá', 'price']):
-        await update.message.reply_text("⌛️ Iem đang tra bảng giá xíu...")
+        await update.message.reply_text("⌛️ Em đang tra bảng giá xíu...")
         answer = ask_groq_ai(user_input)
         await update.message.reply_text(answer, parse_mode='Markdown')
         return
@@ -1379,7 +1379,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         if customer_name:
             await export_customer_orders(update, context, customer_name)
         else:
-            await update.message.reply_text("Sếp muốn tra đơn của khách nào ạ? Gõ tên khách cho iem với nhé!")
+            await update.message.reply_text("Sếp muốn tra đơn của khách nào ạ? Gõ tên khách cho em với nhé!")
         return
         
     elif action == "check_single_order":
@@ -1387,7 +1387,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         if order_code:
             await check_single_order(update, context, order_code)
         else:
-            await update.message.reply_text("Sếp ném mã đơn (VD: SO001) đây để iem check cho nóng!")
+            await update.message.reply_text("Sếp ném mã đơn (VD: SO001) đây để em check cho nóng!")
         return
 
     elif action == "export_report":
@@ -1398,7 +1398,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         
     elif action == "weather":
         loc = ai_intent.get("location", "Hà Nội")
-        await update.message.reply_text("🌤 Đang đưa mặt ra ngoài cửa sổ đo thời tiết cho sếp...")
+        await update.message.reply_text("🌤 Đang đưa mặt ra ngoài cửa sổ đo thời tiết cho Sếp...")
         weather_data = get_realtime_weather(loc)
         final_answer = generate_witty_response(user_input, f"Thời tiết tại {loc}", weather_data)
         await update.message.reply_text(final_answer)
@@ -1406,14 +1406,14 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         
     elif action == "news" or action == "web_search":
         search_query = ai_intent.get("query", user_input)
-        await update.message.reply_text(f"📰 Đang lướt mạng tra cứu '{search_query}' cho sếp...")
+        await update.message.reply_text(f"📰 Đang lướt mạng tra cứu '{search_query}' cho Sếp...")
         news_data = perform_web_search(search_query)
         final_answer = generate_witty_response(user_input, "Thông tin mạng hiện tại", news_data)
         await update.message.reply_text(final_answer)
         return
         
     elif action == "chat":
-        await update.message.reply_text(ai_intent.get("response", "Lỗi rồi sếp ơi!"))
+        await update.message.reply_text(ai_intent.get("response", "Lỗi rồi Sếp ơi!"))
         return
 
     # --- 4. LOGIC ODOO: Tra tồn kho sản phẩm (Fallback) ---
@@ -1534,7 +1534,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"Tồn kho HN: {int(hn_stock_qty)}\n"
             f"Tồn kho HCM: {int(hcm_stock_qty)}\n"
             f"Tồn kho nhập Hà Nội: {int(hn_transit_qty)}\n"
-            f"=> Đề xuất nhập thêm {int(recommend)} sp để HN đủ tồn {TARGET_MIN_QTY} sản phẩm.\n\n"
+            f"=> Đề xuất nhập thêm {int(recommend)} sp để HN đủ tồn {TARGET_MIN_QTY} sp.\n\n"
             "2/ Tồn kho chi tiết(Có hàng):"
         )
 
@@ -1667,7 +1667,7 @@ async def daily_report_command(update: Update, context: ContextTypes.DEFAULT_TYP
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
     
-    await update.message.reply_text("⌛️ Iem đang tổng hợp dữ liệu Xuất/Nhập kho hôm nay...")
+    await update.message.reply_text("⌛️ Em đang tổng hợp dữ liệu Xuất/Nhập kho hôm nay...")
     
     excel_buffer, error_msg = get_daily_movement_report()
     
@@ -1698,7 +1698,7 @@ async def excel_report_command(update: Update, context: ContextTypes.DEFAULT_TYP
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
 
-    await update.message.reply_text("⌛️ Iem đang xử lý dữ liệu và tạo báo cáo Excel...")
+    await update.message.reply_text("⌛️ Em đang xử lý dữ liệu và tạo báo cáo Excel...")
     excel_buffer, item_count, error_msg = get_stock_data()
 
     if excel_buffer is None:
@@ -1723,7 +1723,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     name = update.message.from_user.first_name
     await update.message.reply_text(
-        f"Chào sếp {name}!\n"
+        f"Chào con vợ {name}!\n"
         "1. Gõ mã sp để tra tồn.\n"
         "2. Hỏi giá sản phẩm để em báo giá.\n"
         "3. Gửi file Excel bảng giá để cập nhật.\n"
@@ -1733,8 +1733,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "7. `/dotonkho <tên kho>` để xuất tồn 1 kho.\n"
         "8. `/baodanh <email>` để báo danh nhân viên Odoo.\n"
         "9. `/lendon` Form lên đơn hàng chuẩn Odoo từng bước.\n"
-        "10. Gõ tên khách (VD: Đơn hàng HC) để xuất Excel đơn của khách.\n"
-        "11. Gõ mã đơn (VD: Kiểm tra đơn SO001) để xem chi tiết.\n"
+        "10. Gõ tên khách (VD:Đơn hàng HC) để xuất Excel đơn của khách.\n"
+        "11. Gõ mã đơn (VD:Kiểm tra đơn SO001) để xem chi tiết.\n"
         "12. Hỏi bất cứ thông tin nào (World Cup, tin tức, thời tiết...).\n"
         "13. Hoặc yêu cầu: 'Tổng hợp đơn hàng từ ngày 2 đến ngày 20'\n"
         "14. `/ping` để kiểm tra kết nối Odoo.",
@@ -1767,7 +1767,7 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get('waiting_for_po'):
         context.user_data['waiting_for_po'] = False
-        await update.message.reply_text("⌛️ Iem đang xử lý file PO, chờ em xíu xìu xiu nha...")
+        await update.message.reply_text("⌛️ Em đang xử lý file PO, chờ em nha...")
 
         try:
             file = await document.get_file()
@@ -1793,7 +1793,7 @@ async def handle_po_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if success:
                 # Đồng bộ JSONBin sau khi nạp bảng giá
                 await save_cloud_db(context, chat_id)
-                await update.message.reply_text(f"✅ Đã nạp thành công bảng giá ({info}). Chị có thể bắt đầu hỏi giá rồi nha!")
+                await update.message.reply_text(f"✅ Đã nạp thành công bảng giá ({info}). Các con vợ có thể bắt đầu hỏi giá rồi nha!")
             else:
                 await update.message.reply_text(f"❌ Lỗi nạp bảng giá: {info}")
         except Exception as e:
@@ -2124,7 +2124,7 @@ async def start_lendon_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(
             "❌ **Sếp chưa Báo danh Chuyên viên Sales!**\n\n"
             "Vui lòng gõ lệnh `/baodanh <email_odoo_của_sếp>` để hệ thống nhận diện danh tính trước khi lên đơn nhé.\n"
-            "*(Ví dụ: /baodanh nguyenthithang@nsv.vn)*",
+            "*(Ví dụ: /baodanh kinhdoanh09@nguonsongviet.vn)*",
             parse_mode='Markdown'
         )
         return ConversationHandler.END
@@ -2162,7 +2162,7 @@ async def lendon_ref_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def lendon_products_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     products_raw = update.message.text.strip()
-    loading_msg = await update.message.reply_text("⌛️ Iem đang đối chiếu dữ liệu Odoo và bóc tách AI, sếp đợi xíu...")
+    loading_msg = await update.message.reply_text("⌛️ Em đang đối chiếu dữ liệu Odoo và bóc tách AI, sếp đợi xíu...")
     
     cust_raw = context.user_data['lendon_data']['customer_raw']
     ref_raw = context.user_data['lendon_data']['ref_raw']
