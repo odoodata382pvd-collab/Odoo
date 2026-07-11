@@ -19,19 +19,18 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import pytz
 import json
 import re
-import html
-import google.generativeai as genai
+from groq import Groq
 
 # ---------------- Config Environment ----------------
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 
-# Cấu hình API Keys mới
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
-JSONBIN_API_KEY = os.environ.get('JSONBIN_API_KEY')
-JSONBIN_BIN_ID = os.environ.get('JSONBIN_BIN_ID')
-
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+# Cấu hình 3 API Key AI (Xoay vòng để tránh lỗi 429)
+AI_KEYS = [
+    os.environ.get('GROQ_API_KEY_1'),
+    os.environ.get('GROQ_API_KEY_2'),
+    os.environ.get('GROQ_API_KEY_3')
+]
+current_key_index = 0
 
 ODOO_URL_RAW = os.environ.get('ODOO_URL').rstrip('/') if os.environ.get('ODOO_URL') else None
 if ODOO_URL_RAW and ODOO_URL_RAW.lower().endswith('/odoo'):
@@ -66,40 +65,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------------- TÍNH NĂNG: CLOUD STORAGE & XỬ LÝ EXCEL ----------------
-
-def save_cache_to_cloud(data_dict):
-    if not JSONBIN_API_KEY or not JSONBIN_BIN_ID:
-        logger.error("Thiếu cấu hình JSONBIN_API_KEY hoặc JSONBIN_BIN_ID.")
-        return False
-    
-    url = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
-    headers = {
-        'Content-Type': 'application/json',
-        'X-Master-Key': JSONBIN_API_KEY
-    }
-    try:
-        res = requests.put(url, json=data_dict, headers=headers)
-        return res.status_code == 200
-    except Exception as e:
-        logger.error(f"Lỗi khi lưu lên JSONBin: {e}")
-        return False
-
-def get_cache_from_cloud():
-    if not JSONBIN_API_KEY or not JSONBIN_BIN_ID:
-        return None
-        
-    url = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}/latest"
-    headers = {
-        'X-Master-Key': JSONBIN_API_KEY
-    }
-    try:
-        res = requests.get(url, headers=headers)
-        if res.status_code == 200:
-            return res.json().get('record', {})
-    except Exception as e:
-        logger.error(f"Lỗi khi đọc từ JSONBin: {e}")
-    return None
+# ---------------- TÍNH NĂNG: AI & XỬ LÝ EXCEL ----------------
+PRICE_DATA_FILE = "price_cache.json"
 
 def process_price_excel(file_bytes):
     try:
@@ -125,7 +92,10 @@ def process_price_excel(file_bytes):
         
         if not target_sheet:
             target_sheet = sheet_names[0]
-        
+            logger.info(f"Dùng sheet đầu tiên: {target_sheet}")
+        else:
+            logger.info(f"Dùng sheet mới nhất: {target_sheet}")
+
         df_raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=target_sheet, header=None)
         
         header_row_idx = 0
@@ -156,6 +126,7 @@ def process_price_excel(file_bytes):
                         df.columns.values[i] = val_above
 
         df.columns = [str(c).strip() for c in df.columns]
+        
         ma_hang_col = next((c for c in df.columns if 'mã hàng' in c.lower() or 'mã sp' in c.lower()), None)
         
         if ma_hang_col:
@@ -167,12 +138,10 @@ def process_price_excel(file_bytes):
                 "data": data_dict
             }
             
-            # LƯU DỮ LIỆU LÊN CLOUD (JSONBIN)
-            success = save_cache_to_cloud(cache_data)
-            if success:
-                return True, f"{len(df)} dòng (Sheet: {target_sheet}) - Đã đồng bộ Cloud"
-            else:
-                return False, "Lưu cloud thất bại. Hãy kiểm tra lại API Key JSONBin."
+            with open(PRICE_DATA_FILE, 'w', encoding='utf-8') as f:
+                json.dump(cache_data, f, ensure_ascii=False, indent=4)
+                
+            return True, f"{len(df)} dòng (Sheet: {target_sheet})"
         
         return False, f"Lỗi cấu trúc cột trong sheet {target_sheet}"
 
@@ -180,18 +149,16 @@ def process_price_excel(file_bytes):
         logger.error(f"Lỗi nạp bảng giá: {e}")
         return False, str(e)
 
-
-# ---------------- BỘ NÃO GEMINI AI ----------------
-
-def ask_ai(query):
-    if not GEMINI_API_KEY:
-        return "Thiếu GEMINI_API_KEY trong cấu hình."
-        
-    cache = get_cache_from_cloud()
-    if not cache:
-        return "Iem chưa có dữ liệu bảng giá hoặc lỗi kết nối Cloud. Hãy gửi file Excel để nạp nhé!"
+def ask_groq_ai(query):
+    global current_key_index
+    
+    if not os.path.exists(PRICE_DATA_FILE):
+        return "Iem chưa có dữ liệu bảng giá. Hãy gửi file Excel để nạp nhé!"
 
     try:
+        with open(PRICE_DATA_FILE, 'r', encoding='utf-8') as f:
+            cache = json.load(f)
+            
         if isinstance(cache, list):
             full_data = cache
             sheet_name = "Mới nhất"
@@ -223,13 +190,13 @@ def ask_ai(query):
         NHIỆM VỤ: Trả lời chính xác theo FORM mẫu bên dưới.
         
         QUY TẮC XỬ LÝ SỐ LIỆU (BẮT BUỘC):
-        1. CHẶN SỐ RÁC: Bất kỳ con số nào nhỏ hơn 1000 (Ví dụ: 0, 0.3, 0.15, 30, 40) => ĐÓ LÀ CHIẾT KHẤU HOẶC RÁC. BỎ QUA NGAY.
-        2. TÌM CỘT GIÁ:
+        1. **CHẶN SỐ RÁC:** Bất kỳ con số nào nhỏ hơn 1000 (Ví dụ: 0, 0.3, 0.15, 30, 40) => ĐÓ LÀ CHIẾT KHẤU HOẶC RÁC. BỎ QUA NGAY.
+        2. **TÌM CỘT GIÁ:**
            - "Giá niêm yết": Cột 'Niêm Yết'.
            - "Giá nhập (VAT 10%)": Cột 'Giá nhập (+VAT 10%)' hoặc tương tự.
            - "VAT 8%": Cột 'Giá Mới (VAT 8%)' hoặc 'Giá nhập (Bao gồm VAT)'.
            - "Giá chưa VAT": Cột '- VAT' (giá cũ) hoặc '- VAT.1' (giá mới 8%). Ưu tiên lấy giá ở cột '- VAT.1' (cột sau) nếu có.
-        3. LÀM TRÒN: Luôn làm tròn số đến hàng nghìn (VD: 525909 -> 526.000).
+        3. **LÀM TRÒN:** Luôn làm tròn số đến hàng nghìn (VD: 525909 -> 526.000).
         4. Nếu một loại giá là 0 hoặc không tìm thấy, ghi "Chưa có thông tin".
         
         FORM TRẢ LỜI (Copy y nguyên):
@@ -242,83 +209,32 @@ def ask_ai(query):
         - *Giá chưa VAT: * [Số tiền] VNĐ
         """
 
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        response = model.generate_content(prompt)
-        return response.text
+        for _ in range(3):
+            api_key = AI_KEYS[current_key_index]
+            if not api_key:
+                current_key_index = (current_key_index + 1) % 3
+                continue
+            try:
+                client = Groq(api_key=api_key)
+                completion = client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0
+                )
+                return completion.choices[0].message.content
+            except Exception as e:
+                if "429" in str(e):
+                    current_key_index = (current_key_index + 1) % 3
+                    continue
+                return f"Lỗi AI: {e}"
+        
+        return "Hệ thống AI đang bận, vui lòng thử lại sau!"
 
     except Exception as e:
-        return f"Lỗi hệ thống AI: {e}"
+        return f"Lỗi hệ thống: {e}"
 
-def analyze_chat_intent(user_input):
-    if not GEMINI_API_KEY:
-        return {"action": "error", "response": "Thiếu GEMINI_API_KEY"}
-        
-    tz_vn = pytz.timezone("Asia/Ho_Chi_Minh")
-    current_time_str = datetime.now(tz_vn).strftime("%Y-%m-%d %H:%M:%S")
-    
-    system_prompt = f"""
-    Bạn là bộ não điều hướng. Thời gian hiện tại: {current_time_str}.
-    Nhiệm vụ của bạn là phân tích câu nói của người dùng và trả về DUY NHẤT một chuỗi JSON hợp lệ. KHÔNG giải thích.
-    
-    Quy tắc phân loại (QUAN TRỌNG):
-    1. Nếu yêu cầu THỐNG KÊ / BÁO CÁO ĐƠN HÀNG từ ngày này đến ngày khác:
-    -> {{"action": "export_report", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD"}}
-    
-    2. Nếu yêu cầu XUẤT ĐƠN HÀNG của MỘT KHÁCH HÀNG cụ thể (VD: "Đơn hàng HC", "Đơn hàng của anh Tuấn"):
-    -> {{"action": "export_customer_orders", "customer_name": "Tên khách hàng cần tìm"}}
-    
-    3. Nếu yêu cầu KIỂM TRA CHI TIẾT 1 MÃ ĐƠN HÀNG cụ thể (VD: "Kiểm tra đơn SO001"):
-    -> {{"action": "check_single_order", "order_code": "Mã đơn hàng"}}
-    
-    4. Nếu người dùng hỏi về THỜI TIẾT:
-    -> {{"action": "weather", "location": "Tên địa phương"}} (mặc định là 'Hà Nội' nếu không rõ)
-    
-    5. Nếu người dùng hỏi TIN TỨC, thời sự, thể thao, giá vàng, mạng xã hội:
-    -> {{"action": "web_search", "query": "Từ khóa tìm kiếm tối ưu (ngắn gọn, tập trung)"}}
-    
-    6. Nếu câu lệnh CHỈ LÀ MÃ SẢN PHẨM (chuỗi ngắn, liền nhau, vd: 'SP01', 'IPHONE12'):
-    -> {{"action": "stock_search"}}
-    
-    7. Nếu là câu giao tiếp bình thường (chào hỏi, tâm sự, trêu đùa):
-    -> {{"action": "chat", "response": "Câu trả lời dí dỏm, thông minh của bạn"}}
-    """
 
-    try:
-        model = genai.GenerativeModel('gemini-1.5-flash', generation_config={"response_mime_type": "application/json"})
-        response = model.generate_content(system_prompt + "\nCâu nói của người dùng: " + user_input)
-        return json.loads(response.text)
-    except Exception as e:
-        return {"action": "error", "response": f"Lỗi phân tích AI: {e}"}
-
-def generate_witty_response(user_input, topic, real_data):
-    if not GEMINI_API_KEY:
-        return f"Thông tin nguyên bản: \n{real_data}"
-        
-    system_prompt = f"""
-    Bạn là một trợ lý AI thông minh, dí dỏm, làm việc cho sếp.
-    Người dùng vừa hỏi về: {topic}. 
-    Dưới đây là THÔNG TIN THỰC TẾ CHÍNH XÁC được cào từ Internet:
-    ---
-    {real_data}
-    ---
-    Nhiệm vụ: Trả lời câu hỏi '{user_input}'.
-    
-    LUẬT THÉP:
-    1. Tổng hợp thông tin khéo léo, tự nhiên như người thật đang đọc báo cho sếp nghe. KHÔNG copy paste.
-    2. Nếu thông tin bị thiếu, hãy thành thật báo sếp là tin chưa đầy đủ.
-    3. NẾU LÀ THỜI TIẾT: Phải bắt buộc dùng đúng ĐỘ C (°C). Tùy vào nhiệt độ mà than vãn hoặc trêu đùa.
-    4. Giọng văn dí dỏm, chuyên nghiệp nhưng thân thiện. Có thể nịnh sếp nhẹ nhàng 1 câu ở cuối.
-    5. KHÔNG VIẾT DÀI DÒNG. Tối đa 4-5 câu.
-    """
-    
-    try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        response = model.generate_content(system_prompt)
-        return response.text
-    except Exception:
-        return f"Thông tin nguyên bản đây sếp ơi: \n{real_data}"
-
-# ---------------- CÁC HÀM HỖ TRỢ REAL-TIME ----------------
+# ---------------- CÁC HÀM HỖ TRỢ REAL-TIME CHO AI ----------------
 
 def get_realtime_weather(location="Hà Nội"):
     try:
@@ -331,16 +247,19 @@ def get_realtime_weather(location="Hà Nội"):
         return "Lỗi kết nối khi lấy thời tiết."
 
 def perform_web_search(query):
+    """Sử dụng duckduckgo-search phiên bản mở rộng để lấy nhiều tin tức hơn"""
     try:
         from duckduckgo_search import DDGS
         info = ""
         with DDGS() as ddgs:
+            # Ưu tiên lấy News (Tin tức) trước, tối đa 5 bài mới nhất
             news_results = list(ddgs.news(query, region='wt-wt', safesearch='off', timelimit='d', max_results=5))
             if news_results:
                 info += "📰 **TIN TỨC MỚI NHẤT:**\n"
                 for res in news_results:
                     info += f"- {res.get('title', '')}: {res.get('body', '')}\n"
             
+            # Cào thêm Web thông thường (Web Search) để lấy thêm ngữ cảnh chung
             web_results = list(ddgs.text(query, region='wt-wt', safesearch='off', timelimit='d', max_results=3))
             if web_results:
                 info += "\n🌐 **THÔNG TIN WEB BỔ SUNG:**\n"
@@ -349,12 +268,107 @@ def perform_web_search(query):
         
         if not info.strip():
             return "Không tìm thấy thông tin mới nhất trên mạng cho từ khóa này."
+        
         return info
     except ImportError:
-        return "Sếp ơi, nhớ thêm 'duckduckgo-search' vào file requirements.txt rồi deploy lại nhé."
+        return "Sếp ơi, em chưa lướt web được! Sếp nhớ thêm 'duckduckgo-search' vào file requirements.txt rồi deploy lại nhé."
     except Exception as e:
         return f"Lỗi khi lướt web tìm kiếm: {e}"
 
+def analyze_chat_intent(user_input):
+    global current_key_index
+    tz_vn = pytz.timezone("Asia/Ho_Chi_Minh")
+    current_time_str = datetime.now(tz_vn).strftime("%Y-%m-%d %H:%M:%S")
+    
+    system_prompt = f"""
+    Bạn là bộ não điều hướng. Thời gian hiện tại: {current_time_str}.
+    Nhiệm vụ của bạn là phân tích câu nói của người dùng và trả về DUY NHẤT một chuỗi JSON hợp lệ. KHÔNG giải thích.
+    
+    Quy tắc phân loại (QUAN TRỌNG):
+    1. Nếu yêu cầu THỐNG KÊ / BÁO CÁO ĐƠN HÀNG từ ngày này đến ngày khác:
+    -> {{"action": "export_report", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD"}}
+    
+    2. Nếu yêu cầu XUẤT ĐƠN HÀNG của MỘT KHÁCH HÀNG cụ thể (VD: "Đơn hàng HC", "Đơn hàng của anh Tuấn", "Cho xem đơn VHC"):
+    -> {{"action": "export_customer_orders", "customer_name": "Tên khách hàng cần tìm (VD: HC, VHC, Tuấn)"}}
+    
+    3. Nếu yêu cầu KIỂM TRA CHI TIẾT 1 MÃ ĐƠN HÀNG cụ thể (VD: "Kiểm tra đơn SO001", "Check đơn S12345"):
+    -> {{"action": "check_single_order", "order_code": "Mã đơn hàng"}}
+    
+    4. Nếu người dùng hỏi về THỜI TIẾT:
+    -> {{"action": "weather", "location": "Tên địa phương"}} (mặc định là 'Hà Nội' nếu không rõ)
+    
+    5. Nếu người dùng hỏi TIN TỨC, thời sự, thể thao, giá vàng, hoặc cần tra cứu kiến thức mạng:
+    -> {{"action": "web_search", "query": "Từ khóa tìm kiếm tối ưu (ngắn gọn, tập trung)"}}
+    
+    6. Nếu câu lệnh CHỈ LÀ MÃ SẢN PHẨM (chuỗi ngắn, liền nhau, vd: 'SP01', 'IPHONE12', 'A123'):
+    -> {{"action": "stock_search"}}
+    
+    7. Nếu là câu giao tiếp bình thường (chào hỏi, tâm sự, trêu đùa không cần cào mạng):
+    -> {{"action": "chat", "response": "Câu trả lời dí dỏm, thông minh của bạn"}}
+    """
+
+    for _ in range(3):
+        api_key = AI_KEYS[current_key_index]
+        if not api_key:
+            current_key_index = (current_key_index + 1) % 3
+            continue
+        try:
+            client = Groq(api_key=api_key)
+            completion = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_input}
+                ],
+                temperature=0.1,
+                response_format={"type": "json_object"}
+            )
+            return json.loads(completion.choices[0].message.content)
+        except Exception as e:
+            if "429" in str(e):
+                current_key_index = (current_key_index + 1) % 3
+                continue
+            return {"action": "error", "response": f"Lỗi phân tích AI: {e}"}
+            
+    return {"action": "error", "response": "Server AI đang quá tải, sếp thử lại sau nhé!"}
+
+def generate_witty_response(user_input, topic, real_data):
+    global current_key_index
+    system_prompt = f"""
+    Bạn là một trợ lý AI thông minh, dí dỏm, làm việc cho sếp.
+    Người dùng vừa hỏi về: {topic}. 
+    Dưới đây là THÔNG TIN THỰC TẾ CHÍNH XÁC được cào từ Internet:
+    ---
+    {real_data}
+    ---
+    Nhiệm vụ: Trả lời câu hỏi '{user_input}'.
+    
+    LUẬT THÉP:
+    1. Tổng hợp thông tin từ dữ liệu được cung cấp một cách khéo léo, tự nhiên như người thật đang đọc báo cho sếp nghe. KHÔNG copy paste nguyên xi.
+    2. Nếu thông tin cào được bị thiếu hoặc không rõ ràng, hãy trả lời dựa trên những gì tốt nhất có được và thành thật báo sếp là tin này chưa đầy đủ.
+    3. Nếu là THỜI TIẾT: Phải bắt buộc dùng đúng ĐỘ C (°C). Tùy vào nhiệt độ mà than vãn hoặc trêu đùa.
+    4. Giọng văn dí dỏm, chuyên nghiệp nhưng thân thiện. Có thể nịnh sếp nhẹ nhàng 1 câu ở cuối.
+    5. KHÔNG VIẾT DÀI DÒNG. Tối đa 4-5 câu.
+    """
+    for _ in range(3):
+        api_key = AI_KEYS[current_key_index]
+        if not api_key:
+            current_key_index = (current_key_index + 1) % 3
+            continue
+        try:
+            client = Groq(api_key=api_key)
+            completion = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "system", "content": system_prompt}],
+                temperature=0.5
+            )
+            return completion.choices[0].message.content
+        except Exception:
+            if "429" in str(Exception):
+                current_key_index = (current_key_index + 1) % 3
+                continue
+            return f"Thông tin nguyên bản đây sếp ơi: \n{real_data}"
+    return real_data
 
 # ---------------- Keep port open (Render free) ----------------
 def keep_port_open():
@@ -1040,7 +1054,7 @@ async def export_orders_by_date_range(update: Update, context: ContextTypes.DEFA
         await update.message.reply_text(f"❌ Lỗi xuất Excel: {e}")
 
 # =====================================================================
-# ---> KIỂM TRA ĐƠN HÀNG <---
+# ---> [NEW FEATURE] KIỂM TRA ĐƠN HÀNG <---
 # =====================================================================
 async def check_single_order(update: Update, context: ContextTypes.DEFAULT_TYPE, order_code: str):
     await update.message.reply_text(f"🔍 Đang truy xuất thông tin đơn hàng `*{order_code}*`...", parse_mode='Markdown')
@@ -1202,7 +1216,7 @@ async def export_customer_orders(update: Update, context: ContextTypes.DEFAULT_T
 
 
 # =====================================================================
-# ---> XỬ LÝ TEXT CHÍNH: CỔNG ĐIỀU HƯỚNG AI & TÌM KIẾM <---
+# ---> XỬ LÝ TEXT CHÍNH: CỔNG ĐIỀU HƯỚNG AI & TÌM KẾM <---
 # =====================================================================
 async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
@@ -1211,7 +1225,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_input = update.message.text.strip()
     user_input_lower = user_input.lower()
 
-    # --- Lọc Lệnh Chọn ID Kho ---
+    # --- 1. Lọc Lệnh Chọn ID Kho cho Đổ Tồn Kho ---
     if context.user_data.get('waiting_for_location'):
         loc_dict = context.user_data.get('available_locations', {})
         if user_input in loc_dict:
@@ -1225,17 +1239,17 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("✅ Đã hủy lệnh đổ tồn kho nha!")
             return
         else:
-            await update.message.reply_text("❌ Mã kho không hợp lệ. Gõ đúng ID kho hoặc 'hủy' để thoát.")
+            await update.message.reply_text("❌ Mã kho không hợp lệ. Chị vui lòng nhập đúng ID kho trong danh sách hoặc gõ 'hủy' để thoát ạ.")
             return
 
-    # --- Báo Giá Tĩnh ---
+    # --- 2. Báo Giá (Luồng tĩnh ưu tiên) ---
     if any(k in user_input_lower for k in ['giá', 'bao nhiêu', 'vat', 'bảng giá', 'price']):
         await update.message.reply_text("⌛️ Iem đang tra bảng giá xíu...")
-        answer = ask_ai(user_input)
+        answer = ask_groq_ai(user_input)
         await update.message.reply_text(answer, parse_mode='Markdown')
         return
 
-    # --- AI ĐIỀU HƯỚNG ---
+    # --- 3. GIAO CHO AI PHÂN TÍCH Ý ĐỊNH VÀ ĐIỀU HƯỚNG ---
     ai_intent = analyze_chat_intent(user_input)
     action = ai_intent.get("action")
     
@@ -1281,7 +1295,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(ai_intent.get("response", "Lỗi rồi sếp ơi!"))
         return
 
-    # --- FALLBACK: LOGIC ODOO (Tra tồn kho sản phẩm) ---
+    # --- 4. LOGIC ODOO: Tra tồn kho sản phẩm (Fallback) ---
     product_code = user_input.upper()
     await update.message.reply_text(f"Đang tra tồn cho `{product_code}`, vui lòng chờ!", parse_mode='Markdown')
 
@@ -1870,22 +1884,15 @@ def watchdog_batch():
                     pid = q['product_id'][0]
                     quant_map[pid] = quant_map.get(pid, 0) + float(q.get('available_quantity', 0))
 
-                # --- BẮT ĐẦU ĐOẠN CODE THAY THẾ (HTML FORMAT) ---
-                safe_loc_name = html.escape(str(target_loc_name))
-                safe_dest_name = html.escape(str(dest_name))
-                safe_pick_name = html.escape(str(pick_name))
-                safe_actor = html.escape(str(actor))
-
-                # Build nội dung thông báo (Dùng chuẩn HTML để format phân cấp cực nét)
+                # Build nội dung thông báo
                 msg_header = (
-                    f"📦 <b>CẬP NHẬT TỒN KHO: {direction}</b>\n"
-                    f"🏢 <b>Tuyến:</b> {safe_loc_name} ➔ {safe_dest_name}\n\n"
-                    f"🔖 <b>Mã lệnh:</b> <code>{safe_pick_name}</code>\n"
-                    f"✅ <b>Trạng thái:</b> {state_vn}\n"
-                    f"👤 <b>Thao tác:</b> {safe_actor}\n"
-                    f"🕒 <b>Thời gian:</b> {vn_time_str}\n"
-                    f"〰️〰️〰️〰️〰️〰️〰️〰️〰️\n"
-                    f"📝 <b>CHI TIẾT BIẾN ĐỘNG ({len(prod_qtys)} SP):</b>\n\n"
+                    f"📦 **Cập nhật tồn kho {target_loc_name} – {direction}**\n\n"
+                    f"🔖 **Mã lệnh:** {pick_name}\n"
+                    f"🏢 **Lệnh đi cho kho:** {dest_name}\n"
+                    f"✅ **Trạng thái lệnh:** {state_vn}\n"
+                    f"👤 **Người thao tác:** {actor}\n"
+                    f"🕒 **Thời gian:** {vn_time_str}\n\n"
+                    f"📝 **CHI TIẾT BIẾN ĐỘNG ({len(prod_qtys)} Mã sản phẩm):**\n\n"
                 )
 
                 number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
@@ -1894,8 +1901,8 @@ def watchdog_batch():
                 idx = 1
                 
                 for pid, data in prod_qtys.items():
-                    code = html.escape(str(pcode_map.get(pid, 'N/A')))
-                    name = html.escape(str(data['name']))
+                    code = pcode_map.get(pid, 'N/A')
+                    name = data['name']
                     qty_diff = data['qty']
                     new_ton = int(quant_map.get(pid, 0))
                     
@@ -1911,18 +1918,17 @@ def watchdog_batch():
                         diff_str = f"Chuyển {int(qty_diff)} SP"
                         icon = "🔄"
 
-                    # Đóng khung Mã SP và tạo cấu trúc thụt đầu dòng (L-shape)
                     line = (
-                        f"{emoji} <code>[{code}]</code> <b>{name}</b>\n"
-                        f" └ {icon} Biến động: <b>{diff_str}</b>  |  📦 Tồn mới: <b>{new_ton} SP</b>\n\n"
+                        f"{emoji} **[{code}]** {name}\n"
+                        f"{icon} Biến động: {diff_str}  |  📦 Tồn mới: {new_ton} SP\n\n"
                     )
 
-                    # Băm nhỏ tin nhắn nếu quá dài (Lưu ý: parse_mode đã được đổi thành HTML)
+                    # Băm nhỏ tin nhắn nếu quá dài
                     if len(current_msg) + len(line) > 3800:
                         for chat_id in get_registered_chat_ids():
                             try:
                                 bot = Bot(token=TELEGRAM_TOKEN)
-                                asyncio.run(bot.send_message(chat_id, current_msg, parse_mode="HTML"))
+                                asyncio.run(bot.send_message(chat_id, current_msg, parse_mode="Markdown"))
                             except Exception as e:
                                 logger.error(f"Lỗi gửi thông báo: {e}")
                         current_msg = "" 
@@ -1930,15 +1936,14 @@ def watchdog_batch():
                     current_msg += line
                     idx += 1
 
-                # Gửi đoạn tin nhắn cuối cùng (Lưu ý: parse_mode đã được đổi thành HTML)
+                # Gửi đoạn tin nhắn cuối cùng
                 if current_msg:
                     for chat_id in get_registered_chat_ids():
                         try:
                             bot = Bot(token=TELEGRAM_TOKEN)
-                            asyncio.run(bot.send_message(chat_id, current_msg, parse_mode="HTML"))
+                            asyncio.run(bot.send_message(chat_id, current_msg, parse_mode="Markdown"))
                         except Exception as e:
                             logger.error(f"Lỗi gửi thông báo: {e}")
-                # --- KẾT THÚC ĐOẠN CODE THAY THẾ ---
 
             time.sleep(WATCH_INTERVAL)
 
@@ -1959,7 +1964,7 @@ def main():
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
         asyncio.get_event_loop().run_until_complete(bot.delete_webhook())
-        logger.info("Đã xóa webhook cũ (nếu có).")
+        logger.info("đã xóa webhook cũ (nếu có).")
     except Exception as e:
         logger.warning(f"Lỗi xóa webhook: {e}")
 
