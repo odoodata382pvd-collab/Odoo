@@ -6,3 +6,4 @@ openpyxl
 duckduckgo-search
 google-generativeai
 requests
+groq
