@@ -918,6 +918,20 @@ def _extract_weather_location(user_input, default_location="Hà Nội"):
     return candidate
 
 
+def _looks_like_html_payload(text, content_type=""):
+    """Chặn trường hợp API/fallback trả trang HTML nhưng HTTP vẫn là 200."""
+    body = str(text or "").lstrip()
+    sample = body[:500].lower()
+    ctype = str(content_type or "").lower()
+    return (
+        "text/html" in ctype
+        or sample.startswith("<!doctype html")
+        or sample.startswith("<html")
+        or "<head" in sample
+        or "<body" in sample
+    )
+
+
 def get_realtime_weather(location="Hà Nội"):
     """
     Nguồn 1: Open-Meteo (không cần API key) -> Nguồn 2: wttr.in -> Nguồn 3: web search.
@@ -927,21 +941,40 @@ def get_realtime_weather(location="Hà Nội"):
 
     # --- Nguồn 1: Open-Meteo ---
     try:
-        geo_res = requests.get(
-            "https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": location, "count": 5, "language": "vi", "format": "json"},
-            timeout=7,
-        )
-        if geo_res.status_code == 200:
-            results = geo_res.json().get("results") or []
-            if results:
-                # Nếu có kết quả ở Việt Nam thì ưu tiên; nếu không dùng kết quả đầu tiên
-                # để vẫn hỗ trợ Tokyo, Seoul, Bangkok... khi người dùng hỏi.
-                place = next((x for x in results if x.get("country_code") == "VN"), results[0])
-                lat = place.get("latitude")
-                lon = place.get("longitude")
-                tz = place.get("timezone") or "auto"
+        # Một số dịch vụ geocoding ổn định hơn với tên không dấu, nên thử cả hai.
+        geo_names = [location]
+        location_ascii = _normalize_vn_text(location)
+        if location_ascii and location_ascii.casefold() != location.casefold():
+            geo_names.append(location_ascii)
 
+        results = []
+        for geo_name in geo_names:
+            geo_res = requests.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={"name": geo_name, "count": 5, "language": "vi", "format": "json"},
+                timeout=7,
+            )
+            if geo_res.status_code != 200:
+                logger.warning(
+                    f"Open-Meteo geocoding status={geo_res.status_code} cho {geo_name}"
+                )
+                continue
+            try:
+                results = geo_res.json().get("results") or []
+            except Exception:
+                results = []
+            if results:
+                break
+
+        if results:
+            # Nếu có kết quả ở Việt Nam thì ưu tiên; nếu không dùng kết quả đầu tiên
+            # để vẫn hỗ trợ Tokyo, Seoul, Bangkok... khi người dùng hỏi.
+            place = next((x for x in results if x.get("country_code") == "VN"), results[0])
+            lat = place.get("latitude")
+            lon = place.get("longitude")
+            tz = place.get("timezone") or "auto"
+
+            if lat is not None and lon is not None:
                 forecast_res = requests.get(
                     "https://api.open-meteo.com/v1/forecast",
                     params={
@@ -987,20 +1020,51 @@ def get_realtime_weather(location="Hà Nội"):
                         "rain_probability": first_value("precipitation_probability_max"),
                         "observed_at": current.get("time"),
                     }
+                logger.warning(
+                    f"Open-Meteo forecast status={forecast_res.status_code} cho {location}"
+                )
+        else:
+            logger.warning(f"Open-Meteo không tìm thấy địa điểm: {location}")
     except Exception as e:
         logger.warning(f"Open-Meteo lỗi cho {location}: {e}")
 
     # --- Nguồn 2: wttr.in ---
     try:
-        url = f"https://wttr.in/{urllib.parse.quote(location)}?format=%l:+%C,+Nhiệt+độ:+%t,+Cảm+giác+như:+%f,+Độ+ẩm:+%h&m"
-        res = requests.get(url, timeout=7, headers={"User-Agent": "Mozilla/5.0"})
-        if res.status_code == 200 and res.text.strip():
+        # wttr.in đôi lúc trả nguyên trang HTML với HTTP 200. Chỉ nhận plain text thật.
+        url = f"https://wttr.in/{urllib.parse.quote(location, safe='')}"
+        res = requests.get(
+            url,
+            params={
+                "format": "%l: %C, Nhiệt độ: %t, Cảm giác như: %f, Độ ẩm: %h",
+                "m": "",
+            },
+            timeout=7,
+            headers={
+                "User-Agent": "curl/8.5.0",
+                "Accept": "text/plain",
+            },
+        )
+        body = res.text.strip()
+        content_type = res.headers.get("Content-Type", "")
+        if (
+            res.status_code == 200
+            and body
+            and not _looks_like_html_payload(body, content_type)
+        ):
             return {
                 "ok": True,
                 "source": "wttr.in",
                 "location": location,
-                "raw": res.text.strip(),
+                "raw": body,
             }
+
+        logger.warning(
+            "wttr.in trả dữ liệu không hợp lệ cho %s: status=%s, content-type=%s, sample=%r",
+            location,
+            res.status_code,
+            content_type,
+            body[:100],
+        )
     except Exception as e:
         logger.warning(f"wttr.in lỗi cho {location}: {e}")
 
