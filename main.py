@@ -79,6 +79,61 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Không ghi toàn bộ URL HTTP của Telegram/Groq ra log INFO.
+# Với Telegram Bot API, URL có chứa bot token nên không nên xuất hiện trong log vận hành.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+TELEGRAM_SAFE_TEXT_LIMIT = 3500
+
+def _split_telegram_text(text, limit=TELEGRAM_SAFE_TEXT_LIMIT):
+    """Chia văn bản dài thành các đoạn an toàn dưới giới hạn 4096 ký tự của Telegram.
+
+    Chỉ dùng cho text thường (không parse_mode) để không làm vỡ Markdown/HTML.
+    Ưu tiên cắt ở đoạn, xuống dòng hoặc khoảng trắng để câu dễ đọc.
+    """
+    text = str(text or "")
+    if not text:
+        return [""]
+    if len(text) <= limit:
+        return [text]
+
+    chunks = []
+    remaining = text
+    while len(remaining) > limit:
+        window = remaining[:limit + 1]
+        candidates = [
+            window.rfind("\n\n"),
+            window.rfind("\n"),
+            window.rfind(". "),
+            window.rfind("! "),
+            window.rfind("? "),
+            window.rfind(" "),
+        ]
+        cut = max(candidates)
+        # Nếu điểm cắt quá sớm thì cắt cứng ở giới hạn an toàn.
+        if cut < int(limit * 0.55):
+            cut = limit
+        else:
+            # Giữ dấu câu ở cuối đoạn nếu cắt theo ". ", "! ", "? ".
+            if window[cut:cut+2] in (". ", "! ", "? "):
+                cut += 1
+
+        chunk = remaining[:cut].strip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[cut:].lstrip()
+
+    if remaining.strip():
+        chunks.append(remaining.strip())
+    return chunks or [text[:limit]]
+
+
+async def reply_text_safe(message, text):
+    """Gửi text thường an toàn; tự chia nếu AI trả lời vượt giới hạn Telegram."""
+    for chunk in _split_telegram_text(text):
+        await message.reply_text(chunk)
+
 
 def _advance_ai_key():
     """Chuyển sang API key kế tiếp; không làm gì nếu chưa cấu hình key."""
@@ -2582,7 +2637,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"🌤 Đang lấy thời tiết {loc}...")
         weather_data = await asyncio.to_thread(get_realtime_weather, loc)
         final_answer = format_weather_response(weather_data)
-        await update.message.reply_text(final_answer)
+        await reply_text_safe(update.message, final_answer)
         return
 
     elif action == "news" or action == "web_search":
@@ -2591,7 +2646,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"📰 Đang lướt mạng tra cứu '{search_query}' cho các con vợ...")
         news_data = await asyncio.to_thread(perform_web_search, search_query)
         final_answer = await asyncio.to_thread(generate_witty_response, user_input, "Thông tin mạng hiện tại", news_data)
-        await update.message.reply_text(final_answer)
+        await reply_text_safe(update.message, final_answer)
         return
 
     elif action == "chat":
@@ -2601,7 +2656,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             update, context, user_input,
             fallback_response=ai_intent.get("response", "Lỗi rồi con vợ ơi!")
         )
-        await update.message.reply_text(answer)
+        await reply_text_safe(update.message, answer)
 
         # Lưu memory sau khi đã trả lời để người dùng không phải chờ JSONBin mới thấy phản hồi.
         await save_cloud_db(context, update.message.chat_id)
