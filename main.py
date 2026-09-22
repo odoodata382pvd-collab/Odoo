@@ -159,6 +159,7 @@ AI_MEMORY_SUMMARY_TRIGGER = 22       # Quá ngưỡng này mới tóm tắt ph�
 AI_MEMORY_KEEP_AFTER_SUMMARY = 12    # Sau tóm tắt giữ 12 message mới nhất
 AI_MEMORY_MESSAGE_MAX_CHARS = 1800   # Chặn một message quá dài làm phình JSONBin/token
 AI_MEMORY_SUMMARY_MAX_CHARS = 1800
+AI_ACTION_CONTEXT_MAX_AGE_HOURS = 24
 AI_MEMORY_LOCK = threading.Lock()
 
 def load_cloud_db():
@@ -257,6 +258,7 @@ def _sync_ai_memory_profile(update: Update, odoo_profile=None):
             "summary": "",
             "style_notes": "",
             "recent_messages": [],
+            "last_context": {},
             "updated_at": _memory_now_iso(),
         })
 
@@ -285,6 +287,7 @@ def _sync_ai_memory_profile(update: Update, odoo_profile=None):
         memory.setdefault("summary", "")
         memory.setdefault("style_notes", "")
         memory.setdefault("recent_messages", [])
+        memory.setdefault("last_context", {})
         memory["updated_at"] = _memory_now_iso()
         return memory_key, memory
 
@@ -316,7 +319,7 @@ def _append_ai_memory_message(memory_key, role, content):
     with AI_MEMORY_LOCK:
         memory = cloud_data.setdefault("ai_memory", {}).setdefault(memory_key, {
             "profile": {}, "summary": "", "style_notes": "",
-            "recent_messages": [], "updated_at": _memory_now_iso()
+            "recent_messages": [], "last_context": {}, "updated_at": _memory_now_iso()
         })
         messages = memory.setdefault("recent_messages", [])
 
@@ -348,10 +351,17 @@ def _memory_prompt_context(memory):
     summary = _clean_memory_text(memory.get("summary", ""), AI_MEMORY_SUMMARY_MAX_CHARS)
     style = _clean_memory_text(memory.get("style_notes", ""), 900)
 
+    last_context = memory.get("last_context", {}) if isinstance(memory, dict) else {}
+    if isinstance(last_context, dict) and last_context.get("action"):
+        action_context = json.dumps(last_context, ensure_ascii=False)
+    else:
+        action_context = "Chưa có hành động gần nhất"
+
     return {
         "profile": "; ".join(profile_parts) if profile_parts else "Chưa có hồ sơ bổ sung",
         "summary": summary or "Chưa có tóm tắt dài hạn",
         "style": style or "Chưa có ghi chú phong cách ổn định",
+        "last_context": action_context,
     }
 
 
@@ -366,6 +376,50 @@ def _recent_memory_messages(memory):
         if role in ("user", "assistant") and content:
             out.append({"role": role, "content": content})
     return out
+
+
+
+def _get_last_action_context(memory_key):
+    """Lấy ngữ cảnh hành động gần nhất của riêng Telegram user_id hiện tại."""
+    with AI_MEMORY_LOCK:
+        memory = cloud_data.get("ai_memory", {}).get(str(memory_key), {})
+        ctx = memory.get("last_context", {}) if isinstance(memory, dict) else {}
+        return dict(ctx) if isinstance(ctx, dict) else {}
+
+
+def _context_is_fresh(ctx, max_age_hours=AI_ACTION_CONTEXT_MAX_AGE_HOURS):
+    if not isinstance(ctx, dict) or not ctx.get("updated_at"):
+        return False
+    try:
+        updated = datetime.fromisoformat(str(ctx["updated_at"]))
+        now = datetime.now(pytz.timezone("Asia/Ho_Chi_Minh"))
+        if updated.tzinfo is None:
+            updated = pytz.timezone("Asia/Ho_Chi_Minh").localize(updated)
+        return (now - updated).total_seconds() <= max_age_hours * 3600
+    except Exception:
+        return False
+
+
+def _set_last_action_context(memory_key, action, topic="", entities=None):
+    """
+    Lưu hành động gần nhất để hiểu các câu nối tiếp như "tra lại đi", "còn cái vừa nãy?".
+    Chỉ là metadata hội thoại; không thay đổi dữ liệu/nghiệp vụ Odoo.
+    """
+    if not memory_key or not action:
+        return
+    ctx = {
+        "action": str(action),
+        "topic": _clean_memory_text(topic, 500),
+        "entities": entities if isinstance(entities, dict) else {},
+        "updated_at": _memory_now_iso(),
+    }
+    with AI_MEMORY_LOCK:
+        memory = cloud_data.setdefault("ai_memory", {}).setdefault(str(memory_key), {
+            "profile": {}, "summary": "", "style_notes": "",
+            "recent_messages": [], "last_context": {}, "updated_at": _memory_now_iso()
+        })
+        memory["last_context"] = ctx
+        memory["updated_at"] = _memory_now_iso()
 
 
 def _compact_ai_memory(memory_key):
@@ -489,6 +543,9 @@ TRÍ NHỚ DÀI HẠN ĐÃ TÓM TẮT:
 GHI CHÚ PHONG CÁCH GIAO TIẾP ĐÃ QUAN SÁT:
 {ctx['style']}
 
+NGỮ CẢNH HÀNH ĐỘNG GẦN NHẤT:
+{ctx['last_context']}
+
 NGUYÊN TẮC GIAO TIẾP:
 1. Dùng lịch sử thật để nối tiếp câu chuyện. Không được giả vờ nhớ điều không có trong memory.
 2. Tự điều chỉnh độ dài, độ trang trọng, mức hài hước theo cách người này đang nói và thói quen đã quan sát.
@@ -504,7 +561,7 @@ NGUYÊN TẮC GIAO TIẾP:
     messages.append({"role": "user", "content": current_clean})
 
     try:
-        answer = call_groq_chat(messages=messages, temperature=0.55)
+        answer = await asyncio.to_thread(call_groq_chat, messages, 0.55)
     except Exception as e:
         logger.error(f"Lỗi AI chat có memory: {e}")
         answer = fallback_response or "⚠️ AI hội thoại đang không phản hồi, nhưng các chức năng Odoo vẫn hoạt động bình thường."
@@ -748,15 +805,238 @@ def ask_groq_ai(query):
     except Exception as e:
         return f"Lỗi hệ thống: {e}"
 
+def _weather_code_to_vi(code):
+    mapping = {
+        0: "trời quang",
+        1: "chủ yếu quang", 2: "có mây", 3: "nhiều mây",
+        45: "sương mù", 48: "sương mù đóng băng",
+        51: "mưa phùn nhẹ", 53: "mưa phùn", 55: "mưa phùn dày",
+        56: "mưa phùn lạnh nhẹ", 57: "mưa phùn lạnh",
+        61: "mưa nhẹ", 63: "mưa vừa", 65: "mưa to",
+        66: "mưa lạnh nhẹ", 67: "mưa lạnh",
+        71: "tuyết nhẹ", 73: "tuyết vừa", 75: "tuyết dày", 77: "hạt tuyết",
+        80: "mưa rào nhẹ", 81: "mưa rào", 82: "mưa rào mạnh",
+        85: "mưa tuyết nhẹ", 86: "mưa tuyết mạnh",
+        95: "dông", 96: "dông kèm mưa đá nhẹ", 99: "dông kèm mưa đá mạnh",
+    }
+    try:
+        return mapping.get(int(code), "thời tiết thay đổi")
+    except Exception:
+        return "thời tiết thay đổi"
+
+
+def _extract_weather_location(user_input, default_location="Hà Nội"):
+    """
+    Lấy địa điểm khỏi câu hỏi thời tiết mà không nhầm các cụm như
+    "hôm nay thế nào mày" thành tên địa phương.
+    """
+    original = str(user_input or "").strip()
+    m = re.search(r'(?:thời\s*tiết|thoi\s*tiet)(.*)$', original, flags=re.IGNORECASE)
+    if not m:
+        return default_location
+
+    rest = m.group(1).strip(" ,:;?!.")
+    if not rest:
+        return default_location
+
+    # Nếu có "ở/tại" thì phần sau đó có độ tin cậy cao nhất.
+    m_explicit = re.search(r'(?:^|\s)(?:ở|o|tại|tai)\s+(.+)$', rest, flags=re.IGNORECASE)
+    candidate = m_explicit.group(1).strip() if m_explicit else rest
+
+    # Bỏ các cụm thời gian ở đầu.
+    candidate = re.sub(
+        r'^(?:hôm\s*nay|hom\s*nay|ngày\s*mai|ngay\s*mai|hôm\s*qua|hom\s*qua)\s*',
+        '', candidate, flags=re.IGNORECASE
+    ).strip()
+
+    # Cắt phần câu hỏi/filler ở cuối, giữ lại địa danh.
+    candidate = re.split(
+        r'\b(?:hôm\s*nay|hom\s*nay|ngày\s*mai|ngay\s*mai|hôm\s*qua|hom\s*qua|'
+        r'thế\s*nào|the\s*nao|thì\s*sao|thi\s*sao|ra\s*sao|như\s*thế\s*nào|nhu\s*the\s*nao|'
+        r'mày|may|vậy|vay|nhé|nhe|đi|di)\b',
+        candidate, maxsplit=1, flags=re.IGNORECASE
+    )[0].strip(" ,:;?!.")
+
+    norm = _normalize_vn_text(candidate)
+    if not candidate or norm in {"hom nay", "ngay mai", "hom qua", "the nao", "ra sao"}:
+        return default_location
+    return candidate
+
+
 def get_realtime_weather(location="Hà Nội"):
+    """
+    Nguồn 1: Open-Meteo (không cần API key) -> Nguồn 2: wttr.in -> Nguồn 3: web search.
+    Trả dict có cấu trúc để phần trả lời không phải nhờ AI bịa/diễn giải số liệu.
+    """
+    location = str(location or "Hà Nội").strip() or "Hà Nội"
+
+    # --- Nguồn 1: Open-Meteo ---
+    try:
+        geo_res = requests.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": location, "count": 5, "language": "vi", "format": "json"},
+            timeout=7,
+        )
+        if geo_res.status_code == 200:
+            results = geo_res.json().get("results") or []
+            if results:
+                # Nếu có kết quả ở Việt Nam thì ưu tiên; nếu không dùng kết quả đầu tiên
+                # để vẫn hỗ trợ Tokyo, Seoul, Bangkok... khi người dùng hỏi.
+                place = next((x for x in results if x.get("country_code") == "VN"), results[0])
+                lat = place.get("latitude")
+                lon = place.get("longitude")
+                tz = place.get("timezone") or "auto"
+
+                forecast_res = requests.get(
+                    "https://api.open-meteo.com/v1/forecast",
+                    params={
+                        "latitude": lat,
+                        "longitude": lon,
+                        "current": "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m",
+                        "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+                        "timezone": tz,
+                        "forecast_days": 1,
+                    },
+                    timeout=7,
+                )
+                if forecast_res.status_code == 200:
+                    data = forecast_res.json()
+                    current = data.get("current") or {}
+                    daily = data.get("daily") or {}
+                    display_parts = [place.get("name")]
+                    admin1 = place.get("admin1")
+                    country = place.get("country")
+                    if admin1 and admin1 != place.get("name"):
+                        display_parts.append(admin1)
+                    if country and country not in display_parts:
+                        display_parts.append(country)
+                    display_name = ", ".join(x for x in display_parts if x) or location
+
+                    def first_value(key):
+                        value = daily.get(key)
+                        if isinstance(value, list) and value:
+                            return value[0]
+                        return None
+
+                    return {
+                        "ok": True,
+                        "source": "Open-Meteo",
+                        "location": display_name,
+                        "temperature": current.get("temperature_2m"),
+                        "apparent_temperature": current.get("apparent_temperature"),
+                        "humidity": current.get("relative_humidity_2m"),
+                        "wind_speed": current.get("wind_speed_10m"),
+                        "weather_code": current.get("weather_code"),
+                        "temp_max": first_value("temperature_2m_max"),
+                        "temp_min": first_value("temperature_2m_min"),
+                        "rain_probability": first_value("precipitation_probability_max"),
+                        "observed_at": current.get("time"),
+                    }
+    except Exception as e:
+        logger.warning(f"Open-Meteo lỗi cho {location}: {e}")
+
+    # --- Nguồn 2: wttr.in ---
     try:
         url = f"https://wttr.in/{urllib.parse.quote(location)}?format=%l:+%C,+Nhiệt+độ:+%t,+Cảm+giác+như:+%f,+Độ+ẩm:+%h&m"
-        res = requests.get(url, timeout=5)
-        if res.status_code == 200:
-            return res.text.strip()
-        return "Hiện tại không lấy được dữ liệu thời tiết thực tế."
+        res = requests.get(url, timeout=7, headers={"User-Agent": "Mozilla/5.0"})
+        if res.status_code == 200 and res.text.strip():
+            return {
+                "ok": True,
+                "source": "wttr.in",
+                "location": location,
+                "raw": res.text.strip(),
+            }
+    except Exception as e:
+        logger.warning(f"wttr.in lỗi cho {location}: {e}")
+
+    # --- Nguồn 3: web search ---
+    try:
+        web_data = perform_web_search(f"thời tiết {location} hôm nay")
+        if web_data and not web_data.startswith("Lỗi") and "Không tìm thấy" not in web_data:
+            return {
+                "ok": False,
+                "source": "web_search",
+                "location": location,
+                "raw": web_data,
+                "error": "Hai nguồn thời tiết trực tiếp không phản hồi.",
+            }
+    except Exception as e:
+        logger.warning(f"Weather web fallback lỗi cho {location}: {e}")
+
+    return {
+        "ok": False,
+        "source": "none",
+        "location": location,
+        "error": "Không lấy được dữ liệu thời tiết từ các nguồn hiện có.",
+    }
+
+
+def _fmt_weather_number(value, digits=0):
+    if value is None:
+        return None
+    try:
+        value = float(value)
+        return f"{value:.{digits}f}"
     except Exception:
-        return "Lỗi kết nối khi lấy thời tiết."
+        return None
+
+
+def format_weather_response(weather_data):
+    """Trả lời thời tiết trực tiếp, ngắn và dựa trên số liệu; không cần Groq."""
+    if not isinstance(weather_data, dict):
+        return str(weather_data)
+
+    if weather_data.get("ok") and weather_data.get("source") == "Open-Meteo":
+        loc = weather_data.get("location") or "địa điểm đã chọn"
+        temp = _fmt_weather_number(weather_data.get("temperature"))
+        feel = _fmt_weather_number(weather_data.get("apparent_temperature"))
+        hum = _fmt_weather_number(weather_data.get("humidity"))
+        wind = _fmt_weather_number(weather_data.get("wind_speed"))
+        tmin = _fmt_weather_number(weather_data.get("temp_min"))
+        tmax = _fmt_weather_number(weather_data.get("temp_max"))
+        rain = _fmt_weather_number(weather_data.get("rain_probability"))
+        condition = _weather_code_to_vi(weather_data.get("weather_code"))
+
+        first = f"🌤 {loc}: {condition}"
+        if temp is not None:
+            first += f", {temp}°C"
+        if feel is not None:
+            first += f" (cảm giác {feel}°C)"
+        first += "."
+
+        second_bits = []
+        if hum is not None:
+            second_bits.append(f"Độ ẩm {hum}%")
+        if wind is not None:
+            second_bits.append(f"gió {wind} km/h")
+        second = ", ".join(second_bits)
+        if second:
+            second = second[0].upper() + second[1:] + "."
+
+        third_bits = []
+        if tmin is not None and tmax is not None:
+            third_bits.append(f"Hôm nay khoảng {tmin}–{tmax}°C")
+        if rain is not None:
+            third_bits.append(f"khả năng mưa cao nhất {rain}%")
+        third = ", ".join(third_bits)
+        if third:
+            third += "."
+
+        return " ".join(x for x in [first, second, third] if x)
+
+    if weather_data.get("ok") and weather_data.get("raw"):
+        return f"🌤 {weather_data['raw']}"
+
+    if weather_data.get("source") == "web_search" and weather_data.get("raw"):
+        # Web search chỉ là phương án cuối; không giả vờ đây là số liệu thời tiết chính xác.
+        lines = [x.strip() for x in str(weather_data["raw"]).splitlines() if x.strip()]
+        snippets = [x for x in lines if not x.startswith("📰") and not x.startswith("🌐")][:2]
+        detail = " ".join(snippets)
+        if len(detail) > 500:
+            detail = detail[:500].rstrip() + "…"
+        return f"⚠️ Nguồn thời tiết trực tiếp đang lỗi. Kết quả web gần nhất cho {weather_data.get('location')}: {detail}"
+
+    return f"⚠️ Chưa lấy được thời tiết của {weather_data.get('location', 'địa điểm này')} lúc này."
 
 def perform_web_search(query):
     """Sử dụng duckduckgo-search phiên bản mở rộng để lấy nhiều tin tức hơn"""
@@ -869,6 +1149,80 @@ def _extract_date_range(user_input):
     return start_dt.strftime('%Y-%m-%d'), end_dt.strftime('%Y-%m-%d')
 
 
+def _looks_like_followup(user_input):
+    norm = _normalize_vn_text(user_input).strip(" ?!.,;:")
+    if not norm or len(norm) > 90:
+        return False
+    patterns = [
+        r'^(tra|tim|xem|kiem tra|cap nhat|thu|lam)\s+(lai|cho ro)',
+        r'^(tra cho ro|tra ro hon|noi ro hon|xem ro hon)',
+        r'^(con|the con|vay con|the|vay)\b',
+        r'^(o|tai)\s+.+(?:thi sao|the nao|ra sao)$',
+        r'^(hom qua|hom nay|ngay mai)\b.*(?:thi sao|the nao|ra sao|sao)',
+        r'^(roi sao|sao roi|the nao|ra sao|co gi moi|moi nhat)$',
+        r'^(cai vua nay|cai luc nay|cai tren|no)\b.*',
+    ]
+    return any(re.search(p, norm) for p in patterns)
+
+
+def _followup_intent(user_input, last_context):
+    """Nối câu ngắn với hành động gần nhất, chỉ với các action đọc dữ liệu an toàn."""
+    if not _looks_like_followup(user_input):
+        return None
+    if not _context_is_fresh(last_context):
+        return None
+
+    action = last_context.get("action")
+    entities = dict(last_context.get("entities") or {})
+    safe_reuse_actions = {
+        "weather", "web_search", "export_customer_orders",
+        "check_single_order", "export_report", "stock_search"
+    }
+    if action not in safe_reuse_actions:
+        return None
+
+    norm = _normalize_vn_text(user_input)
+
+    if action == "weather":
+        # "Ở Đà Nẵng thì sao?" sau một câu hỏi thời tiết.
+        m_loc = re.search(r'^(?:o|tai)\s+(.+?)(?:\s+thi\s+sao|\s+the\s+nao|\s+ra\s+sao)?$', norm)
+        if m_loc:
+            entities["location"] = _extract_weather_location(
+                f"thời tiết {str(user_input).strip()}",
+                default_location=entities.get("location") or "Hà Nội"
+            )
+        return {
+            "action": "weather",
+            "location": entities.get("location") or "Hà Nội",
+            "source": "followup"
+        }
+
+    if action == "web_search":
+        query = entities.get("query") or last_context.get("topic") or str(user_input)
+        if any(x in norm for x in ["moi nhat", "cap nhat", "co gi moi", "tra lai", "tra cho ro"]):
+            query = f"{query} mới nhất"
+        return {"action": "web_search", "query": query, "source": "followup"}
+
+    if action == "export_customer_orders" and entities.get("customer_name"):
+        return {"action": action, "customer_name": entities["customer_name"], "source": "followup"}
+
+    if action == "check_single_order" and entities.get("order_code"):
+        return {"action": action, "order_code": entities["order_code"], "source": "followup"}
+
+    if action == "export_report" and entities.get("start_date") and entities.get("end_date"):
+        return {
+            "action": action,
+            "start_date": entities["start_date"],
+            "end_date": entities["end_date"],
+            "source": "followup"
+        }
+
+    if action == "stock_search" and entities.get("product_code"):
+        return {"action": action, "product_code": entities["product_code"], "source": "followup"}
+
+    return None
+
+
 def _deterministic_intent(user_input):
     """
     Điều hướng các nghiệp vụ cốt lõi bằng rule trước khi gọi AI.
@@ -923,15 +1277,10 @@ def _deterministic_intent(user_input):
     if _looks_like_product_code(original):
         return {"action": "stock_search", "source": "rule"}
 
-    # Thời tiết: có thể tự xác định action; AI chỉ cần thiết cho câu hỏi mơ hồ hơn.
+    # Thời tiết: rule cục bộ, không nhờ AI đoán địa điểm từ các từ như "hôm nay thế nào".
     if 'thoi tiet' in norm:
-        m_weather = re.search(
-            r'(?:thời\s*tiết|thoi\s*tiet)(?:\s+(?:ở|o|tại|tai))?\s*(.*)$',
-            original,
-            flags=re.IGNORECASE
-        )
-        loc = (m_weather.group(1) if m_weather else '').strip(' ?!.')
-        return {"action": "weather", "location": loc or "Hà Nội", "source": "rule"}
+        loc = _extract_weather_location(original, default_location="Hà Nội")
+        return {"action": "weather", "location": loc, "source": "rule"}
 
     # Một số nhóm tra cứu web rõ ràng.
     if any(k in norm for k in ['tin tuc', 'thoi su', 'gia vang', 'world cup', 'bong da']):
@@ -940,11 +1289,15 @@ def _deterministic_intent(user_input):
     return None
 
 
-def analyze_chat_intent(user_input):
+def analyze_chat_intent(user_input, last_context=None):
     # Luồng nghiệp vụ rõ ràng chạy bằng rule trước, để không phụ thuộc uptime/model của Groq.
     deterministic = _deterministic_intent(user_input)
     if deterministic:
         return deterministic
+
+    followup = _followup_intent(user_input, last_context or {})
+    if followup:
+        return followup
 
     tz_vn = pytz.timezone("Asia/Ho_Chi_Minh")
     current_time_str = datetime.now(tz_vn).strftime("%Y-%m-%d %H:%M:%S")
@@ -953,6 +1306,11 @@ def analyze_chat_intent(user_input):
     Bạn là bộ não điều hướng. Thời gian hiện tại: {current_time_str}.
     Bạn xưng "Anh" và gọi người dùng là "con vợ" hoặc "các con vợ".
     Nhiệm vụ của bạn là phân tích câu nói của người dùng và trả về DUY NHẤT một JSON object hợp lệ. KHÔNG giải thích.
+
+    Hành động gần nhất của chính người dùng này (có thể rỗng):
+    {json.dumps(last_context or {}, ensure_ascii=False)}
+    Nếu câu hiện tại là câu nối tiếp ngắn như "tra lại", "còn cái đó?", "thế sao?" thì có thể dùng ngữ cảnh này.
+    Không được dùng ngữ cảnh cũ nếu câu hiện tại đã nêu yêu cầu mới rõ ràng.
 
     Quy tắc phân loại (QUAN TRỌNG):
     1. Nếu yêu cầu THỐNG KÊ / BÁO CÁO ĐƠN HÀNG từ ngày này đến ngày khác:
@@ -1022,7 +1380,7 @@ def generate_witty_response(user_input, topic, real_data):
     2. Nếu thông tin cào được bị thiếu hoặc không rõ ràng, hãy trả lời dựa trên những gì tốt nhất có được và thành thật báo các con vợ là tin này chưa đầy đủ.
     3. Nếu là THỜI TIẾT: Phải bắt buộc dùng đúng ĐỘ C (°C). Tùy vào nhiệt độ mà than vãn hoặc trêu đùa.
     4. Giọng văn dí dỏm, chuyên nghiệp nhưng mặn mòi. Có thể trêu đùa các con vợ nhẹ nhàng 1 câu ở cuối.
-    5. KHÔNG VIẾT DÀI DÒNG. Tối đa 4-5 câu.
+    5. KHÔNG VIẾT DÀI DÒNG. Câu hỏi dữ liệu đơn giản: 1-3 câu. Chỉ tối đa 4 câu khi thật sự cần.
     6. TUYỆT ĐỐI KHÔNG dùng 2 dấu sao để in đậm. Chỉ dùng 1 dấu sao (*Nội dung*) để in đậm theo chuẩn Telegram.
     """
     try:
@@ -2156,7 +2514,8 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # Ghi lịch sử theo Telegram user_id. Đây chỉ là lớp memory, không tham gia
     # quyết định nghiệp vụ nên không làm thay đổi command/flow Odoo hiện có.
-    _remember_user_text(update, user_input)
+    memory_key = _remember_user_text(update, user_input)
+    last_context = _get_last_action_context(memory_key)
 
     # --- 1. Lọc Lệnh Chọn ID Kho cho Đổ Tồn Kho ---
     if context.user_data.get('waiting_for_location'):
@@ -2186,12 +2545,13 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # --- 3. PHÂN TÍCH Ý ĐỊNH: rule nghiệp vụ trước, Groq cho câu linh hoạt sau ---
-    ai_intent = analyze_chat_intent(user_input)
+    ai_intent = await asyncio.to_thread(analyze_chat_intent, user_input, last_context)
     action = ai_intent.get("action")
 
     if action == "export_customer_orders":
         customer_name = ai_intent.get("customer_name", "").strip()
         if customer_name:
+            _set_last_action_context(memory_key, "export_customer_orders", f"Đơn hàng khách {customer_name}", {"customer_name": customer_name})
             await export_customer_orders(update, context, customer_name)
         else:
             await update.message.reply_text("Con vợ muốn tra đơn của khách nào? Gõ tên khách cho Anh với nhé!")
@@ -2200,6 +2560,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif action == "check_single_order":
         order_code = ai_intent.get("order_code", "").strip().upper()
         if order_code:
+            _set_last_action_context(memory_key, "check_single_order", f"Đơn hàng {order_code}", {"order_code": order_code})
             await check_single_order(update, context, order_code)
         else:
             await update.message.reply_text("Con vợ ném mã đơn (VD: SO001) đây để Anh check cho nóng!")
@@ -2209,24 +2570,27 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         start_d = ai_intent.get("start_date")
         end_d = ai_intent.get("end_date")
         if start_d and end_d:
+            _set_last_action_context(memory_key, "export_report", f"Báo cáo đơn {start_d} đến {end_d}", {"start_date": start_d, "end_date": end_d})
             await export_orders_by_date_range(update, context, start_d, end_d)
         else:
             await update.message.reply_text("❌ Anh chưa hiểu đủ khoảng ngày. Ví dụ: `Tổng hợp đơn hàng từ ngày 2 đến ngày 20`", parse_mode='Markdown')
         return
 
     elif action == "weather":
-        loc = ai_intent.get("location", "Hà Nội")
-        await update.message.reply_text("🌤 Đang đưa mặt ra ngoài cửa sổ đo thời tiết cho các con vợ...")
-        weather_data = get_realtime_weather(loc)
-        final_answer = generate_witty_response(user_input, f"Thời tiết tại {loc}", weather_data)
+        loc = (ai_intent.get("location") or "Hà Nội").strip()
+        _set_last_action_context(memory_key, "weather", f"Thời tiết {loc}", {"location": loc})
+        await update.message.reply_text(f"🌤 Đang lấy thời tiết {loc}...")
+        weather_data = await asyncio.to_thread(get_realtime_weather, loc)
+        final_answer = format_weather_response(weather_data)
         await update.message.reply_text(final_answer)
         return
 
     elif action == "news" or action == "web_search":
         search_query = ai_intent.get("query", user_input)
+        _set_last_action_context(memory_key, "web_search", str(search_query), {"query": str(search_query)})
         await update.message.reply_text(f"📰 Đang lướt mạng tra cứu '{search_query}' cho các con vợ...")
-        news_data = perform_web_search(search_query)
-        final_answer = generate_witty_response(user_input, "Thông tin mạng hiện tại", news_data)
+        news_data = await asyncio.to_thread(perform_web_search, search_query)
+        final_answer = await asyncio.to_thread(generate_witty_response, user_input, "Thông tin mạng hiện tại", news_data)
         await update.message.reply_text(final_answer)
         return
 
@@ -2254,7 +2618,8 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # --- 4. LOGIC ODOO: Tra tồn kho sản phẩm (GIỮ NGUYÊN THUẬT TOÁN CŨ) ---
-    product_code = user_input.upper()
+    product_code = str(ai_intent.get("product_code") or user_input).strip().upper()
+    _set_last_action_context(memory_key, "stock_search", f"Tồn kho {product_code}", {"product_code": product_code})
     await update.message.reply_text(f"Đang tra tồn cho `{product_code}`, vui lòng chờ!", parse_mode='Markdown')
 
     uid, models, error_msg = connect_odoo()
