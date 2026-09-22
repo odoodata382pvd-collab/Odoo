@@ -145,9 +145,21 @@ JSONBIN_API_KEY = os.environ.get('JSONBIN_API_KEY')
 JSONBIN_BIN_ID = os.environ.get('JSONBIN_BIN_ID')
 
 # Bộ nhớ đệm chạy trên RAM
+# ai_memory được tách theo Telegram user_id để nhiều người dùng cùng một bot
+# không bị lẫn lịch sử hội thoại với nhau.
 cloud_data = {
-    "sales_mapping": {} 
+    "sales_mapping": {},
+    "ai_memory": {}
 }
+
+# ---------------- AI MEMORY (KHÔNG THAY ĐỔI NGHIỆP VỤ ODOO) ----------------
+# Chỉ phục vụ lớp giao tiếp tự nhiên. Các rule/command Odoo vẫn chạy như cũ.
+AI_MEMORY_RECENT_LIMIT = 16          # 16 message gần nhất (~8 lượt hỏi/đáp)
+AI_MEMORY_SUMMARY_TRIGGER = 22       # Quá ngưỡng này mới tóm tắt phần cũ
+AI_MEMORY_KEEP_AFTER_SUMMARY = 12    # Sau tóm tắt giữ 12 message mới nhất
+AI_MEMORY_MESSAGE_MAX_CHARS = 1800   # Chặn một message quá dài làm phình JSONBin/token
+AI_MEMORY_SUMMARY_MAX_CHARS = 1800
+AI_MEMORY_LOCK = threading.Lock()
 
 def load_cloud_db():
     global cloud_data, JSONBIN_BIN_ID
@@ -162,7 +174,11 @@ def load_cloud_db():
             if res.status_code == 200:
                 record = res.json().get('record')
                 if record:
-                    cloud_data = record
+                    cloud_data = record if isinstance(record, dict) else {}
+                    # Giữ tương thích dữ liệu JSONBin cũ: bin trước đây có thể chỉ
+                    # chứa sales_mapping/price_cache và chưa có ai_memory.
+                    cloud_data.setdefault("sales_mapping", {})
+                    cloud_data.setdefault("ai_memory", {})
                     if "price_cache" in cloud_data:
                         with open("price_cache.json", 'w', encoding='utf-8') as f:
                             json.dump(cloud_data["price_cache"], f, ensure_ascii=False, indent=4)
@@ -199,6 +215,304 @@ async def save_cloud_db(context=None, chat_id=None):
                     await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Lỗi lưu Cloud DB: {e}")
+
+
+def _memory_now_iso():
+    return datetime.now(pytz.timezone("Asia/Ho_Chi_Minh")).isoformat(timespec="seconds")
+
+
+def _clean_memory_text(text, max_chars=AI_MEMORY_MESSAGE_MAX_CHARS):
+    """Chuẩn hóa text trước khi lưu để JSONBin không phình vô hạn."""
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "…"
+    return text
+
+
+def _get_ai_memory_key(update: Update):
+    """Memory bắt buộc tách theo Telegram user_id, không dùng group chat_id."""
+    user = getattr(update, "effective_user", None)
+    if user and getattr(user, "id", None) is not None:
+        return str(user.id)
+
+    # Fallback hiếm gặp (service message). Không ảnh hưởng nghiệp vụ Telegram thường.
+    chat = getattr(update, "effective_chat", None)
+    if chat and getattr(chat, "id", None) is not None:
+        return f"chat:{chat.id}"
+    return "unknown"
+
+
+def _sync_ai_memory_profile(update: Update, odoo_profile=None):
+    """
+    Tạo/cập nhật hồ sơ giao tiếp cho đúng Telegram user_id.
+    Chỉ lưu thông tin nhận diện phục vụ hội thoại; không thay sales_mapping cũ.
+    """
+    memory_key = _get_ai_memory_key(update)
+    user = getattr(update, "effective_user", None)
+
+    with AI_MEMORY_LOCK:
+        cloud_data.setdefault("ai_memory", {})
+        memory = cloud_data["ai_memory"].setdefault(memory_key, {
+            "profile": {},
+            "summary": "",
+            "style_notes": "",
+            "recent_messages": [],
+            "updated_at": _memory_now_iso(),
+        })
+
+        profile = memory.setdefault("profile", {})
+        profile["telegram_user_id"] = memory_key
+        if user:
+            full_name = " ".join(
+                x for x in [getattr(user, "first_name", None), getattr(user, "last_name", None)] if x
+            ).strip()
+            if full_name:
+                profile["telegram_name"] = full_name
+            username = getattr(user, "username", None)
+            if username:
+                profile["telegram_username"] = username
+
+        # Nếu người dùng đã /baodanh thì bổ sung danh tính Odoo vào memory.
+        # Không sửa khóa hay cách vận hành sales_mapping hiện hữu.
+        if odoo_profile:
+            if odoo_profile.get("name"):
+                profile["odoo_name"] = str(odoo_profile.get("name"))
+            if odoo_profile.get("email"):
+                profile["odoo_email"] = str(odoo_profile.get("email"))
+            if odoo_profile.get("odoo_user_id") is not None:
+                profile["odoo_user_id"] = odoo_profile.get("odoo_user_id")
+
+        memory.setdefault("summary", "")
+        memory.setdefault("style_notes", "")
+        memory.setdefault("recent_messages", [])
+        memory["updated_at"] = _memory_now_iso()
+        return memory_key, memory
+
+
+def _get_odoo_profile_for_memory(update: Update):
+    """Đọc danh tính đã báo danh nếu có, nhưng tuyệt đối không thay cơ chế báo danh cũ."""
+    mapping = cloud_data.get("sales_mapping", {})
+    candidates = []
+
+    chat = getattr(update, "effective_chat", None)
+    if chat and getattr(chat, "id", None) is not None:
+        candidates.append(str(chat.id))
+
+    user = getattr(update, "effective_user", None)
+    if user and getattr(user, "id", None) is not None:
+        candidates.append(str(user.id))
+
+    for key in candidates:
+        if key in mapping and isinstance(mapping[key], dict):
+            return mapping[key]
+    return None
+
+
+def _append_ai_memory_message(memory_key, role, content):
+    content = _clean_memory_text(content)
+    if not content:
+        return
+
+    with AI_MEMORY_LOCK:
+        memory = cloud_data.setdefault("ai_memory", {}).setdefault(memory_key, {
+            "profile": {}, "summary": "", "style_notes": "",
+            "recent_messages": [], "updated_at": _memory_now_iso()
+        })
+        messages = memory.setdefault("recent_messages", [])
+
+        # Không ghi trùng đúng message cuối (hữu ích khi handler retry).
+        if messages and messages[-1].get("role") == role and messages[-1].get("content") == content:
+            return
+
+        messages.append({
+            "role": role,
+            "content": content,
+            "ts": _memory_now_iso(),
+        })
+        memory["updated_at"] = _memory_now_iso()
+
+
+def _memory_prompt_context(memory):
+    profile = memory.get("profile", {}) if isinstance(memory, dict) else {}
+    profile_parts = []
+    for label, key in [
+        ("Tên Telegram", "telegram_name"),
+        ("Username", "telegram_username"),
+        ("Tên nhân viên Odoo", "odoo_name"),
+        ("Email Odoo", "odoo_email"),
+    ]:
+        value = profile.get(key)
+        if value:
+            profile_parts.append(f"{label}: {value}")
+
+    summary = _clean_memory_text(memory.get("summary", ""), AI_MEMORY_SUMMARY_MAX_CHARS)
+    style = _clean_memory_text(memory.get("style_notes", ""), 900)
+
+    return {
+        "profile": "; ".join(profile_parts) if profile_parts else "Chưa có hồ sơ bổ sung",
+        "summary": summary or "Chưa có tóm tắt dài hạn",
+        "style": style or "Chưa có ghi chú phong cách ổn định",
+    }
+
+
+def _recent_memory_messages(memory):
+    raw = memory.get("recent_messages", []) if isinstance(memory, dict) else []
+    out = []
+    for item in raw[-AI_MEMORY_RECENT_LIMIT:]:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        content = _clean_memory_text(item.get("content", ""))
+        if role in ("user", "assistant") and content:
+            out.append({"role": role, "content": content})
+    return out
+
+
+def _compact_ai_memory(memory_key):
+    """
+    Tóm tắt phần hội thoại cũ để giữ trí nhớ dài hạn nhưng không gửi lịch sử vô hạn
+    lên Groq. Nếu Groq lỗi thì chỉ cắt bớt lịch sử, không ảnh hưởng bot/Odoo.
+    """
+    with AI_MEMORY_LOCK:
+        memory = cloud_data.get("ai_memory", {}).get(memory_key)
+        if not isinstance(memory, dict):
+            return
+        messages = list(memory.get("recent_messages", []))
+        previous_summary = str(memory.get("summary", "") or "")
+        previous_style = str(memory.get("style_notes", "") or "")
+
+    if len(messages) <= AI_MEMORY_SUMMARY_TRIGGER:
+        return
+
+    old_messages = messages[:-AI_MEMORY_KEEP_AFTER_SUMMARY]
+    keep_messages = messages[-AI_MEMORY_KEEP_AFTER_SUMMARY:]
+    transcript = "\n".join(
+        f"{m.get('role', 'unknown')}: {_clean_memory_text(m.get('content', ''), 900)}"
+        for m in old_messages if isinstance(m, dict)
+    )
+
+    prompt = f"""
+Bạn đang quản lý bộ nhớ dài hạn cho một trợ lý công việc bằng tiếng Việt.
+Hãy tóm tắt phần hội thoại cũ thành JSON hợp lệ với đúng 2 khóa:
+{{"summary":"...", "style_notes":"..."}}
+
+QUY TẮC:
+- summary: giữ các sự kiện, chủ đề đang làm, cách gọi tắt, sở thích/ưu tiên mà người dùng thể hiện rõ, và ngữ cảnh hữu ích cho lần nói chuyện sau.
+- style_notes: chỉ ghi cách giao tiếp có thể quan sát được (ví dụ thích ngắn gọn, hay dùng tiếng lóng, thích câu trả lời có số liệu).
+- Không chẩn đoán tâm lý, không gắn nhãn tính cách/cảm xúc như một sự thật cố định, không suy diễn thông tin nhạy cảm.
+- Không bịa. Nếu chưa chắc thì bỏ qua.
+- Viết ngắn, thực dụng. summary tối đa khoảng 900 ký tự, style_notes tối đa khoảng 400 ký tự.
+
+TÓM TẮT CŨ:
+{previous_summary}
+
+PHONG CÁCH CŨ:
+{previous_style}
+
+HỘI THOẠI CẦN GỘP:
+{transcript}
+"""
+
+    new_summary = previous_summary
+    new_style = previous_style
+    try:
+        content = call_groq_chat(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            response_format={"type": "json_object"}
+        )
+        parsed = json.loads(content)
+        new_summary = _clean_memory_text(parsed.get("summary", previous_summary), AI_MEMORY_SUMMARY_MAX_CHARS)
+        new_style = _clean_memory_text(parsed.get("style_notes", previous_style), 900)
+    except Exception as e:
+        logger.warning(f"Không tóm tắt được AI memory {memory_key}: {e}")
+
+    with AI_MEMORY_LOCK:
+        memory = cloud_data.get("ai_memory", {}).get(memory_key)
+        if isinstance(memory, dict):
+            memory["summary"] = new_summary
+            memory["style_notes"] = new_style
+            memory["recent_messages"] = keep_messages
+            memory["updated_at"] = _memory_now_iso()
+
+
+def _remember_user_text(update: Update, text):
+    """
+    Ghi câu người dùng vào RAM memory trước khi router xử lý.
+    Việc ghi này không thay đổi action/command/logic nghiệp vụ.
+    """
+    odoo_profile = _get_odoo_profile_for_memory(update)
+    memory_key, _ = _sync_ai_memory_profile(update, odoo_profile=odoo_profile)
+    _append_ai_memory_message(memory_key, "user", text)
+    return memory_key
+
+
+async def flush_ai_memory_job(context: ContextTypes.DEFAULT_TYPE):
+    """Đồng bộ memory định kỳ lên JSONBin để Render Free restart/sleep không làm mất lịch sử.
+    Không tham gia định tuyến hay nghiệp vụ Odoo.
+    """
+    if not JSONBIN_API_KEY:
+        return
+    try:
+        await save_cloud_db()
+    except Exception as e:
+        logger.warning(f"Lỗi đồng bộ AI memory định kỳ: {e}")
+
+
+async def generate_personal_chat_response(update: Update, context: ContextTypes.DEFAULT_TYPE, user_input, fallback_response=None):
+    """Lớp chat riêng có memory; không thực thi nghiệp vụ Odoo."""
+    odoo_profile = _get_odoo_profile_for_memory(update)
+    memory_key, memory = _sync_ai_memory_profile(update, odoo_profile=odoo_profile)
+    ctx = _memory_prompt_context(memory)
+
+    recent_messages = _recent_memory_messages(memory)
+    # _remember_user_text() đã ghi câu hiện tại trước khi router chạy. Khi gửi Groq,
+    # bỏ bản cuối nếu đúng là câu hiện tại rồi thêm lại một lần ở cuối.
+    current_clean = _clean_memory_text(user_input)
+    if recent_messages and recent_messages[-1].get("role") == "user" and recent_messages[-1].get("content") == current_clean:
+        recent_messages = recent_messages[:-1]
+
+    system_prompt = f"""
+Bạn là lớp GIAO TIẾP TỰ NHIÊN của bot Telegram nội bộ đang làm việc với Odoo.
+Các nghiệp vụ thật (tồn kho, đơn hàng, báo cáo, lên đơn, chuyển kho...) đã có router riêng xử lý.
+Ở đây bạn chỉ trò chuyện, giải thích và duy trì mạch hội thoại; KHÔNG tự bịa rằng đã thao tác Odoo nếu dữ liệu không được cung cấp.
+
+CÁCH XƯNG HÔ HIỆN CÓ CỦA BOT:
+- Xưng "Anh". Có thể gọi người dùng là "con vợ"/"các con vợ" theo phong cách bot cũ khi phù hợp, nhưng đừng nhồi vào mọi câu.
+
+HỒ SƠ NGƯỜI ĐANG NÓI:
+{ctx['profile']}
+
+TRÍ NHỚ DÀI HẠN ĐÃ TÓM TẮT:
+{ctx['summary']}
+
+GHI CHÚ PHONG CÁCH GIAO TIẾP ĐÃ QUAN SÁT:
+{ctx['style']}
+
+NGUYÊN TẮC GIAO TIẾP:
+1. Dùng lịch sử thật để nối tiếp câu chuyện. Không được giả vờ nhớ điều không có trong memory.
+2. Tự điều chỉnh độ dài, độ trang trọng, mức hài hước theo cách người này đang nói và thói quen đã quan sát.
+3. Có thể nhận ra tín hiệu tạm thời như người dùng đang gấp, khó chịu, vui hoặc đùa để điều chỉnh cách trả lời; nhưng không tuyên bố/đóng nhãn trạng thái tâm lý là sự thật và không lưu chẩn đoán.
+4. Nếu người dùng đang bực hoặc cần xử lý nhanh: vào thẳng vấn đề, hạn chế đùa. Nếu đang nói vui: có thể đáp lại tự nhiên.
+5. Ưu tiên ngắn gọn, rõ ràng, thực tế. Chỉ giải thích dài khi người dùng thật sự cần.
+6. Không dùng lịch sử của người khác. Memory hiện tại chỉ thuộc Telegram user_id này.
+7. Nếu câu hỏi cần dữ liệu Odoo/thời gian thực mà không có trong ngữ cảnh, nói rõ cần dùng chức năng tương ứng thay vì tự bịa số liệu.
+"""
+
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(recent_messages)
+    messages.append({"role": "user", "content": current_clean})
+
+    try:
+        answer = call_groq_chat(messages=messages, temperature=0.55)
+    except Exception as e:
+        logger.error(f"Lỗi AI chat có memory: {e}")
+        answer = fallback_response or "⚠️ AI hội thoại đang không phản hồi, nhưng các chức năng Odoo vẫn hoạt động bình thường."
+
+    answer = str(answer).strip()
+    _append_ai_memory_message(memory_key, "assistant", answer)
+    _compact_ai_memory(memory_key)
+    return answer
 
 
 # ---------------- TÍNH NĂNG: AI & XỬ LÝ EXCEL ----------------
@@ -1641,6 +1955,10 @@ async def baodanh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'name': odoo_user['name'],
             'email': email
         }
+
+        # Bổ sung danh tính Odoo vào AI memory theo Telegram user_id.
+        # sales_mapping và nghiệp vụ /baodanh vẫn giữ nguyên như cũ.
+        _sync_ai_memory_profile(update, odoo_profile=cloud_data['sales_mapping'][chat_id])
         
         await update.message.reply_text(
             f"✅ *BÁO DANH THÀNH CÔNG!*\n\n"
@@ -1836,6 +2154,10 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_input = update.message.text.strip()
     user_input_lower = user_input.lower()
 
+    # Ghi lịch sử theo Telegram user_id. Đây chỉ là lớp memory, không tham gia
+    # quyết định nghiệp vụ nên không làm thay đổi command/flow Odoo hiện có.
+    _remember_user_text(update, user_input)
+
     # --- 1. Lọc Lệnh Chọn ID Kho cho Đổ Tồn Kho ---
     if context.user_data.get('waiting_for_location'):
         loc_dict = context.user_data.get('available_locations', {})
@@ -1909,7 +2231,16 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     elif action == "chat":
-        await update.message.reply_text(ai_intent.get("response", "Lỗi rồi con vợ ơi!"))
+        # Tách hẳn lớp chat khỏi router: router chỉ xác định đây là hội thoại,
+        # còn câu trả lời dùng memory riêng của Telegram user_id hiện tại.
+        answer = await generate_personal_chat_response(
+            update, context, user_input,
+            fallback_response=ai_intent.get("response", "Lỗi rồi con vợ ơi!")
+        )
+        await update.message.reply_text(answer)
+
+        # Lưu memory sau khi đã trả lời để người dùng không phải chờ JSONBin mới thấy phản hồi.
+        await save_cloud_db(context, update.message.chat_id)
         return
 
     elif action == "error":
@@ -3315,7 +3646,12 @@ def main():
     # --- ĐĂNG KÝ JOB QUEUE (TỰ ĐỘNG LÊN CƠN) ---
     if application.job_queue:
         application.job_queue.run_repeating(auto_troll_message, interval=7200, first=60)
+        # Memory chỉ là lớp giao tiếp. Đồng bộ định kỳ để các câu hỏi Odoo/text
+        # cũng được giữ lại qua lần sleep/restart của Render Free mà không làm
+        # chậm từng nghiệp vụ bằng một request JSONBin ngay tại mỗi lệnh.
+        application.job_queue.run_repeating(flush_ai_memory_job, interval=600, first=120)
         logger.info("Đã kích hoạt chế độ Auto Troll mỗi 2 tiếng (Tỷ lệ 30%).")
+        logger.info("Đã kích hoạt đồng bộ AI memory lên JSONBin mỗi 10 phút.")
     else:
         logger.warning("JobQueue chưa khả dụng. Cần cài đặt python-telegram-bot[job-queue]")
 
