@@ -20,6 +20,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import pytz
 import json
 import re
+import unicodedata
 from groq import Groq
 
 # ---------------- Trạng thái Hội thoại Lên đơn & Chuyển kho ----------------
@@ -29,12 +30,20 @@ CK_PRODUCTS = 3
 # ---------------- Config Environment ----------------
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 
-# Cấu hình 3 API Key AI (Xoay vòng để tránh lỗi 429)
-AI_KEYS = [
-    os.environ.get('GROQ_API_KEY_1'),
-    os.environ.get('GROQ_API_KEY_2'),
-    os.environ.get('GROQ_API_KEY_3')
+# Cấu hình Groq AI
+# - Giữ tương thích GROQ_API_KEY_1..3 như cũ.
+# - Hỗ trợ thêm GROQ_API_KEY (không đánh số) và GROQ_API_KEY_4..10.
+# - Có thể đổi model trên Render bằng biến GROQ_MODEL mà không cần sửa code.
+GROQ_MODEL = (os.environ.get('GROQ_MODEL') or 'openai/gpt-oss-120b').strip()
+
+_raw_ai_keys = [os.environ.get('GROQ_API_KEY')] + [
+    os.environ.get(f'GROQ_API_KEY_{i}') for i in range(1, 11)
 ]
+AI_KEYS = []
+for _key in _raw_ai_keys:
+    if _key and _key.strip() and _key.strip() not in AI_KEYS:
+        AI_KEYS.append(_key.strip())
+
 current_key_index = 0
 
 ODOO_URL_RAW = os.environ.get('ODOO_URL').rstrip('/') if os.environ.get('ODOO_URL') else None
@@ -69,6 +78,65 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+
+def _advance_ai_key():
+    """Chuyển sang API key kế tiếp; không làm gì nếu chưa cấu hình key."""
+    global current_key_index
+    if AI_KEYS:
+        current_key_index = (current_key_index + 1) % len(AI_KEYS)
+
+
+def call_groq_chat(messages, temperature=0.0, response_format=None):
+    """
+    Gọi Groq theo một điểm duy nhất để tất cả tính năng AI dùng chung cơ chế:
+    - model cấu hình qua GROQ_MODEL;
+    - tự xoay toàn bộ key khi một key/model/request gặp lỗi;
+    - không làm rơi luồng nghiệp vụ sang tra tồn khi AI lỗi.
+    """
+    global current_key_index
+
+    if not AI_KEYS:
+        raise RuntimeError(
+            "Chưa cấu hình GROQ_API_KEY hoặc GROQ_API_KEY_1..10 trên Environment."
+        )
+
+    errors = []
+    attempts = len(AI_KEYS)
+
+    for _ in range(attempts):
+        key_index = current_key_index % len(AI_KEYS)
+        api_key = AI_KEYS[key_index]
+        try:
+            client = Groq(api_key=api_key)
+            kwargs = {
+                "model": GROQ_MODEL,
+                "messages": messages,
+                "temperature": temperature,
+            }
+            if response_format is not None:
+                kwargs["response_format"] = response_format
+
+            completion = client.chat.completions.create(**kwargs)
+            content = completion.choices[0].message.content
+            if not content:
+                raise RuntimeError("Groq trả về nội dung rỗng.")
+            return content
+        except Exception as e:
+            # Không ghi API key ra log. Mọi lỗi đều thử key tiếp theo để tránh
+            # tình trạng key mới hợp lệ nhưng bot mắc kẹt ở một key cũ bị lỗi.
+            err_text = str(e)
+            errors.append(f"key#{key_index + 1}: {err_text}")
+            logger.warning(
+                "Groq lỗi với key #%s / model %s: %s",
+                key_index + 1, GROQ_MODEL, err_text
+            )
+            _advance_ai_key()
+
+    last_error = errors[-1] if errors else "không xác định"
+    raise RuntimeError(
+        f"Không gọi được Groq sau {attempts} key. Lỗi cuối: {last_error}"
+    )
 
 # =====================================================================
 # ---> CẤU HÌNH LƯU TRỮ ĐÁM MÂY (JSONBIN) BẢO TOÀN DỮ LIỆU <---
@@ -217,16 +285,93 @@ def process_price_excel(file_bytes):
         logger.error(f"Lỗi nạp bảng giá: {e}")
         return False, str(e)
 
+def _safe_number(value):
+    """Đọc số từ dữ liệu Excel đã ép sang chuỗi; trả None nếu không phải số tiền hợp lệ."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s or s.lower() in ('nan', 'none', 'null'):
+        return None
+
+    # Excel thường lưu số thành 525909 hoặc 525909.0. Với chuỗi có cả dấu
+    # chấm/phẩy, ưu tiên cách đọc phổ biến của dữ liệu số do pandas sinh ra.
+    try:
+        cleaned = s.replace(' ', '')
+        if ',' in cleaned and '.' not in cleaned:
+            # 525,909 -> 525909; 525,5 -> 525.5 (phân biệt theo phần sau dấu phẩy)
+            tail = cleaned.rsplit(',', 1)[-1]
+            cleaned = cleaned.replace(',', '.') if len(tail) <= 2 else cleaned.replace(',', '')
+        else:
+            cleaned = cleaned.replace(',', '')
+        number = float(cleaned)
+        return number
+    except Exception:
+        m = re.search(r'-?\d+(?:[\.,]\d+)?', s)
+        if not m:
+            return None
+        try:
+            return float(m.group(0).replace(',', '.'))
+        except Exception:
+            return None
+
+
+def _format_money(value):
+    number = _safe_number(value)
+    if number is None or number < 1000:
+        return "Chưa có thông tin"
+    rounded = int(round(number / 1000.0) * 1000)
+    return f"{rounded:,.0f}".replace(',', '.')
+
+
+def _fallback_price_response(found_item, sheet_name):
+    """Fallback không dùng AI để chức năng báo giá vẫn hoạt động khi Groq lỗi."""
+    entries = [(str(k), v) for k, v in found_item.items() if 'unnamed' not in str(k).lower()]
+
+    def norm(s):
+        s = unicodedata.normalize('NFD', str(s).lower())
+        return ''.join(c for c in s if unicodedata.category(c) != 'Mn')
+
+    def pick(predicate, prefer_last=False):
+        found = [(k, v) for k, v in entries if predicate(norm(k))]
+        if not found:
+            return None
+        return found[-1][1] if prefer_last else found[0][1]
+
+    code = None
+    for k, v in entries:
+        nk = norm(k)
+        if 'ma hang' in nk or 'ma sp' in nk or 'ma san pham' in nk:
+            code = str(v).strip()
+            break
+    code = code or "Sản phẩm"
+
+    niem_yet = pick(lambda k: 'niem yet' in k)
+    vat10 = pick(lambda k: ('gia nhap' in k and 'vat 10' in k) or '+vat 10' in k)
+    vat8 = pick(lambda k: ('gia moi' in k and 'vat 8' in k) or ('gia nhap' in k and 'bao gom vat' in k))
+
+    # Pandas đặt tên cột trùng dạng "- VAT", "- VAT.1"...; ưu tiên cột sau.
+    no_vat_candidates = [(k, v) for k, v in entries if norm(k).strip().startswith('- vat')]
+    no_vat = no_vat_candidates[-1][1] if no_vat_candidates else None
+
+    return (
+        f"📦 *{code}*\n"
+        f"📅 Bảng giá tháng ({sheet_name})\n"
+        f"💰 *Giá nhập:*\n"
+        f"- *VAT 10%: * {_format_money(vat10)} VNĐ\n"
+        f"- *VAT 8%: * {_format_money(vat8)} VNĐ\n"
+        f"- *Giá niêm yết: * {_format_money(niem_yet)} VNĐ\n"
+        f"- *Giá chưa VAT: * {_format_money(no_vat)} VNĐ"
+    )
+
+
 def ask_groq_ai(query):
-    global current_key_index
-    
     if not os.path.exists(PRICE_DATA_FILE):
         return "Anh chưa có dữ liệu bảng giá. Các con vợ gửi file Excel để nạp nhé!"
 
     try:
         with open(PRICE_DATA_FILE, 'r', encoding='utf-8') as f:
             cache = json.load(f)
-            
+
         if isinstance(cache, list):
             full_data = cache
             sheet_name = "Mới nhất"
@@ -236,7 +381,7 @@ def ask_groq_ai(query):
 
         query_upper = query.upper()
         found_item = None
-        
+
         for item in full_data:
             key_ma = next((k for k in item.keys() if "mã" in k.lower() and ("hàng" in k.lower() or "sp" in k.lower())), None)
             if key_ma:
@@ -244,7 +389,7 @@ def ask_groq_ai(query):
                 if ma_sp and ma_sp in query_upper:
                     found_item = item
                     break
-        
+
         if not found_item:
             return "Anh không tìm thấy mã hàng này trong bảng giá."
 
@@ -254,9 +399,9 @@ def ask_groq_ai(query):
         Dữ liệu sản phẩm: {clean_info}
         Tên bảng giá: {sheet_name}
         Câu hỏi: "{query}"
-        
+
         NHIỆM VỤ: Trả lời chính xác theo FORM mẫu bên dưới.
-        
+
         QUY TẮC XỬ LÝ SỐ LIỆU (BẮT BUỘC):
         1. *CHẶN SỐ RÁC:* Bất kỳ con số nào nhỏ hơn 1000 (Ví dụ: 0, 0.3, 0.15, 30, 40) => ĐÓ LÀ CHIẾT KHẤU HOẶC RÁC. BỎ QUA NGAY.
         2. *TÌM CỘT GIÁ:*
@@ -266,7 +411,7 @@ def ask_groq_ai(query):
            - "Giá chưa VAT": Cột '- VAT' (giá cũ) hoặc '- VAT.1' (giá mới 8%). Ưu tiên lấy giá ở cột '- VAT.1' (cột sau) nếu có.
         3. *LÀM TRÒN:* Luôn làm tròn số đến hàng nghìn (VD: 525909 -> 526.000).
         4. Nếu một loại giá là 0 hoặc không tìm thấy, ghi "Chưa có thông tin".
-        
+
         FORM TRẢ LỜI (Copy y nguyên):
         📦 *[Mã SP]*
         📅 Bảng giá tháng ({sheet_name})
@@ -277,32 +422,17 @@ def ask_groq_ai(query):
         - *Giá chưa VAT: * [Số tiền] VNĐ
         """
 
-        for _ in range(3):
-            api_key = AI_KEYS[current_key_index]
-            if not api_key:
-                current_key_index = (current_key_index + 1) % 3
-                continue
-            try:
-                client = Groq(api_key=api_key)
-                completion = client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0
-                )
-                return completion.choices[0].message.content
-            except Exception as e:
-                if "429" in str(e):
-                    current_key_index = (current_key_index + 1) % 3
-                    continue
-                return f"Lỗi AI: {e}"
-        
-        return "Hệ thống AI đang bận, các con vợ thử lại sau nhé!"
+        try:
+            return call_groq_chat(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0
+            )
+        except Exception as e:
+            logger.error(f"AI báo giá không khả dụng, dùng fallback cục bộ: {e}")
+            return _fallback_price_response(found_item, sheet_name)
 
     except Exception as e:
         return f"Lỗi hệ thống: {e}"
-
-
-# ---------------- CÁC HÀM HỖ TRỢ REAL-TIME CHO AI ----------------
 
 def get_realtime_weather(location="Hà Nội"):
     try:
@@ -341,75 +471,238 @@ def perform_web_search(query):
     except Exception as e:
         return f"Lỗi khi lướt web tìm kiếm: {e}"
 
+def _normalize_vn_text(value):
+    """Chuẩn hóa tiếng Việt để so khớp câu lệnh nhưng không làm thay đổi nội dung gốc."""
+    s = unicodedata.normalize('NFD', str(value).lower())
+    s = ''.join(c for c in s if unicodedata.category(c) != 'Mn')
+    s = s.replace('đ', 'd')
+    return re.sub(r'\s+', ' ', s).strip()
+
+
+def _looks_like_product_code(text):
+    """Chỉ coi chuỗi liền có ít nhất một chữ số là mã SP; tránh biến câu tự nhiên thành mã."""
+    s = str(text).strip()
+    if not s or len(s) > 40 or re.search(r'\s', s):
+        return False
+    if not re.search(r'\d', s):
+        return False
+    return re.fullmatch(r'[A-Za-z0-9._/\-]+', s) is not None
+
+
+def _contains_product_code_in_text(text):
+    """Nhận diện mã SP nằm trong câu hỏi giá, ví dụ: 'AC-161 giá bao nhiêu'."""
+    for token in re.findall(r'[A-Za-z][A-Za-z0-9._/\-]*\d[A-Za-z0-9._/\-]*', str(text)):
+        if _looks_like_product_code(token):
+            return True
+    return False
+
+
+def _parse_date_token(token, default_month, default_year):
+    nums = [int(x) for x in re.findall(r'\d+', token)]
+    if not nums:
+        return None
+
+    if len(nums) >= 3:
+        a, b, c = nums[0], nums[1], nums[2]
+        # Hỗ trợ cả YYYY-MM-DD lẫn DD/MM/YYYY.
+        if a >= 1000:
+            year, month, day = a, b, c
+        else:
+            day, month, year = a, b, c
+            if year < 100:
+                year += 2000
+    elif len(nums) == 2:
+        day, month = nums
+        year = default_year
+    else:
+        day = nums[0]
+        month = default_month
+        year = default_year
+
+    try:
+        return datetime(year, month, day)
+    except ValueError:
+        return None
+
+
+def _extract_date_range(user_input):
+    """Hiểu các kiểu: từ ngày 2 đến ngày 20, 2/9 đến 20/9, 2026-09-02 đến 2026-09-20."""
+    tz_vn = pytz.timezone("Asia/Ho_Chi_Minh")
+    now = datetime.now(tz_vn)
+    norm = _normalize_vn_text(user_input)
+
+    m = re.search(
+        r'(?:tu\s+(?:ngay\s+)?)'
+        r'(?P<start>\d{1,4}(?:[./-]\d{1,2})?(?:[./-]\d{1,4})?)'
+        r'\s*(?:den|toi)\s*(?:ngay\s+)?'
+        r'(?P<end>\d{1,4}(?:[./-]\d{1,2})?(?:[./-]\d{1,4})?)',
+        norm
+    )
+    if not m:
+        return None
+
+    start_token = m.group('start')
+    end_token = m.group('end')
+    start_dt = _parse_date_token(start_token, now.month, now.year)
+    if not start_dt:
+        return None
+
+    # Nếu ngày kết thúc không ghi tháng/năm thì dùng tháng/năm của ngày bắt đầu.
+    end_dt = _parse_date_token(end_token, start_dt.month, start_dt.year)
+    if not end_dt:
+        return None
+
+    return start_dt.strftime('%Y-%m-%d'), end_dt.strftime('%Y-%m-%d')
+
+
+def _deterministic_intent(user_input):
+    """
+    Điều hướng các nghiệp vụ cốt lõi bằng rule trước khi gọi AI.
+    Mục đích: Groq lỗi/đổi model vẫn không làm mất các chức năng Odoo cũ.
+    """
+    original = str(user_input).strip()
+    norm = _normalize_vn_text(original)
+
+    # Báo cáo đơn hàng theo khoảng ngày - ưu tiên trước "Đơn hàng <khách>".
+    if ('don hang' in norm or 'bao cao' in norm or 'tong hop' in norm) and (' tu ' in f' {norm} ' and (' den ' in f' {norm} ' or ' toi ' in f' {norm} ')):
+        date_range = _extract_date_range(original)
+        if date_range:
+            return {
+                "action": "export_report",
+                "start_date": date_range[0],
+                "end_date": date_range[1],
+                "source": "rule"
+            }
+
+    # Kiểm tra chi tiết một mã đơn.
+    m_order = re.search(
+        r'^(?:kiem tra|check|xem)(?:\s+chi tiet)?\s+(?:don hang|don)\s+(.+)$',
+        norm
+    )
+    if m_order:
+        # Lấy lại phần mã từ câu gốc để không mất ký tự / - .
+        original_match = re.search(
+            r'^(?:kiểm\s*tra|kiem\s*tra|check|xem)(?:\s+chi\s*tiết|\s+chi\s*tiet)?\s+'
+            r'(?:đơn\s*hàng|don\s*hang|đơn|don)\s+(.+)$',
+            original,
+            flags=re.IGNORECASE
+        )
+        code = (original_match.group(1) if original_match else m_order.group(1)).strip()
+        return {"action": "check_single_order", "order_code": code, "source": "rule"}
+
+    # Xuất đơn hàng theo khách: "Đơn hàng HC", "đơn hàng của HC".
+    m_customer = re.match(r'^don hang(?: cua)?\s+(.+)$', norm)
+    if m_customer:
+        original_match = re.match(
+            r'^đơn\s*hàng(?:\s+của)?\s+(.+)$|^don\s*hang(?:\s+cua)?\s+(.+)$',
+            original,
+            flags=re.IGNORECASE
+        )
+        if original_match:
+            customer = next((g for g in original_match.groups() if g), '').strip()
+        else:
+            customer = m_customer.group(1).strip()
+        if customer:
+            return {"action": "export_customer_orders", "customer_name": customer, "source": "rule"}
+
+    # Mã sản phẩm được nhận dạng cục bộ, không cần tốn một lượt AI.
+    if _looks_like_product_code(original):
+        return {"action": "stock_search", "source": "rule"}
+
+    # Thời tiết: có thể tự xác định action; AI chỉ cần thiết cho câu hỏi mơ hồ hơn.
+    if 'thoi tiet' in norm:
+        m_weather = re.search(
+            r'(?:thời\s*tiết|thoi\s*tiet)(?:\s+(?:ở|o|tại|tai))?\s*(.*)$',
+            original,
+            flags=re.IGNORECASE
+        )
+        loc = (m_weather.group(1) if m_weather else '').strip(' ?!.')
+        return {"action": "weather", "location": loc or "Hà Nội", "source": "rule"}
+
+    # Một số nhóm tra cứu web rõ ràng.
+    if any(k in norm for k in ['tin tuc', 'thoi su', 'gia vang', 'world cup', 'bong da']):
+        return {"action": "web_search", "query": original, "source": "rule"}
+
+    return None
+
+
 def analyze_chat_intent(user_input):
-    global current_key_index
+    # Luồng nghiệp vụ rõ ràng chạy bằng rule trước, để không phụ thuộc uptime/model của Groq.
+    deterministic = _deterministic_intent(user_input)
+    if deterministic:
+        return deterministic
+
     tz_vn = pytz.timezone("Asia/Ho_Chi_Minh")
     current_time_str = datetime.now(tz_vn).strftime("%Y-%m-%d %H:%M:%S")
-    
+
     system_prompt = f"""
     Bạn là bộ não điều hướng. Thời gian hiện tại: {current_time_str}.
     Bạn xưng "Anh" và gọi người dùng là "con vợ" hoặc "các con vợ".
-    Nhiệm vụ của bạn là phân tích câu nói của người dùng và trả về DUY NHẤT một chuỗi JSON hợp lệ. KHÔNG giải thích.
-    
+    Nhiệm vụ của bạn là phân tích câu nói của người dùng và trả về DUY NHẤT một JSON object hợp lệ. KHÔNG giải thích.
+
     Quy tắc phân loại (QUAN TRỌNG):
     1. Nếu yêu cầu THỐNG KÊ / BÁO CÁO ĐƠN HÀNG từ ngày này đến ngày khác:
     -> {{"action": "export_report", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD"}}
-    
+
     2. Nếu yêu cầu XUẤT ĐƠN HÀNG của MỘT KHÁCH HÀNG cụ thể:
     -> {{"action": "export_customer_orders", "customer_name": "Tên khách hàng cần tìm"}}
-    
+
     3. Nếu yêu cầu KIỂM TRA CHI TIẾT 1 MÃ ĐƠN HÀNG cụ thể:
     -> {{"action": "check_single_order", "order_code": "Mã đơn hàng"}}
-    
+
     4. Nếu người dùng hỏi về THỜI TIẾT:
     -> {{"action": "weather", "location": "Tên địa phương"}}
-    
+
     5. Nếu người dùng hỏi TIN TỨC, thời sự, thể thao, giá vàng, hoặc cần tra cứu kiến thức mạng:
     -> {{"action": "web_search", "query": "Từ khóa tìm kiếm tối ưu (ngắn gọn)"}}
-    
+
     6. Nếu câu lệnh CHỈ LÀ MÃ SẢN PHẨM (chuỗi ngắn, liền nhau, vd: 'SP01', 'IPHONE12'):
     -> {{"action": "stock_search"}}
-    
+
     7. Nếu là câu giao tiếp bình thường (chào hỏi, tâm sự, trêu đùa không cần cào mạng):
     -> {{"action": "chat", "response": "Câu trả lời dí dỏm, thông minh của Anh dành cho các con vợ"}}
     """
 
-    for _ in range(3):
-        api_key = AI_KEYS[current_key_index]
-        if not api_key:
-            current_key_index = (current_key_index + 1) % 3
-            continue
-        try:
-            client = Groq(api_key=api_key)
-            completion = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_input}
-                ],
-                temperature=0.1,
-                response_format={"type": "json_object"}
-            )
-            return json.loads(completion.choices[0].message.content)
-        except Exception as e:
-            if "429" in str(e):
-                current_key_index = (current_key_index + 1) % 3
-                continue
-            return {"action": "error", "response": f"Lỗi phân tích AI: {e}"}
-            
-    return {"action": "error", "response": "Server AI đang quá tải, con vợ thử lại sau nhé!"}
+    try:
+        content = call_groq_chat(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_input}
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"}
+        )
+        result = json.loads(content)
+        action = result.get('action')
+        allowed_actions = {
+            'export_report', 'export_customer_orders', 'check_single_order',
+            'weather', 'web_search', 'news', 'stock_search', 'chat'
+        }
+        if action not in allowed_actions:
+            raise ValueError(f"AI trả action không hợp lệ: {action}")
+        return result
+    except Exception as e:
+        logger.error(f"Lỗi phân tích ý định AI: {e}")
+        return {
+            "action": "error",
+            "response": (
+                "⚠️ Bộ AI hiện không phản hồi nên Anh không tự đoán câu lệnh này. "
+                "Các lệnh Odoo cố định và các mẫu như 'Đơn hàng HC', 'Kiểm tra đơn SO001', "
+                "mã sản phẩm vẫn hoạt động bình thường."
+            ),
+            "detail": str(e)
+        }
 
 def generate_witty_response(user_input, topic, real_data):
-    global current_key_index
     system_prompt = f"""
     Bạn là một trợ lý AI thông minh, dí dỏm. Bạn xưng "Anh" và gọi người dùng là "con vợ" hoặc "các con vợ".
-    Người dùng vừa hỏi về: {topic}. 
+    Người dùng vừa hỏi về: {topic}.
     Dưới đây là THÔNG TIN THỰC TẾ CHÍNH XÁC được cào từ Internet:
     ---
     {real_data}
     ---
     Nhiệm vụ: Trả lời câu hỏi '{user_input}'.
-    
+
     LUẬT THÉP:
     1. Tổng hợp thông tin từ dữ liệu được cung cấp một cách khéo léo, tự nhiên như người thật đang đọc báo cho các con vợ nghe. KHÔNG copy paste nguyên xi.
     2. Nếu thông tin cào được bị thiếu hoặc không rõ ràng, hãy trả lời dựa trên những gì tốt nhất có được và thành thật báo các con vợ là tin này chưa đầy đủ.
@@ -418,81 +711,54 @@ def generate_witty_response(user_input, topic, real_data):
     5. KHÔNG VIẾT DÀI DÒNG. Tối đa 4-5 câu.
     6. TUYỆT ĐỐI KHÔNG dùng 2 dấu sao để in đậm. Chỉ dùng 1 dấu sao (*Nội dung*) để in đậm theo chuẩn Telegram.
     """
-    for _ in range(3):
-        api_key = AI_KEYS[current_key_index]
-        if not api_key:
-            current_key_index = (current_key_index + 1) % 3
-            continue
-        try:
-            client = Groq(api_key=api_key)
-            completion = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "system", "content": system_prompt}],
-                temperature=0.5
-            )
-            return completion.choices[0].message.content
-        except Exception:
-            if "429" in str(Exception):
-                current_key_index = (current_key_index + 1) % 3
-                continue
-            return f"Thông tin nguyên bản đây con vợ ơi: \n{real_data}"
-    return real_data
+    try:
+        return call_groq_chat(
+            messages=[{"role": "system", "content": system_prompt}],
+            temperature=0.5
+        )
+    except Exception as e:
+        logger.error(f"Lỗi AI tổng hợp câu trả lời: {e}")
+        return f"Thông tin nguyên bản đây con vợ ơi:\n{real_data}"
 
-# =====================================================================
-# ---> [NEW] TÍNH NĂNG BOT TỰ ĐỘNG CÀ KHỊA & PHÁN QUẺ (TÂM LINH) <---
-# =====================================================================
 async def auto_troll_message(context: ContextTypes.DEFAULT_TYPE):
     """Hàm tự động gọi AI để sinh tin nhắn cà khịa/tâm linh ngẫu nhiên"""
     chat_ids = get_registered_chat_ids()
     if not chat_ids:
-        return 
-        
+        return
+
     # Tỷ lệ 30% kích hoạt mỗi lần chạy để tạo sự ngẫu nhiên thực sự
     if random.random() > 0.3:
         return
 
-    global current_key_index
     prompt = """
     Bạn là một trợ lý AI quản lý kho Odoo đanh đá, xéo xắt, xưng "Anh" và gọi "con vợ" hoặc "các con vợ".
-    Bây giờ, hãy chủ động gửi MỘT tin nhắn ngắn (2-3 câu) vào group chat phòng Sales. 
+    Bây giờ, hãy chủ động gửi MỘT tin nhắn ngắn (2-3 câu) vào group chat phòng Sales.
     Ngẫu nhiên chọn 1 trong 2 chủ đề:
     1. Tâm linh: Bói một quẻ vui, phán hướng chốt đơn, hoặc giờ hoàng đạo để gọi khách.
     2. Cà khịa: Trêu chọc các con vợ lười biếng, ế đơn, mải lướt điện thoại, khịa doanh số.
     Bắt buộc: Giọng điệu hài hước, mặn mòi, dùng từ lóng mạng. Không cần chào hỏi, vào thẳng vấn đề luôn.
     TUYỆT ĐỐI KHÔNG dùng 2 dấu sao để in đậm. Chỉ dùng 1 dấu sao (*Nội dung*) để in đậm theo chuẩn Telegram.
     """
-    
-    ai_msg = "Nay Anh bị đau họng không chửi được..." 
-    for _ in range(3):
-        api_key = AI_KEYS[current_key_index]
-        if not api_key:
-            current_key_index = (current_key_index + 1) % 3
-            continue
-        try:
-            client = Groq(api_key=api_key)
-            completion = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.8 
-            )
-            ai_msg = completion.choices[0].message.content
-            break
-        except Exception as e:
-            logger.error(f"Lỗi AI auto troll: {e}")
-            current_key_index = (current_key_index + 1) % 3
+
+    ai_msg = "Nay Anh bị đau họng không chửi được..."
+    try:
+        ai_msg = call_groq_chat(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.8
+        )
+    except Exception as e:
+        logger.error(f"Lỗi AI auto troll: {e}")
 
     for cid in chat_ids:
         try:
             await context.bot.send_message(
-                chat_id=cid, 
-                text=f"🤖 *[Góc Vô Tri]*\n_{ai_msg}_", 
+                chat_id=cid,
+                text=f"🤖 *[Góc Vô Tri]*\n_{ai_msg}_",
                 parse_mode='Markdown'
             )
         except Exception as e:
             logger.error(f"Lỗi gửi auto troll cho {cid}: {e}")
 
-
-# ---------------- Keep port open (Render free) ----------------
 def keep_port_open():
     try:
         s = socket.socket()
@@ -1587,17 +1853,20 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("❌ Mã kho không hợp lệ. Nhập đúng ID kho trong danh sách hoặc gõ 'hủy' để thoát.")
             return
 
-    # --- 2. Báo Giá (Luồng tĩnh ưu tiên) ---
-    if any(k in user_input_lower for k in ['giá', 'bao nhiêu', 'vat', 'bảng giá', 'price']):
+    # --- 2. Báo Giá (Luồng tĩnh ưu tiên - giữ nguyên cách gọi cũ) ---
+    if (
+        any(k in user_input_lower for k in ['giá', 'bao nhiêu', 'vat', 'bảng giá', 'price'])
+        and _contains_product_code_in_text(user_input)
+    ):
         await update.message.reply_text("⌛️ Anh đang tra bảng giá xíu...")
         answer = ask_groq_ai(user_input)
         await update.message.reply_text(answer, parse_mode='Markdown')
         return
 
-    # --- 3. GIAO CHO AI PHÂN TÍCH Ý ĐỊNH VÀ ĐIỀU HƯỚNG ---
+    # --- 3. PHÂN TÍCH Ý ĐỊNH: rule nghiệp vụ trước, Groq cho câu linh hoạt sau ---
     ai_intent = analyze_chat_intent(user_input)
     action = ai_intent.get("action")
-    
+
     if action == "export_customer_orders":
         customer_name = ai_intent.get("customer_name", "").strip()
         if customer_name:
@@ -1605,7 +1874,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             await update.message.reply_text("Con vợ muốn tra đơn của khách nào? Gõ tên khách cho Anh với nhé!")
         return
-        
+
     elif action == "check_single_order":
         order_code = ai_intent.get("order_code", "").strip().upper()
         if order_code:
@@ -1617,9 +1886,12 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif action == "export_report":
         start_d = ai_intent.get("start_date")
         end_d = ai_intent.get("end_date")
-        await export_orders_by_date_range(update, context, start_d, end_d)
+        if start_d and end_d:
+            await export_orders_by_date_range(update, context, start_d, end_d)
+        else:
+            await update.message.reply_text("❌ Anh chưa hiểu đủ khoảng ngày. Ví dụ: `Tổng hợp đơn hàng từ ngày 2 đến ngày 20`", parse_mode='Markdown')
         return
-        
+
     elif action == "weather":
         loc = ai_intent.get("location", "Hà Nội")
         await update.message.reply_text("🌤 Đang đưa mặt ra ngoài cửa sổ đo thời tiết cho các con vợ...")
@@ -1627,7 +1899,7 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         final_answer = generate_witty_response(user_input, f"Thời tiết tại {loc}", weather_data)
         await update.message.reply_text(final_answer)
         return
-        
+
     elif action == "news" or action == "web_search":
         search_query = ai_intent.get("query", user_input)
         await update.message.reply_text(f"📰 Đang lướt mạng tra cứu '{search_query}' cho các con vợ...")
@@ -1635,12 +1907,22 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         final_answer = generate_witty_response(user_input, "Thông tin mạng hiện tại", news_data)
         await update.message.reply_text(final_answer)
         return
-        
+
     elif action == "chat":
         await update.message.reply_text(ai_intent.get("response", "Lỗi rồi con vợ ơi!"))
         return
 
-    # --- 4. LOGIC ODOO: Tra tồn kho sản phẩm (Fallback) ---
+    elif action == "error":
+        # QUAN TRỌNG: AI lỗi không được phép rơi xuống nhánh tra tồn như bản cũ.
+        await update.message.reply_text(ai_intent.get("response", "⚠️ AI hiện không phản hồi, thử lại sau nhé."))
+        return
+
+    elif action != "stock_search":
+        # Chặn mọi action lạ để không biến câu tự nhiên thành mã sản phẩm.
+        await update.message.reply_text("❌ Anh chưa xác định được yêu cầu này. Gõ /help để xem các mẫu lệnh đang hỗ trợ nhé.")
+        return
+
+    # --- 4. LOGIC ODOO: Tra tồn kho sản phẩm (GIỮ NGUYÊN THUẬT TOÁN CŨ) ---
     product_code = user_input.upper()
     await update.message.reply_text(f"Đang tra tồn cho `{product_code}`, vui lòng chờ!", parse_mode='Markdown')
 
@@ -1773,9 +2055,6 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         logger.error(f"lỗi khi tra tồn: {e}")
         await update.message.reply_text(f"❌ lỗi khi tra tồn: {e}")
-
-
-# ---------------- Telegram Handlers ----------------
 
 def get_daily_movement_report():
     uid, models, error_msg = connect_odoo()
@@ -2307,39 +2586,83 @@ threading.Thread(target=watchdog_batch, daemon=True).start()
 # ---> LOGIC TÍNH NĂNG FORM LÊN ĐƠN (NÚT BẤM) <---
 # =====================================================================
 
+def _parse_order_products_local(raw_text):
+    """Fallback parser cho /lendon khi Groq không phản hồi."""
+    results = []
+    chunks = [c.strip() for c in re.split(r'[\n;,]+', str(raw_text)) if c.strip()]
+
+    for chunk in chunks:
+        # Mã sản phẩm: chuỗi không có khoảng trắng, có ít nhất một chữ số.
+        code_match = re.search(r'(?i)\b(?=[A-Z0-9._/\-]*\d)[A-Z][A-Z0-9._/\-]*\b', chunk)
+        if not code_match:
+            continue
+        code = code_match.group(0).upper()
+
+        # Chiết khấu.
+        discount = 0.0
+        ck = re.search(r'(?i)(?:ck|chi[eế]t\s*kh[aấ]u)\s*[:=]?\s*(\d+(?:[.,]\d+)?)\s*%?', chunk)
+        if ck:
+            try:
+                discount = float(ck.group(1).replace(',', '.'))
+            except Exception:
+                discount = 0.0
+
+        # Số lượng: ưu tiên ký hiệu x/sl/số lượng, sau đó số ngay sau mã.
+        qty = None
+        qm = re.search(r'(?i)(?:\bx\s*|\bsl\s*[:=]?\s*|s[oố]\s*l[uư][oợ]ng\s*[:=]?\s*)(\d+)', chunk)
+        if qm:
+            qty = int(qm.group(1))
+        else:
+            tail = chunk[code_match.end():]
+            qm = re.search(r'^\s*[:xX*\-]?\s*(\d+)\b', tail)
+            if qm:
+                qty = int(qm.group(1))
+
+        if qty is None or qty <= 0:
+            qty = 1
+
+        results.append({"code": code, "qty": qty, "discount": discount})
+
+    return results
+
+
 def parse_order_products_ai(raw_text):
-    global current_key_index
     prompt = f"""
     Văn bản sản phẩm thô: "{raw_text}"
-    Nhiệm vụ: Hãy trích xuất các sản phẩm, số lượng, và phần trăm chiết khấu (nếu có) thành chuỗi JSON hợp lệ.
-    Định dạng JSON trả về bắt buộc phải là một mảng Object có dạng:
-    [
+    Nhiệm vụ: Hãy trích xuất các sản phẩm, số lượng, và phần trăm chiết khấu (nếu có) thành JSON object hợp lệ.
+    Định dạng BẮT BUỘC:
+    {{
+      "products": [
         {{"code": "MÃ_SP_VIẾT_HOA", "qty": SỐ_LƯỢNG_SỐ_NGUYÊN, "discount": PHẦN_TRĂM_CK_SỐ_THỰC_HOẶC_0}}
-    ]
-    KHÔNG GIẢI THÍCH, CHỈ TRẢ VỀ DUY NHẤT CHUỖI JSON.
+      ]
+    }}
+    KHÔNG GIẢI THÍCH, CHỈ TRẢ VỀ JSON OBJECT.
     """
-    for _ in range(3):
-        api_key = AI_KEYS[current_key_index]
-        if not api_key:
-            current_key_index = (current_key_index + 1) % 3
-            continue
-        try:
-            client = Groq(api_key=api_key)
-            completion = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                response_format={"type": "json_object"}
-            )
-            res_json = json.loads(completion.choices[0].message.content)
-            key = list(res_json.keys())[0] if res_json.keys() else None
-            if isinstance(res_json, list): return res_json
-            if isinstance(res_json.get(key), list): return res_json[key]
-            return []
-        except Exception as e:
-            logger.error(f"Lỗi AI parse hàng hóa: {e}")
-            current_key_index = (current_key_index + 1) % 3
-    return []
+    try:
+        content = call_groq_chat(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            response_format={"type": "json_object"}
+        )
+        res_json = json.loads(content)
+        products = res_json.get('products', []) if isinstance(res_json, dict) else []
+        if isinstance(products, list) and products:
+            cleaned = []
+            for p in products:
+                try:
+                    code = str(p.get('code', '')).strip().upper()
+                    qty = int(float(p.get('qty', 0)))
+                    discount = float(p.get('discount', 0) or 0)
+                    if code and qty > 0:
+                        cleaned.append({"code": code, "qty": qty, "discount": discount})
+                except Exception:
+                    continue
+            if cleaned:
+                return cleaned
+    except Exception as e:
+        logger.error(f"Lỗi AI parse hàng hóa, chuyển sang parser cục bộ: {e}")
+
+    return _parse_order_products_local(raw_text)
 
 async def start_lendon_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.message.chat_id)
@@ -2922,6 +3245,10 @@ def main():
         return
 
     load_cloud_db() # Tải dữ liệu JSONBin
+
+    logger.info("Groq model: %s | Số API key đã nạp: %s", GROQ_MODEL, len(AI_KEYS))
+    if not AI_KEYS:
+        logger.warning("Chưa có Groq API key. Các nghiệp vụ rule/Odoo vẫn chạy; chat AI sẽ báo không khả dụng.")
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
