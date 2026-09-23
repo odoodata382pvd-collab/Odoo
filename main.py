@@ -15,10 +15,11 @@ import random
 import calendar
 import difflib
 import hashlib
+import html
 from datetime import datetime, timedelta, time as dt_time
 from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 import pytz
 import json
@@ -88,6 +89,11 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 TELEGRAM_SAFE_TEXT_LIMIT = 3500
+
+
+def _tg_html(value):
+    """Escape dynamic text before putting it inside Telegram HTML messages."""
+    return html.escape(str(value if value is not None else ""), quote=False)
 
 def _split_telegram_text(text, limit=TELEGRAM_SAFE_TEXT_LIMIT):
     """Chia văn bản dài thành các đoạn an toàn dưới giới hạn 4096 ký tự của Telegram.
@@ -2856,21 +2862,22 @@ async def handle_product_code(update: Update, context: ContextTypes.DEFAULT_TYPE
         final_list = priority_items + other_items
 
         msg = (
-            f"{product_code} {product_name}\n"
-            f"Tồn kho HN: {int(hn_stock_qty)}\n"
-            f"Tồn kho HCM: {int(hcm_stock_qty)}\n"
-            f"Tồn kho nhập Hà Nội: {int(hn_transit_qty)}\n"
-            f"=> Đề xuất nhập thêm {int(recommend)} sp để HN đủ tồn {TARGET_MIN_QTY} sản phẩm.\n\n"
-            "2/ Tồn kho chi tiết(Có hàng):"
+            f"📦 <b>{_tg_html(product_code)} — {_tg_html(product_name)}</b>\n\n"
+            "<b>TỒN CHÍNH</b>\n"
+            f"• Hà Nội: <b>{int(hn_stock_qty)}</b>\n"
+            f"• HCM: <b>{int(hcm_stock_qty)}</b>\n"
+            f"• Kho nhập Hà Nội: <b>{int(hn_transit_qty)}</b>\n\n"
+            f"🚚 <b>Đề xuất kéo:</b> {int(recommend)} sp để HN đạt mức {TARGET_MIN_QTY} sp.\n\n"
+            "🏭 <b>TỒN CHI TIẾT — CÓ HÀNG</b>"
         )
 
         if final_list:
             for loc_name, qty in final_list:
-                msg += f"\n{loc_name}: {qty}"
+                msg += f"\n• {_tg_html(loc_name)}: <b>{qty}</b>"
         else:
-            msg += "\nKhông có tồn kho chi tiết lớn hơn 0."
+            msg += "\n• Không có tồn kho chi tiết lớn hơn 0."
 
-        await update.message.reply_text(msg.strip())
+        await update.message.reply_text(msg.strip(), parse_mode="HTML")
 
     except Exception as e:
         logger.error(f"lỗi khi tra tồn: {e}")
@@ -3040,35 +3047,357 @@ async def excel_report_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
 
+
+# =====================================================================
+# ---> GIAO DIỆN MENU PHÂN CẤP TELEGRAM <---
+# Chỉ là lớp điều hướng UI. Tất cả command/nghiệp vụ cũ vẫn được giữ nguyên.
+# =====================================================================
+MENU_MAIN = "🏠 Menu chính"
+MENU_BACK = "⬅️ Menu chính"
+
+
+def _main_menu_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            ["📦 Kho & PO", "🧾 Đơn hàng"],
+            ["📊 Doanh số", "🔎 Tra cứu & AI"],
+            ["👤 Nhân viên", "⚙️ Hệ thống"],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Chọn nhóm chức năng...",
+    )
+
+
+def _warehouse_menu_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            ["🔍 Tra tồn sản phẩm", "📥 Đề xuất kéo hàng"],
+            ["📄 Kiểm tra PO", "📊 Báo cáo kho ngày"],
+            ["🏭 Tồn kho theo kho", "🔄 Chuyển kho"],
+            [MENU_BACK],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Chọn chức năng kho...",
+    )
+
+
+def _orders_menu_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            ["🧾 Lên đơn Odoo", "👥 Đơn theo khách"],
+            ["🔎 Kiểm tra mã đơn", "📅 Tổng hợp theo ngày"],
+            [MENU_BACK],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Chọn chức năng đơn hàng...",
+    )
+
+
+def _sales_menu_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            ["📊 Tổng quan doanh số", "🚨 Điểm yếu"],
+            ["📍 Chọn điểm bán", "📈 Xu hướng 7 ngày"],
+            ["⚠️ Thiếu dữ liệu", "🔔 Theo dõi cảnh báo"],
+            [MENU_BACK],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Chọn báo cáo doanh số...",
+    )
+
+
+def _lookup_menu_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            ["💰 Hỏi giá sản phẩm", "📤 Cập nhật bảng giá"],
+            ["🌐 Hỏi AI / Internet", "🌤 Thời tiết / Tin tức"],
+            [MENU_BACK],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Chọn chức năng tra cứu...",
+    )
+
+
+def _staff_menu_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            ["👤 Báo danh Odoo"],
+            [MENU_BACK],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Chọn chức năng nhân viên...",
+    )
+
+
+def _system_menu_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            ["🔌 Kiểm tra Odoo", "ℹ️ Hướng dẫn nhanh"],
+            [MENU_BACK],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Chọn chức năng hệ thống...",
+    )
+
+
+def _set_menu_input_mode(context, mode):
+    context.user_data['menu_input_mode'] = mode
+
+
+def _clear_menu_input_mode(context):
+    context.user_data.pop('menu_input_mode', None)
+
+
+async def _menu_sales_store_picker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mở thẳng danh sách điểm bán bằng inline buttons."""
+    msg = await update.message.reply_text("📍 Đang tải danh sách điểm bán...")
+    try:
+        analysis = await _get_sales_analysis_async(force=True)
+        markup, page, max_page, total = _sales_store_list_buttons(analysis, page=0)
+        await msg.edit_text(
+            f"📍 <b>CHỌN ĐIỂM BÁN — {_tg_html(analysis['sheet_name'])}</b>\n"
+            f"Có <b>{total}</b> điểm · Trang {page+1}/{max_page+1}\n\n"
+            "Bấm vào điểm muốn xem để bot phân tích chi tiết.",
+            reply_markup=markup,
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error(f"Lỗi menu chọn điểm bán: {e}")
+        await msg.edit_text(f"❌ Không đọc được dữ liệu doanh số: {e}")
+
+
+async def _menu_sales_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    enabled = str(chat_id) in {str(x) for x in _sales_monitor_state().get('subscribers', [])}
+    await update.message.reply_text(
+        "🔔 <b>THEO DÕI DOANH SỐ</b>\n\n"
+        f"Trạng thái chat này: <b>{'ĐANG BẬT' if enabled else 'ĐANG TẮT'}</b>\n"
+        "Bấm nút bên dưới để thay đổi. <i>Bot chỉ đọc Google Sheet.</i>",
+        reply_markup=_sales_monitor_buttons(chat_id),
+        parse_mode="HTML",
+    )
+
+
+async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Điều hướng các nút menu. Không thay đổi logic của các command nghiệp vụ."""
+    text = (update.message.text or '').strip()
+
+    # ---- Menu cấp 1 ----
+    if text in {MENU_MAIN, MENU_BACK}:
+        _clear_menu_input_mode(context)
+        await update.message.reply_text("🏠 <b>MENU CHÍNH</b>\nChọn nhóm chức năng:", reply_markup=_main_menu_keyboard(), parse_mode="HTML")
+        return
+    if text == "📦 Kho & PO":
+        _clear_menu_input_mode(context)
+        await update.message.reply_text("📦 <b>KHO & PO</b>\nChọn chức năng:", reply_markup=_warehouse_menu_keyboard(), parse_mode="HTML")
+        return
+    if text == "🧾 Đơn hàng":
+        _clear_menu_input_mode(context)
+        await update.message.reply_text("🧾 <b>ĐƠN HÀNG</b>\nChọn chức năng:", reply_markup=_orders_menu_keyboard(), parse_mode="HTML")
+        return
+    if text == "📊 Doanh số":
+        _clear_menu_input_mode(context)
+        await update.message.reply_text("📊 <b>DOANH SỐ</b>\nChọn chức năng:", reply_markup=_sales_menu_keyboard(), parse_mode="HTML")
+        return
+    if text == "🔎 Tra cứu & AI":
+        _clear_menu_input_mode(context)
+        await update.message.reply_text("🔎 <b>TRA CỨU & AI</b>\nChọn chức năng:", reply_markup=_lookup_menu_keyboard(), parse_mode="HTML")
+        return
+    if text == "👤 Nhân viên":
+        _clear_menu_input_mode(context)
+        await update.message.reply_text("👤 <b>NHÂN VIÊN</b>\nChọn chức năng:", reply_markup=_staff_menu_keyboard(), parse_mode="HTML")
+        return
+    if text == "⚙️ Hệ thống":
+        _clear_menu_input_mode(context)
+        await update.message.reply_text("⚙️ <b>HỆ THỐNG</b>\nChọn chức năng:", reply_markup=_system_menu_keyboard(), parse_mode="HTML")
+        return
+
+    # ---- Kho & PO ----
+    if text == "🔍 Tra tồn sản phẩm":
+        _set_menu_input_mode(context, 'stock')
+        await update.message.reply_text("🔍 Nhập mã sản phẩm cần tra tồn. Ví dụ: AC-281")
+        return
+    if text == "📥 Đề xuất kéo hàng":
+        await excel_report_command(update, context)
+        return
+    if text == "📄 Kiểm tra PO":
+        await checkpo_command(update, context)
+        return
+    if text == "📊 Báo cáo kho ngày":
+        await daily_report_command(update, context)
+        return
+    if text == "🏭 Tồn kho theo kho":
+        _set_menu_input_mode(context, 'warehouse')
+        await update.message.reply_text("🏭 Nhập từ khóa tên/mã kho. Ví dụ: 201 hoặc HCM")
+        return
+    # "🔄 Chuyển kho" được ConversationHandler bắt trực tiếp ở entry_point.
+
+    # ---- Đơn hàng ----
+    # "🧾 Lên đơn Odoo" được ConversationHandler bắt trực tiếp ở entry_point.
+    if text == "👥 Đơn theo khách":
+        _set_menu_input_mode(context, 'customer_orders')
+        await update.message.reply_text("👥 Nhập tên khách hàng cần tổng hợp đơn. Ví dụ: HC")
+        return
+    if text == "🔎 Kiểm tra mã đơn":
+        _set_menu_input_mode(context, 'order_code')
+        await update.message.reply_text("🔎 Nhập mã đơn cần kiểm tra. Ví dụ: SO001")
+        return
+    if text == "📅 Tổng hợp theo ngày":
+        _set_menu_input_mode(context, 'date_range')
+        await update.message.reply_text("📅 Nhập khoảng ngày. Ví dụ: 2 đến 20 hoặc 02/09/2026 đến 20/09/2026")
+        return
+
+    # ---- Doanh số ----
+    if text == "📊 Tổng quan doanh số":
+        await doanhso_command(update, context)
+        return
+    if text == "🚨 Điểm yếu":
+        await canhbao_command(update, context)
+        return
+    if text == "📍 Chọn điểm bán":
+        await _menu_sales_store_picker(update, context)
+        return
+    if text == "📈 Xu hướng 7 ngày":
+        await xuhuong_command(update, context)
+        return
+    if text == "⚠️ Thiếu dữ liệu":
+        await thieudulieu_command(update, context)
+        return
+    if text == "🔔 Theo dõi cảnh báo":
+        await _menu_sales_monitor(update, context)
+        return
+
+    # ---- Tra cứu & AI ----
+    if text == "💰 Hỏi giá sản phẩm":
+        _set_menu_input_mode(context, 'price')
+        await update.message.reply_text("💰 Nhập câu hỏi giá kèm mã sản phẩm. Ví dụ: Giá AC-281 bao nhiêu?")
+        return
+    if text == "📤 Cập nhật bảng giá":
+        _clear_menu_input_mode(context)
+        await update.message.reply_text("📤 Gửi file Excel .xlsx bảng giá vào đây. Bot sẽ xử lý theo luồng bảng giá hiện có.")
+        return
+    if text in {"🌐 Hỏi AI / Internet", "🌤 Thời tiết / Tin tức"}:
+        _set_menu_input_mode(context, 'ai')
+        hint = "Nhập câu hỏi cần tra cứu." if text.startswith("🌐") else "Nhập câu hỏi thời tiết hoặc tin tức."
+        await update.message.reply_text(f"🌐 {hint}")
+        return
+
+    # ---- Nhân viên / hệ thống ----
+    if text == "👤 Báo danh Odoo":
+        _set_menu_input_mode(context, 'attendance')
+        await update.message.reply_text("👤 Nhập email đăng nhập Odoo của nhân viên.")
+        return
+    if text == "🔌 Kiểm tra Odoo":
+        await ping_command(update, context)
+        return
+    if text == "ℹ️ Hướng dẫn nhanh":
+        await update.message.reply_text(
+            "ℹ️ CÁCH DÙNG NHANH\n\n"
+            "• Chọn nhóm ở Menu chính rồi bấm chức năng cần dùng.\n"
+            "• Chức năng cần mã/tên sẽ hỏi tiếp ngay trong chat.\n"
+            "• Các lệnh / cũ vẫn hoạt động bình thường để dự phòng.\n"
+            "• Google Sheet doanh số chỉ được đọc, bot không có luồng ghi/sửa dữ liệu.",
+            reply_markup=_system_menu_keyboard(),
+        )
+        return
+
+    # Nếu không phải nút menu thì để global_text_filter xử lý như trước.
+    await handle_product_code(update, context)
+
+
+async def handle_menu_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Xử lý câu trả lời tiếp theo sau các nút cần nhập tham số."""
+    mode = context.user_data.get('menu_input_mode')
+    if not mode:
+        return False
+
+    text = (update.message.text or '').strip()
+    if not text:
+        return True
+    if text in {MENU_MAIN, MENU_BACK}:
+        _clear_menu_input_mode(context)
+        await update.message.reply_text("🏠 <b>MENU CHÍNH</b>\nChọn nhóm chức năng:", reply_markup=_main_menu_keyboard(), parse_mode="HTML")
+        return True
+
+    # Mỗi prompt chỉ dùng một lần để tránh khóa người dùng trong chế độ nhập.
+    _clear_menu_input_mode(context)
+
+    if mode == 'price':
+        # Luồng báo giá cũ chỉ kích hoạt khi câu hỏi có từ khóa giá + mã sản phẩm.
+        # Không tự biến mã hàng thành một nghiệp vụ khác; nếu người dùng chỉ gõ mã,
+        # nhắc nhập rõ câu hỏi giá rồi giữ nguyên mode để tránh bị chuyển sang tra tồn.
+        low = text.lower()
+        if not any(k in low for k in ['giá', 'bao nhiêu', 'vat', 'bảng giá', 'price']):
+            _set_menu_input_mode(context, 'price')
+            await update.message.reply_text(
+                "💰 Vui lòng nhập rõ câu hỏi giá. Ví dụ: Giá AC-281 bao nhiêu?"
+            )
+            return True
+        await handle_product_code(update, context)
+        return True
+
+    if mode in {'stock', 'ai'}:
+        # Giữ nguyên cổng AI/tra tồn cũ.
+        await handle_product_code(update, context)
+        return True
+
+    if mode == 'warehouse':
+        old_args = getattr(context, 'args', None)
+        context.args = text.split()
+        try:
+            await dotonkho_command(update, context)
+        finally:
+            context.args = old_args or []
+        return True
+
+    if mode == 'attendance':
+        old_args = getattr(context, 'args', None)
+        context.args = [text]
+        try:
+            await baodanh_command(update, context)
+        finally:
+            context.args = old_args or []
+        return True
+
+    if mode == 'customer_orders':
+        await export_customer_orders(update, context, text)
+        return True
+
+    if mode == 'order_code':
+        await check_single_order(update, context, text.upper())
+        return True
+
+    if mode == 'date_range':
+        date_range = _extract_date_range(f"từ {text}")
+        if not date_range:
+            _set_menu_input_mode(context, 'date_range')
+            await update.message.reply_text(
+                "❌ Chưa hiểu khoảng ngày. Nhập lại theo dạng: 2 đến 20 hoặc 02/09/2026 đến 20/09/2026"
+            )
+            return True
+        await export_orders_by_date_range(update, context, date_range[0], date_range[1])
+        return True
+
+    return False
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     register_chat_id(chat_id)
+    _clear_menu_input_mode(context)
 
-    name = update.message.from_user.first_name
+    name = update.message.from_user.first_name or "bạn"
     await update.message.reply_text(
-        f"Chào con vợ {name}!\n"
-        "1. Gõ mã sp để tra tồn.\n"
-        "2. Hỏi giá sản phẩm để Anh báo giá.\n"
-        "3. Gửi file Excel bảng giá để cập nhật.\n"
-        "4. `/keohang` để tạo báo cáo Excel kéo hàng.\n"
-        "5. `/checkpo` để đối chiếu tồn kho PO.\n"
-        "6. `/baocaongay` để xuất báo cáo Nhập/Xuất cuối ngày.\n"
-        "7. `/dotonkho <tên kho>` để xuất tồn 1 kho.\n"
-        "8. `/baodanh <email>` để báo danh nhân viên Odoo.\n"
-        "9. `/lendon` Form lên đơn hàng chuẩn Odoo từng bước.\n"
-        "10. `/chuyenkho` Form tạo phiếu chuyển kho nội bộ.\n"
-        "11. Gõ tên khách (VD:Đơn hàng HC) để xuất Excel đơn của khách.\n"
-        "12. Gõ mã đơn (VD:Kiểm tra đơn SO001) để xem chi tiết.\n"
-        "13. Hỏi bất cứ thông tin nào (World Cup, tin tức, thời tiết...).\n"
-        "14. Hoặc yêu cầu: 'Tổng hợp đơn hàng từ ngày 2 đến ngày 20'\n"
-        "15. `/ping` để kiểm tra kết nối Odoo.\n"
-        "16. `/doanhso` xem tiến độ doanh số Google Sheet.\n"
-        "17. `/canhbao` xem các điểm bán có nguy cơ yếu.\n"
-        "18. `/diemban <tên>` phân tích chi tiết một điểm.\n"
-        "19. `/xuhuong [tên điểm]` xem xu hướng 7 ngày.\n"
-        "20. `/thieudulieu` xem ngày thiếu doanh số/lịch ca.\n"
-        "21. `/theodoidoanhso on|off` bật/tắt cảnh báo tự động cho chat này.",
-        parse_mode='Markdown'
+        f"👋 <b>Chào {_tg_html(name)}!</b>\n\n"
+        "Chọn nhóm chức năng bên dưới. <i>Các lệnh cũ vẫn hoạt động nhưng không cần nhớ nữa.</i>",
+        reply_markup=_main_menu_keyboard(),
+        parse_mode="HTML",
     )
 
 
@@ -4281,9 +4610,88 @@ def _looks_like_store_name(name):
     terms = [
         "nguyen kim", "aeon", "kohan", "kohnan", "hc ", " hc", "media mart",
         "mediamart", "pico", "dien may", "big c", "go ", "vincom", "showroom",
-        "lotte", "mega market", "mm mega", "coop", "emart"
+        "lotte", "mega market", "mm mega", "coop", "emart", "mega ", "fpt",
+        "meta ", "livestream", "live tream", "nha sach", "nha phan phoi",
+        "me va be", "wundertute", "thanh ly"
     ]
-    return any(term in f" {n} " for term in terms)
+    padded = f" {n} "
+    return any(term in padded for term in terms)
+
+
+def _looks_like_employee_name(name):
+    """Nhận diện dòng nhân sự để không bao giờ xếp nhầm thành điểm bán.
+
+    Sheet thực tế có nhiều dòng nhân viên vẫn có Target, thậm chí cột D/E có '-'/0%
+    hoặc doanh số phụ. Vì vậy không thể dựa riêng vào C/D/E để phân loại.
+    Hàm này chỉ dùng tín hiệu tên người/chức danh rõ ràng; nếu không chắc thì để
+    các tín hiệu cấu trúc ở _row_is_store quyết định.
+    """
+    n = _normalize_name(name)
+    if not n:
+        return False
+
+    personnel_terms = [
+        "cong tac vien", "tuyen pg", "pg moi", "nhan su moi", "nhan vien",
+        "dai dien gian hang", "nhom truong", "tang cuong"
+    ]
+    if any(term in n for term in personnel_terms):
+        return True
+
+    # Ngoại lệ thương hiệu: "Nguyễn Kim ..." là tên chuỗi/điểm bán, không phải
+    # tên nhân viên dù bắt đầu bằng một họ Việt Nam phổ biến.
+    if n.startswith("nguyen kim"):
+        return False
+
+    # Các họ phổ biến trong danh sách nhân sự hiện tại. Nếu tên bắt đầu bằng họ
+    # người thì vẫn coi là nhân sự ngay cả khi phía sau có hậu tố điểm làm việc
+    # như "- HC HB" hoặc "(Livestream)".
+    vietnamese_surnames = {
+        "nguyen", "tran", "le", "pham", "hoang", "huynh", "phan", "vu", "vo",
+        "dang", "bui", "do", "ho", "ngo", "duong", "ly", "truong", "dinh",
+        "nông", "nong", "mai", "luu", "lam", "ha", "dao", "doan", "ta",
+        "cao", "chau", "ton", "thai", "quach", "trinh", "dinh", "to"
+    }
+    first = n.split()[0] if n.split() else ""
+    return first in vietnamese_surnames and len(n.split()) >= 2
+
+
+def _a_cell_is_store_code(value):
+    """A thường là mã nhóm/điểm (A, B, I, II, III...) còn nhân viên hay là số/null."""
+    a = _normalize_name(value)
+    if not a or a.startswith("nhom") or a == "cnhn":
+        return False
+    if re.fullmatch(r"\d+", a):
+        return False
+    return bool(re.fullmatch(r"[a-z]+", a))
+
+
+def _is_non_store_metric_name(name):
+    """Các dòng bóc tách doanh số bên dưới một đơn vị, không phải tên điểm/chi nhánh."""
+    n = _normalize_name(name)
+    if not n:
+        return False
+    prefixes = (
+        "so ban ra", "doanh so selin", "doanh so ",
+    )
+    if n.startswith(prefixes):
+        return True
+    return n in {"hang thanh ly"}
+
+
+def _is_numeric_sales_cell(value):
+    """True khi ô ngày là số bán/0/'-' chứ không phải ký hiệu ca hoặc chữ lạ."""
+    if _is_blank_cell(value):
+        return False
+    token = _normalize_schedule(value)
+    if token in VALID_SCHEDULE_TOKENS:
+        return False
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return True
+    txt = _clean_cell_text(value).replace(" ", "")
+    if txt in {"-", "–", "—"}:
+        return True
+    txt = txt.replace("₫", "").replace("đ", "").replace("Đ", "")
+    return bool(re.fullmatch(r"-?\d+(?:[\.,]\d+)*", txt))
 
 
 def _row_day_cells(row, days_in_month):
@@ -4301,25 +4709,48 @@ def _row_is_store(row, days_in_month):
     a_value = row.iloc[0] if len(row) > 0 else None
     if _is_summary_sales_row(a_value, name):
         return False
+    if _is_non_store_metric_name(name):
+        return False
 
     target = _parse_sheet_number(row.iloc[2] if len(row) > 2 else None)
     if target <= 0:
         return False
 
+    daily = _row_day_cells(row, days_in_month)
+    schedule_days = sum(1 for v in daily if _normalize_schedule(v) in VALID_SCHEDULE_TOKENS)
+    numeric_days = sum(1 for v in daily if _is_numeric_sales_cell(v))
+    actual_value = _parse_sheet_number(row.iloc[3] if len(row) > 3 else None)
+    ratio_value = _parse_sheet_number(row.iloc[4] if len(row) > 4 else None)
     actual_entered = not _is_blank_cell(row.iloc[3] if len(row) > 3 else None)
     ratio_entered = not _is_blank_cell(row.iloc[4] if len(row) > 4 else None)
-    daily = _row_day_cells(row, days_in_month)
-    numeric_days = sum(
-        1 for v in daily
-        if not _is_blank_cell(v) and _normalize_schedule(v) not in VALID_SCHEDULE_TOKENS
-    )
-    schedule_days = sum(1 for v in daily if _normalize_schedule(v) in VALID_SCHEDULE_TOKENS)
 
-    # Nhân viên thường D/E trống và cột ngày là S/C/FULL/N/NT/OFF.
-    if schedule_days >= 2 and not actual_entered and not ratio_entered:
+    # QUY TẮC QUAN TRỌNG: dòng có lịch ca rõ ràng là nhân sự, kể cả khi cột
+    # D/E có '-' hoặc công thức 0%. Đây là nguyên nhân trước đây tên nhân viên
+    # như Đặng Thị Nhung bị xếp nhầm thành một điểm bán.
+    if schedule_days >= 2 and schedule_days >= numeric_days:
         return False
 
-    return actual_entered or ratio_entered or numeric_days > 0 or _looks_like_store_name(name)
+    # Tên người/chức danh nhân sự không được trở thành điểm bán chỉ vì có Target
+    # hoặc có cột D/E được điền. Nếu họ có doanh số riêng, dữ liệu đó vẫn được
+    # giữ dưới điểm bán cha để phân tích nhân sự khi cần.
+    if _looks_like_employee_name(name):
+        return False
+
+    # Mã A/B/C/I/II/III... là tín hiệu cấu trúc mạnh của một điểm/kênh/nhánh.
+    if _a_cell_is_store_code(a_value):
+        return True
+
+    # Tên thương hiệu/địa điểm rõ ràng là điểm bán, kể cả doanh số hiện bằng 0.
+    if _looks_like_store_name(name):
+        return True
+
+    # Các dòng còn lại chỉ coi là điểm/đơn vị khi thực sự có dữ liệu bán hoặc
+    # tỷ lệ/actual có ý nghĩa. Không dùng việc ô '-' đơn thuần để tạo điểm giả.
+    if numeric_days > 0 or actual_value > 0 or ratio_value > 0:
+        return True
+    if (actual_entered or ratio_entered) and not _looks_like_employee_name(name):
+        return True
+    return False
 
 
 def _row_is_employee(row, days_in_month, inside_store):
@@ -4328,16 +4759,19 @@ def _row_is_employee(row, days_in_month, inside_store):
     name = _clean_cell_text(row.iloc[1] if len(row) > 1 else None)
     if not name:
         return False
-    if _row_is_store(row, days_in_month):
-        return False
 
-    target = _parse_sheet_number(row.iloc[2] if len(row) > 2 else None)
-    d_blank = _is_blank_cell(row.iloc[3] if len(row) > 3 else None)
-    e_blank = _is_blank_cell(row.iloc[4] if len(row) > 4 else None)
     daily = _row_day_cells(row, days_in_month)
     schedule_count = sum(1 for v in daily if _normalize_schedule(v) in VALID_SCHEDULE_TOKENS)
+    target = _parse_sheet_number(row.iloc[2] if len(row) > 2 else None)
 
-    return d_blank and e_blank and (target > 0 or schedule_count > 0)
+    # Ưu tiên nhận diện người trước _row_is_store vì một số nhân viên có D/E='-'
+    # hoặc 0% và vẫn có Target cá nhân.
+    if schedule_count > 0 or _looks_like_employee_name(name):
+        return target > 0 or schedule_count > 0 or not _is_blank_cell(row.iloc[3] if len(row) > 3 else None)
+
+    if _row_is_store(row, days_in_month):
+        return False
+    return False
 
 
 def _parse_sales_sheet(df, year, month, sheet_name):
@@ -4651,6 +5085,7 @@ def get_sales_analysis(target_dt=None, force=False):
         _analyze_store(s, target_dt.year, target_dt.month, parsed["days_in_month"], completed_day)
         for s in parsed["stores"]
         if float(s.get("target") or 0) > 0
+        and not _looks_like_employee_name(s.get("name", ""))
     ]
     parsed["stores"] = analyzed
     parsed["completed_day"] = completed_day
@@ -4700,6 +5135,28 @@ def _fmt_pressure(value):
         return "—"
 
 
+def _branch_display_name(analysis):
+    raw = _clean_cell_text((analysis.get("branch") or {}).get("name"))
+    if not raw:
+        return "CHI NHÁNH"
+    # Sheet đang để "TỔNG CỘNG CHI NHÁNH HÀ NỘI"; giao diện chỉ cần tên chi nhánh.
+    name = re.sub(r"^TỔNG\s+CỘNG\s+", "", raw, flags=re.IGNORECASE).strip()
+    return name or raw
+
+
+def _store_employee_label(store, max_names=2):
+    names = [
+        _clean_cell_text(e.get("name"))
+        for e in (store.get("employees_detail") or [])
+        if _clean_cell_text(e.get("name"))
+    ]
+    if not names:
+        return ""
+    shown = names[:max_names]
+    suffix = f" +{len(names)-max_names} NV" if len(names) > max_names else ""
+    return " · ".join(shown) + suffix
+
+
 def _compact_day_ranges(days):
     vals = sorted({int(d) for d in days if d})
     if not vals:
@@ -4726,59 +5183,133 @@ def _progress_bar(ratio, width=12):
 
 
 def _sales_buttons():
+    """Dashboard doanh số chính - chỉ điều hướng, không thay đổi nghiệp vụ tính toán."""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📊 Tổng quan", callback_data="sales:summary"),
             InlineKeyboardButton("🚨 Điểm yếu", callback_data="sales:weak"),
         ],
         [
+            InlineKeyboardButton("📍 Điểm bán", callback_data="sales:stores:0"),
+            InlineKeyboardButton("📈 Xu hướng", callback_data="sales:trend"),
+        ],
+        [
             InlineKeyboardButton("⚠️ Thiếu dữ liệu", callback_data="sales:missing"),
             InlineKeyboardButton("🔄 Làm mới", callback_data="sales:refresh"),
         ],
+        [
+            InlineKeyboardButton("🔔 Theo dõi tự động", callback_data="sales:monitor"),
+        ],
+    ])
+
+
+def _sales_visible_stores(analysis):
+    """Final guardrail: reports may only contain sales points/units, never employee rows."""
+    stores = analysis.get("stores") or []
+    return [
+        st for st in stores
+        if float(st.get("target") or 0) > 0
+        and not _looks_like_employee_name(st.get("name", ""))
+    ]
+
+
+def _sales_sorted_stores(analysis):
+    return sorted(_sales_visible_stores(analysis), key=lambda x: _normalize_name(x.get("name", "")))
+
+
+def _sales_store_list_buttons(analysis, page=0, per_page=8):
+    stores = _sales_sorted_stores(analysis)
+    total = len(stores)
+    max_page = max(0, (total - 1) // per_page) if total else 0
+    page = max(0, min(int(page or 0), max_page))
+    start = page * per_page
+    end = min(start + per_page, total)
+
+    rows = []
+    for idx in range(start, end):
+        store = stores[idx]
+        label = str(store.get("name") or "Điểm bán")
+        if len(label) > 42:
+            label = label[:39] + "..."
+        rows.append([InlineKeyboardButton(f"📍 {label}", callback_data=f"sales:store:{idx}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Trước", callback_data=f"sales:stores:{page-1}"))
+    if end < total:
+        nav.append(InlineKeyboardButton("Sau ➡️", callback_data=f"sales:stores:{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🏠 Menu doanh số", callback_data="sales:summary")])
+    return InlineKeyboardMarkup(rows), page, max_page, total
+
+
+def _sales_monitor_buttons(chat_id):
+    enabled = str(chat_id) in {str(x) for x in _sales_monitor_state().get("subscribers", [])}
+    toggle_text = "🔕 Tắt cảnh báo tự động" if enabled else "🔔 Bật cảnh báo tự động"
+    toggle_action = "off" if enabled else "on"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle_text, callback_data=f"sales:monitor:{toggle_action}")],
+        [InlineKeyboardButton("🏠 Menu doanh số", callback_data="sales:summary")],
     ])
 
 
 def build_sales_summary(analysis):
     branch = analysis.get("branch") or {}
-    stores = analysis.get("stores") or []
+    stores = _sales_visible_stores(analysis)
     day = analysis.get("completed_day", 0)
     days_in_month = analysis.get("days_in_month", 30)
-    target = float(branch.get("target") or sum(s["target"] for s in stores))
-    actual = float(branch.get("actual") or sum(s["actual"] for s in stores))
+    target = float(branch.get("target") or sum(st["target"] for st in stores))
+    actual = float(branch.get("actual") or sum(st["actual"] for st in stores))
     ratio = actual / target if target > 0 else 0.0
-    expected = day / days_in_month if days_in_month else 0.0
-    pace = ratio / expected if expected > 0 else None
+    time_elapsed = day / days_in_month if days_in_month else 0.0
+    progress_fit = ratio / time_elapsed if time_elapsed > 0 else None
 
     counts = {"🔴": 0, "🟠": 0, "🟡": 0, "🟢": 0, "⚪": 0}
     incomplete = 0
-    for s in stores:
-        counts[s.get("status_icon", "⚪")] = counts.get(s.get("status_icon", "⚪"), 0) + 1
-        if s.get("data_incomplete"):
+    for store in stores:
+        icon = store.get("status_icon", "⚪")
+        counts[icon] = counts.get(icon, 0) + 1
+        if store.get("data_incomplete"):
             incomplete += 1
 
     weak_reliable = sorted(
-        [s for s in stores if s.get("severity", 0) >= 3 and not s.get("data_incomplete")],
+        [st for st in stores if st.get("severity", 0) >= 3 and not st.get("data_incomplete")],
         key=lambda x: (x.get("severity", 0), -(x.get("pace") or 0)),
         reverse=True,
     )[:3]
 
     lines = [
-        f"📊 DOANH SỐ | {analysis['sheet_name']} | chốt đến ngày {day:02d}/{analysis['month']:02d}",
-        f"🏢 Toàn CN: {_fmt_sales_amount(actual)} / {_fmt_sales_amount(target)} · {_fmt_pct(ratio,1)}",
-        f"⏱ Tiến độ tháng: {_fmt_pct(expected,1)} · Pace: {_fmt_pct(pace,0)}",
-        f"📍 Điểm bán: 🔴 {counts.get('🔴',0)} · 🟠 {counts.get('🟠',0)} · 🟡 {counts.get('🟡',0)} · 🟢 {counts.get('🟢',0)}",
+        f"📊 <b>DOANH SỐ — {_tg_html(analysis['sheet_name'])}</b>",
+        f"<i>Chốt dữ liệu đến {day:02d}/{analysis['month']:02d}</i>",
+        "",
+        f"🏢 <b>{_tg_html(_branch_display_name(analysis))}</b>",
+        f"• Thực hiện: <b>{_tg_html(_fmt_sales_amount(actual))}</b> / {_tg_html(_fmt_sales_amount(target))}",
+        f"• Doanh số đã đạt: <b>{_tg_html(_fmt_pct(ratio,1))}</b>",
+        f"• Thời gian tháng đã qua: {_tg_html(_fmt_pct(time_elapsed,1))}",
+        f"• Mức bám tiến độ: <b>{_tg_html(_fmt_pct(progress_fit,0))}</b>",
+        "",
+        "📍 <b>TRẠNG THÁI ĐIỂM BÁN</b>",
+        f"🔴 Báo động: <b>{counts.get('🔴',0)}</b>   ·   🟠 Nguy cơ: <b>{counts.get('🟠',0)}</b>",
+        f"🟡 Chậm nhẹ: <b>{counts.get('🟡',0)}</b>   ·   🟢 Đúng/Vượt: <b>{counts.get('🟢',0)}</b>",
     ]
-    if incomplete:
-        lines.append(f"⚠️ {incomplete} điểm còn thiếu dữ liệu → kết quả các điểm đó chỉ tạm tính.")
-    if weak_reliable:
-        lines.append("\nCần chú ý:")
-        for s in weak_reliable:
-            lines.append(
-                f"{s['status_icon']} {s['name']}: {_fmt_pct(s['actual_ratio'],0)} target · "
-                f"Pace {_fmt_pct(s['pace'],0)} · cần {_fmt_sales_amount(s['required_per_day'])}/ngày"
-            )
-    return "\n".join(lines)
 
+    if incomplete:
+        lines += [
+            "",
+            f"⚠️ <b>DỮ LIỆU CHƯA ĐỦ:</b> {incomplete} điểm",
+            "<i>Các điểm này chỉ được đánh giá tạm tính cho tới khi bổ sung đủ doanh số/lịch ca.</i>",
+        ]
+
+    if weak_reliable:
+        lines += ["", "🚨 <b>CẦN CHÚ Ý NHẤT</b>"]
+        for idx, store in enumerate(weak_reliable, 1):
+            lines += [
+                f"{store['status_icon']} <b>{idx}. {_tg_html(store['name'])}</b>",
+                f"   Đạt <b>{_tg_html(_fmt_pct(store['actual_ratio'],0))}</b> target · Bám tiến độ <b>{_tg_html(_fmt_pct(store['pace'],0))}</b>",
+                f"   Cần {_tg_html(_fmt_sales_amount(store['required_per_day']))}/ngày để theo target",
+            ]
+    return "\n".join(lines)
 
 def _weak_store_sort_key(s):
     pressure = s.get("pressure")
@@ -4790,64 +5321,84 @@ def _weak_store_sort_key(s):
 
 
 def build_weak_sales_report(analysis, max_points=SALES_MAX_ALERT_POINTS):
-    stores = analysis.get("stores") or []
-    reliable = [s for s in stores if s.get("severity", 0) >= 3 and not s.get("data_incomplete")]
-    provisional = [s for s in stores if s.get("severity", 0) >= 3 and s.get("data_incomplete")]
+    stores = _sales_visible_stores(analysis)
+    reliable = [st for st in stores if st.get("severity", 0) >= 3 and not st.get("data_incomplete")]
+    provisional = [st for st in stores if st.get("severity", 0) >= 3 and st.get("data_incomplete")]
     reliable = sorted(reliable, key=_weak_store_sort_key, reverse=True)
     provisional = sorted(provisional, key=_weak_store_sort_key, reverse=True)
 
-    lines = [f"🚨 CẢNH BÁO DOANH SỐ | {analysis['sheet_name']} | đến ngày {analysis['completed_day']:02d}"]
+    lines = [
+        "🚨 <b>CẢNH BÁO DOANH SỐ</b>",
+        f"<i>{_tg_html(_branch_display_name(analysis))} · {_tg_html(analysis['sheet_name'])} · đến ngày {analysis['completed_day']:02d}</i>",
+    ]
     if not reliable and not provisional:
-        lines.append("✅ Chưa có điểm nào ở mức Nguy cơ/Báo động theo dữ liệu hiện tại.")
+        lines += ["", "✅ <b>Chưa có điểm bán nào ở mức Nguy cơ/Báo động.</b>"]
         return "\n".join(lines)
 
     if reliable:
-        lines.append(f"\nĐiểm cần xử lý ({len(reliable)}):")
-        for s in reliable[:max_points]:
-            lines.append(
-                f"{s['status_icon']} {s['name']} · {_fmt_sales_amount(s['actual'])}/{_fmt_sales_amount(s['target'])} ({_fmt_pct(s['actual_ratio'],0)})\n"
-                f"   Pace {_fmt_pct(s['pace'],0)} · TB {_fmt_sales_amount(s['avg_per_day'])}/ngày · "
-                f"cần {_fmt_sales_amount(s['required_per_day'])}/ngày ({_fmt_pressure(s['pressure'])})"
-            )
+        lines += ["", f"🔴 <b>ĐIỂM CẦN XỬ LÝ: {len(reliable)}</b>"]
+        for idx, st in enumerate(reliable[:max_points], 1):
+            lines += [
+                f"{st['status_icon']} <b>{idx}. {_tg_html(st['name'])}</b>",
+                f"   Doanh số: <b>{_tg_html(_fmt_sales_amount(st['actual']))}</b> / {_tg_html(_fmt_sales_amount(st['target']))}  ·  {_tg_html(_fmt_pct(st['actual_ratio'],0))}",
+                f"   Bám tiến độ: <b>{_tg_html(_fmt_pct(st['pace'],0))}</b>  ·  TB {_tg_html(_fmt_sales_amount(st['avg_per_day']))}/ngày",
+                f"   Cần: <b>{_tg_html(_fmt_sales_amount(st['required_per_day']))}/ngày</b>  ·  Áp lực {_tg_html(_fmt_pressure(st['pressure']))}",
+            ]
         if len(reliable) > max_points:
-            lines.append(f"… còn {len(reliable)-max_points} điểm. Dùng /canhbao để xem lại sau khi dữ liệu cập nhật.")
+            lines += ["", f"… còn <b>{len(reliable)-max_points}</b> điểm chưa hiển thị. Bấm <b>📍 Điểm bán</b> để xem chi tiết."]
 
     if provisional:
-        lines.append(f"\n⚠️ {len(provisional)} điểm đang yếu nhưng thiếu dữ liệu, chưa kết luận chính thức:")
-        for s in provisional[:3]:
-            miss = len(s.get("missing_sales_days", [])) + s.get("missing_schedule_count", 0)
-            lines.append(f"• {s['name']}: {_fmt_pct(s['actual_ratio'],0)} target · thiếu {miss} ô/ngày dữ liệu")
+        lines += ["", f"⚠️ <b>CHƯA ĐỦ DỮ LIỆU: {len(provisional)} điểm</b>", "<i>Đang có tín hiệu yếu nhưng chưa kết luận chính thức.</i>"]
+        for st in provisional[:3]:
+            miss = len(st.get("missing_sales_days", [])) + st.get("missing_schedule_count", 0)
+            lines.append(
+                f"• <b>{_tg_html(st['name'])}</b> · {_tg_html(_fmt_pct(st['actual_ratio'],0))} target · thiếu {miss} ô/ngày"
+            )
     return "\n".join(lines)
-
 
 def build_missing_data_report(analysis, max_points=8):
-    stores = [s for s in analysis.get("stores", []) if s.get("data_incomplete")]
-    lines = [f"⚠️ THIẾU DỮ LIỆU | {analysis['sheet_name']} | kiểm tra đến ngày {analysis['completed_day']:02d}"]
+    stores = [st for st in _sales_visible_stores(analysis) if st.get("data_incomplete")]
+    lines = [
+        "⚠️ <b>THIẾU DỮ LIỆU</b>",
+        f"<i>{_tg_html(analysis['sheet_name'])} · kiểm tra đến ngày {analysis['completed_day']:02d}</i>",
+    ]
     if not stores:
-        lines.append("✅ Doanh số và lịch ca của các điểm đang đầy đủ theo phạm vi kiểm tra.")
+        lines += ["", "✅ <b>Doanh số và lịch ca hiện đã đầy đủ trong phạm vi kiểm tra.</b>"]
         return "\n".join(lines)
 
-    total_sales_days = sum(len(s.get("missing_sales_days", [])) for s in stores)
-    total_schedule = sum(s.get("missing_schedule_count", 0) for s in stores)
-    lines.append(f"Tổng: {len(stores)} điểm · {total_sales_days} ngày doanh số · {total_schedule} ô lịch ca còn thiếu.")
+    total_sales_days = sum(len(st.get("missing_sales_days", [])) for st in stores)
+    total_schedule = sum(st.get("missing_schedule_count", 0) for st in stores)
+    lines += [
+        "",
+        "📌 <b>TỔNG HỢP</b>",
+        f"• Điểm thiếu dữ liệu: <b>{len(stores)}</b>",
+        f"• Ngày doanh số còn trống: <b>{total_sales_days}</b>",
+        f"• Ô lịch ca còn trống: <b>{total_schedule}</b>",
+        "",
+        "🧾 <b>ƯU TIÊN BỔ SUNG</b>",
+    ]
 
-    for s in stores[:max_points]:
-        parts = []
-        if s.get("missing_sales_days"):
-            parts.append("DS " + _compact_day_ranges(s["missing_sales_days"]))
-        if s.get("missing_schedule"):
+    for idx, st in enumerate(stores[:max_points], 1):
+        lines.append(f"<b>{idx}. {_tg_html(st['name'])}</b>")
+        if st.get("missing_sales_days"):
+            lines.append(f"   • Doanh số: <code>{_tg_html(_compact_day_ranges(st['missing_sales_days']))}</code>")
+        if st.get("missing_schedule"):
             emp_chunks = []
-            for emp_name, days in list(s["missing_schedule"].items())[:2]:
-                emp_chunks.append(f"{emp_name}: {_compact_day_ranges(days)}")
-            if len(s["missing_schedule"]) > 2:
-                emp_chunks.append(f"+{len(s['missing_schedule'])-2} NV")
-            parts.append("Lịch " + "; ".join(emp_chunks))
-        lines.append(f"• {s['name']}: " + " | ".join(parts))
-    if len(stores) > max_points:
-        lines.append(f"… còn {len(stores)-max_points} điểm chưa hiển thị để giữ tin nhắn ngắn gọn.")
-    lines.append("\nLưu ý: ô trống mới tính là thiếu; 0 hoặc '-' được coi là đã khai báo không phát sinh doanh số.")
-    return "\n".join(lines)
+            for emp_name, days in list(st["missing_schedule"].items())[:2]:
+                emp_chunks.append(f"{_tg_html(emp_name)} → <code>{_tg_html(_compact_day_ranges(days))}</code>")
+            if len(st["missing_schedule"]) > 2:
+                emp_chunks.append(f"+{len(st['missing_schedule'])-2} nhân viên khác")
+            for part in emp_chunks:
+                lines.append(f"   • Lịch: {part}")
 
+    if len(stores) > max_points:
+        lines += ["", f"… còn <b>{len(stores)-max_points}</b> điểm chưa hiển thị để giữ báo cáo gọn."]
+
+    lines += [
+        "",
+        "ℹ️ <i>Chỉ ô trống mới tính là thiếu. Giá trị 0 hoặc '-' được hiểu là đã khai báo không phát sinh doanh số.</i>",
+    ]
+    return "\n".join(lines)
 
 def _find_store(analysis, query):
     stores = analysis.get("stores") or []
@@ -4871,75 +5422,93 @@ def _find_store(analysis, query):
 
 
 def build_store_detail(analysis, store):
-    reliable_note = "" if not store.get("data_incomplete") else "\n⚠️ Dữ liệu chưa đủ, các chỉ số hiệu suất đang là TẠM TÍNH."
     lines = [
-        f"📍 {store['name']} | {analysis['sheet_name']}",
-        f"{store['status_icon']} {store['status_label']} · Target {_fmt_sales_amount(store['target'])}",
-        f"Thực tế : {_progress_bar(store['actual_ratio'])} {_fmt_pct(store['actual_ratio'],1)} · {_fmt_sales_amount(store['actual'])}",
-        f"Kỳ vọng : {_progress_bar(store['expected_ratio'])} {_fmt_pct(store['expected_ratio'],1)} ({store['pace_basis']})",
-        f"⚡ Pace {_fmt_pct(store['pace'],0)} · Áp lực còn lại {_fmt_pressure(store['pressure'])}",
-        f"📈 TB {_fmt_sales_amount(store['avg_per_day'])}/ngày · cần {_fmt_sales_amount(store['required_per_day'])}/ngày",
-        f"🔮 Dự báo cuối tháng ~{_fmt_sales_amount(store['forecast'])} · còn thiếu {_fmt_sales_amount(max(0, store['target']-store['actual']))}",
+        f"📍 <b>{_tg_html(store['name'])}</b>",
+        f"<i>{_tg_html(analysis['sheet_name'])} · {store['status_icon']} {_tg_html(store['status_label'])}</i>",
+        "",
+        "💰 <b>DOANH SỐ</b>",
+        f"• Target: <b>{_tg_html(_fmt_sales_amount(store['target']))}</b>",
+        f"• Thực hiện: <b>{_tg_html(_fmt_sales_amount(store['actual']))}</b> · {_tg_html(_fmt_pct(store['actual_ratio'],1))}",
+        f"• Thực tế: <code>{_progress_bar(store['actual_ratio'])}</code> {_tg_html(_fmt_pct(store['actual_ratio'],1))}",
+        f"• Kỳ vọng: <code>{_progress_bar(store['expected_ratio'])}</code> {_tg_html(_fmt_pct(store['expected_ratio'],1))}",
+        "",
+        "⚡ <b>HIỆU SUẤT</b>",
+        f"• Mức bám tiến độ: <b>{_tg_html(_fmt_pct(store['pace'],0))}</b>",
+        f"• TB hiện tại: {_tg_html(_fmt_sales_amount(store['avg_per_day']))}/ngày",
+        f"• Cần từ nay: <b>{_tg_html(_fmt_sales_amount(store['required_per_day']))}/ngày</b>",
+        f"• Áp lực còn lại: {_tg_html(_fmt_pressure(store['pressure']))}",
+        f"• Dự báo cuối tháng: <b>~{_tg_html(_fmt_sales_amount(store['forecast']))}</b>",
     ]
 
     if store.get("schedule_plan_usable"):
-        lines.append(
-            f"🗓 Phủ ca hiệu dụng: {store['elapsed_effective_days']:.1f}/{store['total_effective_days']:.1f} ngày · "
-            f"công NV đã ghi nhận: {store['work_units_elapsed']}"
-        )
+        lines += [
+            "",
+            "🗓 <b>PHỦ CA & CÔNG</b>",
+            f"• Phủ ca hiệu dụng: {store['elapsed_effective_days']:.1f}/{store['total_effective_days']:.1f} ngày",
+            f"• Công nhân viên đã ghi nhận: <b>{store['work_units_elapsed']}</b>",
+        ]
     else:
-        lines.append(
-            f"🗓 Lịch ca cả tháng chưa đủ để làm mẫu số đáng tin; Pace đang dùng ngày trong tháng. "
-            f"Công NV đã ghi nhận: {store['work_units_elapsed']}"
-        )
+        lines += [
+            "",
+            "🗓 <b>PHỦ CA & CÔNG</b>",
+            "• Lịch cả tháng chưa đủ để dùng làm mẫu số đáng tin.",
+            f"• Tạm tính tiến độ theo ngày trong tháng · Công đã ghi nhận: <b>{store['work_units_elapsed']}</b>",
+        ]
 
     if store.get("employees_detail"):
-        emp_bits = []
+        lines += ["", f"👥 <b>NHÂN SỰ TẠI ĐIỂM ({len(store['employees_detail'])})</b>"]
         for emp in store["employees_detail"][:4]:
-            emp_bits.append(f"{emp['name']}: {emp.get('work_units_elapsed',0)} công")
-        lines.append("👥 " + " · ".join(emp_bits))
+            lines.append(f"• {_tg_html(emp['name'])}: <b>{emp.get('work_units_elapsed',0)} công</b>")
+        if len(store["employees_detail"]) > 4:
+            lines.append(f"• +{len(store['employees_detail'])-4} nhân sự khác")
 
+    warnings = []
     if store.get("missing_sales_days"):
-        lines.append("⚠️ Thiếu doanh số ngày: " + _compact_day_ranges(store["missing_sales_days"]))
+        warnings.append("Doanh số: " + _tg_html(_compact_day_ranges(store["missing_sales_days"])))
     if store.get("missing_schedule"):
-        items = []
         for emp_name, days in list(store["missing_schedule"].items())[:4]:
-            items.append(f"{emp_name} ({_compact_day_ranges(days)})")
-        lines.append("⚠️ Thiếu lịch: " + "; ".join(items))
+            warnings.append(f"Lịch {_tg_html(emp_name)}: {_tg_html(_compact_day_ranges(days))}")
+    if warnings:
+        lines += ["", "⚠️ <b>DỮ LIỆU CÒN THIẾU</b>"]
+        lines.extend(f"• {w}" for w in warnings)
+        lines.append("<i>Các chỉ số hiệu suất hiện chỉ là tạm tính.</i>")
 
     trend = store.get("trend_pct")
     if trend is not None:
         arrow = "↗" if trend > 0.05 else ("↘" if trend < -0.05 else "→")
-        lines.append(
-            f"{arrow} 7 ngày gần nhất {_fmt_sales_amount(store['last7_sales'])} so với 7 ngày trước "
-            f"{_fmt_sales_amount(store['prev7_sales'])} ({trend*100:+.0f}%)"
-        )
-    return "\n".join(lines) + reliable_note
-
+        lines += [
+            "",
+            f"{arrow} <b>XU HƯỚNG 7 NGÀY</b>",
+            f"• 7 ngày gần nhất: {_tg_html(_fmt_sales_amount(store['last7_sales']))}",
+            f"• 7 ngày trước: {_tg_html(_fmt_sales_amount(store['prev7_sales']))} · {trend*100:+.0f}%",
+        ]
+    return "\n".join(lines)
 
 def build_sales_trend_report(analysis, query=None):
     if query:
         store, suggestions = _find_store(analysis, query)
         if not store:
-            return "❌ Không tìm thấy điểm bán phù hợp."
+            return "❌ <b>Không tìm thấy điểm bán phù hợp.</b>"
         return build_store_detail(analysis, store)
 
-    stores = [s for s in analysis.get("stores", []) if s.get("trend_pct") is not None]
+    stores = [st for st in _sales_visible_stores(analysis) if st.get("trend_pct") is not None]
     falling = sorted(stores, key=lambda x: x.get("trend_pct", 0))[:5]
     rising = sorted(stores, key=lambda x: x.get("trend_pct", 0), reverse=True)[:3]
-    lines = [f"📉 XU HƯỚNG 7 NGÀY | {analysis['sheet_name']}"]
+    lines = [
+        "📈 <b>XU HƯỚNG 7 NGÀY</b>",
+        f"<i>{_tg_html(analysis['sheet_name'])}</i>",
+    ]
     if falling:
-        lines.append("\nGiảm mạnh:")
-        for s in falling:
-            lines.append(f"↘ {s['name']}: {s['trend_pct']*100:+.0f}% · 7 ngày {_fmt_sales_amount(s['last7_sales'])}")
+        lines += ["", "📉 <b>GIẢM MẠNH</b>"]
+        for idx, st in enumerate(falling, 1):
+            lines.append(f"{idx}. <b>{_tg_html(st['name'])}</b> · {st['trend_pct']*100:+.0f}% · 7 ngày {_tg_html(_fmt_sales_amount(st['last7_sales']))}")
     if rising:
-        lines.append("\nTăng tốt:")
-        for s in rising:
-            lines.append(f"↗ {s['name']}: {s['trend_pct']*100:+.0f}% · 7 ngày {_fmt_sales_amount(s['last7_sales'])}")
+        lines += ["", "📈 <b>TĂNG TỐT</b>"]
+        for idx, st in enumerate(rising, 1):
+            lines.append(f"{idx}. <b>{_tg_html(st['name'])}</b> · {st['trend_pct']*100:+.0f}% · 7 ngày {_tg_html(_fmt_sales_amount(st['last7_sales']))}")
     if not falling and not rising:
-        lines.append("Chưa đủ dữ liệu hai giai đoạn 7 ngày để so sánh.")
+        lines += ["", "Chưa đủ dữ liệu hai giai đoạn 7 ngày để so sánh."]
     return "\n".join(lines)
-
 
 def _sales_monitor_state():
     state = cloud_data.setdefault("sales_monitor", {})
@@ -4963,7 +5532,7 @@ def _sales_subscribers():
 
 def _sales_issue_fingerprint(analysis):
     payload = []
-    for s in sorted(analysis.get("stores", []), key=lambda x: _normalize_name(x["name"])):
+    for s in sorted(_sales_visible_stores(analysis), key=lambda x: _normalize_name(x["name"])):
         if s.get("severity", 0) >= 2 or s.get("data_incomplete"):
             payload.append({
                 "name": s["name"],
@@ -4976,14 +5545,33 @@ def _sales_issue_fingerprint(analysis):
 
 
 async def _send_sales_message(bot, chat_id, text, reply_markup=None):
-    chunks = _split_telegram_text(text, limit=3400)
+    """Send structured sales HTML without breaking tags across Telegram chunks."""
+    lines = str(text or "").splitlines()
+    chunks = []
+    current = []
+    current_len = 0
+    for line in lines:
+        add_len = len(line) + (1 if current else 0)
+        if current and current_len + add_len > 3400:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = len(line)
+        else:
+            current.append(line)
+            current_len += add_len
+    if current:
+        chunks.append("\n".join(current))
+    if not chunks:
+        chunks = [""]
+
     for i, chunk in enumerate(chunks):
         await bot.send_message(
             chat_id=chat_id,
             text=chunk,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
             reply_markup=reply_markup if i == len(chunks) - 1 else None,
         )
-
 
 async def _get_sales_analysis_async(force=False):
     return await asyncio.to_thread(get_sales_analysis, None, force)
@@ -4994,7 +5582,7 @@ async def doanhso_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("📊 Đang đọc Google Sheet và tính tiến độ...")
     try:
         analysis = await _get_sales_analysis_async(force=True)
-        await msg.edit_text(build_sales_summary(analysis), reply_markup=_sales_buttons())
+        await msg.edit_text(build_sales_summary(analysis), reply_markup=_sales_buttons(), parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Lỗi /doanhso: {e}")
         await msg.edit_text(f"❌ Không đọc được dữ liệu doanh số: {e}")
@@ -5005,7 +5593,7 @@ async def canhbao_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🚨 Đang tính các điểm cần cảnh báo...")
     try:
         analysis = await _get_sales_analysis_async(force=True)
-        await msg.edit_text(build_weak_sales_report(analysis), reply_markup=_sales_buttons())
+        await msg.edit_text(build_weak_sales_report(analysis), reply_markup=_sales_buttons(), parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Lỗi /canhbao: {e}")
         await msg.edit_text(f"❌ Không đọc được dữ liệu doanh số: {e}")
@@ -5016,7 +5604,7 @@ async def thieudulieu_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     msg = await update.message.reply_text("⚠️ Đang rà soát ô trống doanh số và lịch ca...")
     try:
         analysis = await _get_sales_analysis_async(force=True)
-        await msg.edit_text(build_missing_data_report(analysis), reply_markup=_sales_buttons())
+        await msg.edit_text(build_missing_data_report(analysis), reply_markup=_sales_buttons(), parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Lỗi /thieudulieu: {e}")
         await msg.edit_text(f"❌ Không đọc được dữ liệu doanh số: {e}")
@@ -5038,7 +5626,7 @@ async def diemban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = build_store_detail(analysis, store)
         if len(suggestions) > 1:
             text += "\n\nGần khớp: " + "; ".join(suggestions[:4])
-        await msg.edit_text(text, reply_markup=_sales_buttons())
+        await msg.edit_text(text, reply_markup=_sales_buttons(), parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Lỗi /diemban: {e}")
         await msg.edit_text(f"❌ Không đọc được dữ liệu doanh số: {e}")
@@ -5050,7 +5638,7 @@ async def xuhuong_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("📈 Đang tính xu hướng 7 ngày...")
     try:
         analysis = await _get_sales_analysis_async(force=True)
-        await msg.edit_text(build_sales_trend_report(analysis, query or None), reply_markup=_sales_buttons())
+        await msg.edit_text(build_sales_trend_report(analysis, query or None), reply_markup=_sales_buttons(), parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Lỗi /xuhuong: {e}")
         await msg.edit_text(f"❌ Không đọc được dữ liệu doanh số: {e}")
@@ -5089,24 +5677,128 @@ async def theodoidoanhso_command(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("Dùng: /theodoidoanhso on hoặc /theodoidoanhso off")
 
 
+async def _edit_sales_dashboard(query, context, text, reply_markup):
+    """Edit one dashboard message using Telegram HTML; send new chunks only when needed."""
+    try:
+        if len(text) <= 3900:
+            await query.edit_message_text(
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            return
+    except Exception as e:
+        logger.debug(f"Không edit được dashboard doanh số, chuyển sang gửi mới: {e}")
+    await _send_sales_message(context.bot, query.message.chat_id, text, reply_markup)
+
 async def sales_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    action = (query.data or "").split(":", 1)[-1]
+    data = query.data or ""
+    chat_id = query.message.chat_id
+
     try:
-        analysis = await _get_sales_analysis_async(force=(action == "refresh"))
-        if action in {"summary", "refresh"}:
+        # Bật/tắt cảnh báo ngay bằng nút - dùng cùng sales_monitor state cũ.
+        if data.startswith("sales:monitor:"):
+            action = data.rsplit(":", 1)[-1]
+            state = _sales_monitor_state()
+            subscribers = [str(x) for x in state.get("subscribers", [])]
+            cid = str(chat_id)
+            if action == "on":
+                if cid not in subscribers:
+                    subscribers.append(cid)
+                state["subscribers"] = subscribers
+                status_text = (
+                    "🔔 THEO DÕI DOANH SỐ: ĐANG BẬT\n\n"
+                    "Bot sẽ chỉ ĐỌC Google Sheet và gửi cảnh báo khi trạng thái thay đổi, "
+                    "khi thiếu dữ liệu hoặc ở báo cáo cuối ngày."
+                )
+            else:
+                state["subscribers"] = [x for x in subscribers if x != cid]
+                status_text = "🔕 THEO DÕI DOANH SỐ: ĐANG TẮT\n\nBot sẽ không tự động gửi cảnh báo vào chat này."
+            await save_cloud_db(context, chat_id)
+            await _edit_sales_dashboard(query, context, status_text, _sales_monitor_buttons(chat_id))
+            return
+
+        if data == "sales:monitor":
+            enabled = str(chat_id) in {str(x) for x in _sales_monitor_state().get("subscribers", [])}
+            text = (
+                f"🔔 THEO DÕI DOANH SỐ\n\nTrạng thái chat này: {'ĐANG BẬT' if enabled else 'ĐANG TẮT'}\n"
+                "Bot chỉ đọc Google Sheet; không có quyền ghi hoặc sửa dữ liệu."
+            )
+            await _edit_sales_dashboard(query, context, text, _sales_monitor_buttons(chat_id))
+            return
+
+        force = data == "sales:refresh"
+        analysis = await _get_sales_analysis_async(force=force)
+
+        if data in {"sales:summary", "sales:refresh"}:
             text = build_sales_summary(analysis)
-        elif action == "weak":
+            markup = _sales_buttons()
+        elif data == "sales:weak":
             text = build_weak_sales_report(analysis)
-        elif action == "missing":
+            markup = _sales_buttons()
+        elif data == "sales:missing":
             text = build_missing_data_report(analysis)
+            markup = _sales_buttons()
+        elif data == "sales:trend":
+            text = build_sales_trend_report(analysis)
+            markup = _sales_buttons()
+        elif data.startswith("sales:stores:"):
+            try:
+                page = int(data.rsplit(":", 1)[-1])
+            except Exception:
+                page = 0
+            markup, page, max_page, total = _sales_store_list_buttons(analysis, page=page)
+            text = (
+                f"📍 <b>CHỌN ĐIỂM BÁN — {_tg_html(analysis['sheet_name'])}</b>\n"
+                f"Có <b>{total}</b> điểm · Trang {page+1}/{max_page+1}\n\n"
+                "Bấm vào điểm muốn xem để bot phân tích chi tiết."
+            )
+        elif data.startswith("sales:storetrend:"):
+            try:
+                idx = int(data.rsplit(":", 1)[-1])
+            except Exception:
+                idx = -1
+            stores = _sales_sorted_stores(analysis)
+            if idx < 0 or idx >= len(stores):
+                text = "❌ Không tìm thấy điểm bán. Bấm Điểm bán để tải lại danh sách."
+                markup = _sales_buttons()
+            else:
+                store = stores[idx]
+                text = build_sales_trend_report(analysis, store.get('name'))
+                markup = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📍 Chi tiết điểm", callback_data=f"sales:store:{idx}")],
+                    [InlineKeyboardButton("⬅️ Danh sách điểm bán", callback_data="sales:stores:0")],
+                    [InlineKeyboardButton("🏠 Menu doanh số", callback_data="sales:summary"),
+                     InlineKeyboardButton("🔄 Làm mới", callback_data="sales:refresh")],
+                ])
+        elif data.startswith("sales:store:"):
+            try:
+                idx = int(data.rsplit(":", 1)[-1])
+            except Exception:
+                idx = -1
+            stores = _sales_sorted_stores(analysis)
+            if idx < 0 or idx >= len(stores):
+                text = "❌ Không tìm thấy điểm bán. Bấm Điểm bán để tải lại danh sách."
+                markup = _sales_buttons()
+            else:
+                text = build_store_detail(analysis, stores[idx])
+                # Giữ nút quay lại danh sách + menu chính để không cần gõ lệnh.
+                markup = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📈 Xu hướng điểm này", callback_data=f"sales:storetrend:{idx}")],
+                    [InlineKeyboardButton("⬅️ Danh sách điểm bán", callback_data="sales:stores:0")],
+                    [InlineKeyboardButton("🏠 Menu doanh số", callback_data="sales:summary"),
+                     InlineKeyboardButton("🔄 Làm mới", callback_data="sales:refresh")],
+                ])
         else:
             return
-        await _send_sales_message(context.bot, query.message.chat_id, text, _sales_buttons())
+
+        await _edit_sales_dashboard(query, context, text, markup)
     except Exception as e:
         logger.error(f"Lỗi sales callback: {e}")
-        await context.bot.send_message(chat_id=query.message.chat_id, text=f"❌ Không đọc được dữ liệu doanh số: {e}")
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ Không đọc được dữ liệu doanh số: {e}")
 
 
 def _build_auto_sales_report(analysis, include_summary=False):
@@ -5267,7 +5959,10 @@ def main():
 
     # --- ĐĂNG KÝ LUỒNG CONVERSATION CHO LÊN ĐƠN HÀNG ---
     lendon_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("lendon", start_lendon_command)],
+        entry_points=[
+            CommandHandler("lendon", start_lendon_command),
+            MessageHandler(filters.Regex(r"^🧾 Lên đơn Odoo$"), start_lendon_command),
+        ],
         states={
             LENDON_CUSTOMER: [MessageHandler(filters.TEXT & ~filters.COMMAND, lendon_customer_handler)],
             LENDON_REF: [MessageHandler(filters.TEXT & ~filters.COMMAND, lendon_ref_handler)],
@@ -5279,7 +5974,10 @@ def main():
     
     # --- ĐĂNG KÝ LUỒNG CONVERSATION CHO CHUYỂN KHO ---
     chuyenkho_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("chuyenkho", start_chuyenkho_command)],
+        entry_points=[
+            CommandHandler("chuyenkho", start_chuyenkho_command),
+            MessageHandler(filters.Regex(r"^🔄 Chuyển kho$"), start_chuyenkho_command),
+        ],
         states={
             CK_PRODUCTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ck_products_handler)]
         },
@@ -5322,8 +6020,10 @@ def main():
             await ck_warehouse_search_text(update, context, 'src')
         elif context.user_data.get('waiting_ck_dest_kw'):
             await ck_warehouse_search_text(update, context, 'dest')
+        elif context.user_data.get('menu_input_mode'):
+            await handle_menu_input(update, context)
         else:
-            await handle_product_code(update, context)
+            await menu_text_handler(update, context)
             
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, global_text_filter))
 
