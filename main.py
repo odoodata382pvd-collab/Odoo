@@ -12,7 +12,10 @@ import urllib.request
 import urllib.parse
 import requests
 import random
-from datetime import datetime
+import calendar
+import difflib
+import hashlib
+from datetime import datetime, timedelta, time as dt_time
 from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
@@ -204,7 +207,8 @@ JSONBIN_BIN_ID = os.environ.get('JSONBIN_BIN_ID')
 # không bị lẫn lịch sử hội thoại với nhau.
 cloud_data = {
     "sales_mapping": {},
-    "ai_memory": {}
+    "ai_memory": {},
+    "sales_monitor": {}
 }
 
 # ---------------- AI MEMORY (KHÔNG THAY ĐỔI NGHIỆP VỤ ODOO) ----------------
@@ -235,6 +239,7 @@ def load_cloud_db():
                     # chứa sales_mapping/price_cache và chưa có ai_memory.
                     cloud_data.setdefault("sales_mapping", {})
                     cloud_data.setdefault("ai_memory", {})
+                    cloud_data.setdefault("sales_monitor", {})
                     if "price_cache" in cloud_data:
                         with open("price_cache.json", 'w', encoding='utf-8') as f:
                             json.dump(cloud_data["price_cache"], f, ensure_ascii=False, indent=4)
@@ -3056,7 +3061,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "12. Gõ mã đơn (VD:Kiểm tra đơn SO001) để xem chi tiết.\n"
         "13. Hỏi bất cứ thông tin nào (World Cup, tin tức, thời tiết...).\n"
         "14. Hoặc yêu cầu: 'Tổng hợp đơn hàng từ ngày 2 đến ngày 20'\n"
-        "15. `/ping` để kiểm tra kết nối Odoo.",
+        "15. `/ping` để kiểm tra kết nối Odoo.\n"
+        "16. `/doanhso` xem tiến độ doanh số Google Sheet.\n"
+        "17. `/canhbao` xem các điểm bán có nguy cơ yếu.\n"
+        "18. `/diemban <tên>` phân tích chi tiết một điểm.\n"
+        "19. `/xuhuong [tên điểm]` xem xu hướng 7 ngày.\n"
+        "20. `/thieudulieu` xem ngày thiếu doanh số/lịch ca.\n"
+        "21. `/theodoidoanhso on|off` bật/tắt cảnh báo tự động cho chat này.",
         parse_mode='Markdown'
     )
 
@@ -4053,6 +4064,1186 @@ async def cancel_chuyenkho_conversation(update: Update, context: ContextTypes.DE
     return ConversationHandler.END
 
 
+
+# =====================================================================
+# ---> SALES PERFORMANCE MONITOR - GOOGLE SHEET READ ONLY <---
+# =====================================================================
+# NGUYÊN TẮC CỨNG:
+# - Chỉ HTTP GET file XLSX từ Google Sheet. Không có bất kỳ API ghi/sửa/xóa nào.
+# - Sheet tháng được chọn theo ngày giờ Việt Nam: T{tháng}.{năm}.
+# - Target lấy nguyên từ Sheet; KHÔNG nhân/chia theo số nhân viên.
+# - Công nhân viên: S=1, C=1, FULL=2, N/NT/OFF=0.
+# - Điểm 2 nhân viên S+C và điểm 1 nhân viên FULL đều được coi là phủ đủ 2 ca/ngày.
+# - Thiếu dữ liệu KHÔNG được coi là doanh số 0; kết quả hiệu suất sẽ đánh dấu tạm tính.
+
+SALES_SPREADSHEET_ID = (os.environ.get('SALES_SPREADSHEET_ID') or '1b1oWOxzuo044l93gXlOUBD_7XTbYhwKaFNu38gv_BQg').strip()
+SALES_EXPORT_URL = f"https://docs.google.com/spreadsheets/d/{SALES_SPREADSHEET_ID}/export?format=xlsx"
+SALES_CACHE_SECONDS = 180
+SALES_CLOSE_HOUR = 20
+SALES_CLOSE_MINUTE = 30
+SALES_MAX_ALERT_POINTS = 5
+SALES_TZ = pytz.timezone("Asia/Ho_Chi_Minh")
+SALES_CACHE_LOCK = threading.Lock()
+SALES_CACHE = {"fetched_at": 0.0, "bytes": None, "sheet_names": []}
+
+VALID_SCHEDULE_TOKENS = {"S", "C", "FULL", "N", "NT", "OFF"}
+SCHEDULE_WORK_UNITS = {"S": 1, "C": 1, "FULL": 2, "N": 0, "NT": 0, "OFF": 0}
+
+
+def _sales_now():
+    return datetime.now(SALES_TZ)
+
+
+def _is_blank_cell(value):
+    if value is None:
+        return True
+    try:
+        if pd.isna(value):
+            return True
+    except Exception:
+        pass
+    return str(value).replace("\xa0", " ").strip() == ""
+
+
+def _clean_cell_text(value):
+    if _is_blank_cell(value):
+        return ""
+    return re.sub(r"\s+", " ", str(value).replace("\xa0", " ")).strip()
+
+
+def _parse_sheet_number(value):
+    """Đọc số từ XLSX/chuỗi hiển thị Việt Nam. Đơn vị được giữ nguyên như trong Sheet."""
+    if _is_blank_cell(value):
+        return 0.0
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return float(value)
+        except Exception:
+            return 0.0
+
+    s = _clean_cell_text(value)
+    if not s:
+        return 0.0
+    upper = s.upper()
+    if upper in {"-", "–", "—", "N/A", "NA", "#DIV/0!", "#VALUE!"}:
+        return 0.0
+
+    s = s.replace("₫", "").replace("đ", "").replace("Đ", "").replace(" ", "")
+    if s.endswith("%"):
+        s = s[:-1]
+
+    # 220.000 / 10.940.000 là phân tách hàng nghìn theo định dạng Sheet.
+    if re.fullmatch(r"-?\d{1,3}(?:\.\d{3})+", s):
+        s = s.replace(".", "")
+    elif re.fullmatch(r"-?\d{1,3}(?:,\d{3})+", s):
+        s = s.replace(",", "")
+    else:
+        # Trường hợp thập phân dùng dấu phẩy.
+        if "," in s and "." not in s:
+            s = s.replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+
+def _normalize_schedule(value):
+    if _is_blank_cell(value):
+        return ""
+    s = _clean_cell_text(value).upper().replace(".", "")
+    s = re.sub(r"\s+", "", s)
+    # Chỉ chuẩn hóa những biến thể chắc chắn tương đương, không tự đoán ký hiệu lạ.
+    aliases = {
+        "FULLDAY": "FULL",
+        "FULLCA": "FULL",
+        "OFFDAY": "OFF",
+    }
+    return aliases.get(s, s)
+
+
+def _sheet_name_for_date(target_dt):
+    return f"T{target_dt.month}.{target_dt.year}"
+
+
+def _match_month_sheet_name(sheet_names, target_dt):
+    """Luôn ưu tiên đúng tháng/năm; không âm thầm dùng sheet khác tháng."""
+    exact = _sheet_name_for_date(target_dt)
+    for name in sheet_names:
+        if str(name).strip().lower() == exact.lower():
+            return name
+
+    wanted_month, wanted_year = target_dt.month, target_dt.year
+    for name in sheet_names:
+        m = re.match(r"^\s*T\s*0?(\d{1,2})\s*[\.\-/]\s*(20\d{2})\s*$", str(name), re.IGNORECASE)
+        if m and int(m.group(1)) == wanted_month and int(m.group(2)) == wanted_year:
+            return name
+    return None
+
+
+def _download_sales_workbook(force=False):
+    """READ ONLY: duy nhất requests.get(). Không có endpoint/method ghi Google Sheet."""
+    now_ts = time.time()
+    with SALES_CACHE_LOCK:
+        if (
+            not force
+            and SALES_CACHE.get("bytes")
+            and now_ts - float(SALES_CACHE.get("fetched_at") or 0) < SALES_CACHE_SECONDS
+        ):
+            return SALES_CACHE["bytes"], list(SALES_CACHE.get("sheet_names", []))
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; NSV-Sales-Monitor/1.0)",
+        "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/octet-stream,*/*",
+    }
+    res = requests.get(SALES_EXPORT_URL, headers=headers, timeout=35, allow_redirects=True)
+    if res.status_code != 200:
+        raise RuntimeError(f"Google Sheet trả HTTP {res.status_code}. Hãy kiểm tra quyền Viewer bằng link.")
+
+    content = res.content or b""
+    content_type = (res.headers.get("Content-Type") or "").lower()
+    if len(content) < 1000 or not content.startswith(b"PK"):
+        # XLSX là file ZIP nên luôn bắt đầu bằng PK. Nếu nhận HTML login/error thì dừng ngay.
+        hint = ""
+        try:
+            preview = content[:500].decode("utf-8", errors="ignore").lower()
+            if "<html" in preview or "<!doctype" in preview:
+                hint = " Google đang trả trang HTML/đăng nhập thay vì XLSX."
+        except Exception:
+            pass
+        raise RuntimeError(
+            "Không đọc được XLSX từ Google Sheet." + hint +
+            " Bot chỉ có quyền đọc; Sheet cần cho phép tài khoản/link của bot xem dữ liệu."
+        )
+
+    try:
+        excel = pd.ExcelFile(io.BytesIO(content), engine="openpyxl")
+        names = list(excel.sheet_names)
+        excel.close()
+    except Exception as e:
+        raise RuntimeError(f"File Google Sheet tải về không đọc được: {e}")
+
+    with SALES_CACHE_LOCK:
+        SALES_CACHE["fetched_at"] = now_ts
+        SALES_CACHE["bytes"] = content
+        SALES_CACHE["sheet_names"] = names
+    return content, names
+
+
+def _load_sales_sheet(target_dt=None, force=False):
+    target_dt = target_dt or _sales_now()
+    content, sheet_names = _download_sales_workbook(force=force)
+    sheet_name = _match_month_sheet_name(sheet_names, target_dt)
+    if not sheet_name:
+        available = [n for n in sheet_names if re.match(r"^\s*T\s*\d{1,2}[\.\-/]20\d{2}", str(n), re.IGNORECASE)]
+        raise RuntimeError(
+            f"Không tìm thấy sheet đúng tháng {_sheet_name_for_date(target_dt)}. "
+            f"Các sheet tháng hiện có: {', '.join(map(str, available[-8:])) or 'không xác định'}. "
+            "Bot sẽ không lấy sheet tháng khác để tránh phân tích sai dữ liệu."
+        )
+
+    try:
+        df = pd.read_excel(
+            io.BytesIO(content),
+            sheet_name=sheet_name,
+            header=None,
+            dtype=object,
+            engine="openpyxl",
+        )
+    except Exception as e:
+        raise RuntimeError(f"Không đọc được sheet {sheet_name}: {e}")
+    return sheet_name, df
+
+
+def _normalize_name(text):
+    s = unicodedata.normalize("NFD", _clean_cell_text(text).lower())
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _is_summary_sales_row(a_value, name):
+    n = _normalize_name(name)
+    a = _normalize_name(a_value)
+    summary_terms = [
+        "tong cong", "he thong", "phu trach", "nhom ", "chi nhanh ha noi"
+    ]
+    if any(term in n for term in summary_terms):
+        return True
+    if a.startswith("nhom") or a == "cnhn":
+        return True
+    return False
+
+
+def _looks_like_store_name(name):
+    n = _normalize_name(name)
+    terms = [
+        "nguyen kim", "aeon", "kohan", "kohnan", "hc ", " hc", "media mart",
+        "mediamart", "pico", "dien may", "big c", "go ", "vincom", "showroom",
+        "lotte", "mega market", "mm mega", "coop", "emart"
+    ]
+    return any(term in f" {n} " for term in terms)
+
+
+def _row_day_cells(row, days_in_month):
+    values = []
+    for day in range(1, days_in_month + 1):
+        idx = 5 + day - 1  # F = ngày 1
+        values.append(row.iloc[idx] if idx < len(row) else None)
+    return values
+
+
+def _row_is_store(row, days_in_month):
+    name = _clean_cell_text(row.iloc[1] if len(row) > 1 else None)
+    if not name:
+        return False
+    a_value = row.iloc[0] if len(row) > 0 else None
+    if _is_summary_sales_row(a_value, name):
+        return False
+
+    target = _parse_sheet_number(row.iloc[2] if len(row) > 2 else None)
+    if target <= 0:
+        return False
+
+    actual_entered = not _is_blank_cell(row.iloc[3] if len(row) > 3 else None)
+    ratio_entered = not _is_blank_cell(row.iloc[4] if len(row) > 4 else None)
+    daily = _row_day_cells(row, days_in_month)
+    numeric_days = sum(
+        1 for v in daily
+        if not _is_blank_cell(v) and _normalize_schedule(v) not in VALID_SCHEDULE_TOKENS
+    )
+    schedule_days = sum(1 for v in daily if _normalize_schedule(v) in VALID_SCHEDULE_TOKENS)
+
+    # Nhân viên thường D/E trống và cột ngày là S/C/FULL/N/NT/OFF.
+    if schedule_days >= 2 and not actual_entered and not ratio_entered:
+        return False
+
+    return actual_entered or ratio_entered or numeric_days > 0 or _looks_like_store_name(name)
+
+
+def _row_is_employee(row, days_in_month, inside_store):
+    if not inside_store:
+        return False
+    name = _clean_cell_text(row.iloc[1] if len(row) > 1 else None)
+    if not name:
+        return False
+    if _row_is_store(row, days_in_month):
+        return False
+
+    target = _parse_sheet_number(row.iloc[2] if len(row) > 2 else None)
+    d_blank = _is_blank_cell(row.iloc[3] if len(row) > 3 else None)
+    e_blank = _is_blank_cell(row.iloc[4] if len(row) > 4 else None)
+    daily = _row_day_cells(row, days_in_month)
+    schedule_count = sum(1 for v in daily if _normalize_schedule(v) in VALID_SCHEDULE_TOKENS)
+
+    return d_blank and e_blank and (target > 0 or schedule_count > 0)
+
+
+def _parse_sales_sheet(df, year, month, sheet_name):
+    days_in_month = calendar.monthrange(year, month)[1]
+    stores = []
+    branch = None
+    current_store = None
+
+    for _, row in df.iterrows():
+        name = _clean_cell_text(row.iloc[1] if len(row) > 1 else None)
+        if not name:
+            continue
+        a_value = row.iloc[0] if len(row) > 0 else None
+        target = _parse_sheet_number(row.iloc[2] if len(row) > 2 else None)
+        actual = _parse_sheet_number(row.iloc[3] if len(row) > 3 else None)
+        n = _normalize_name(name)
+
+        if "tong cong chi nhanh" in n:
+            branch = {
+                "name": name,
+                "target": target,
+                "actual": actual,
+                "daily": _row_day_cells(row, days_in_month),
+            }
+            current_store = None
+            continue
+
+        if _is_summary_sales_row(a_value, name):
+            current_store = None
+            continue
+
+        if _row_is_store(row, days_in_month):
+            current_store = {
+                "name": name,
+                "target": target,
+                "actual": actual,
+                "daily": _row_day_cells(row, days_in_month),
+                "employees": [],
+                "source_row": int(getattr(row, "name", 0)) + 1,
+            }
+            stores.append(current_store)
+            continue
+
+        if _row_is_employee(row, days_in_month, current_store is not None):
+            current_store["employees"].append({
+                "name": name,
+                "target": target,
+                "schedule": _row_day_cells(row, days_in_month),
+                "source_row": int(getattr(row, "name", 0)) + 1,
+            })
+
+    return {
+        "year": year,
+        "month": month,
+        "sheet_name": sheet_name,
+        "days_in_month": days_in_month,
+        "branch": branch,
+        "stores": stores,
+    }
+
+
+def _analysis_completed_day(year, month, now=None):
+    now = now or _sales_now()
+    if (year, month) < (now.year, now.month):
+        return calendar.monthrange(year, month)[1]
+    if (year, month) > (now.year, now.month):
+        return 0
+
+    include_today = (now.hour, now.minute) >= (SALES_CLOSE_HOUR, SALES_CLOSE_MINUTE)
+    return max(0, min(now.day if include_today else now.day - 1, calendar.monthrange(year, month)[1]))
+
+
+def _employee_schedule_meta(employee, days_in_month, completed_day):
+    tokens = [_normalize_schedule(v) for v in employee.get("schedule", [])[:days_in_month]]
+    if len(tokens) < days_in_month:
+        tokens += [""] * (days_in_month - len(tokens))
+
+    valid_days = [i + 1 for i, t in enumerate(tokens) if t in VALID_SCHEDULE_TOKENS]
+    first_valid = valid_days[0] if valid_days else None
+
+    # Nếu lịch tháng đã có nhưng nhân viên bắt đầu giữa tháng, không bắt lỗi trước ngày bắt đầu.
+    # Nếu hoàn toàn chưa có lịch và có target nhân viên, coi là chưa khai báo lịch tháng.
+    if first_valid is None:
+        active_start = 1 if employee.get("target", 0) > 0 else None
+    else:
+        active_start = first_valid
+
+    missing = []
+    work_units = 0
+    unknown_tokens = []
+    if active_start is not None:
+        for d in range(active_start, min(completed_day, days_in_month) + 1):
+            token = tokens[d - 1]
+            if token == "":
+                missing.append(d)
+            elif token in VALID_SCHEDULE_TOKENS:
+                work_units += SCHEDULE_WORK_UNITS[token]
+            else:
+                unknown_tokens.append((d, token))
+
+    total_planned_work_units = sum(SCHEDULE_WORK_UNITS.get(t, 0) for t in tokens)
+    return {
+        "tokens": tokens,
+        "active_start": active_start,
+        "missing_days": missing,
+        "work_units_elapsed": work_units,
+        "work_units_month": total_planned_work_units,
+        "unknown_tokens": unknown_tokens,
+    }
+
+
+def _coverage_for_day(employee_metas, day):
+    morning = False
+    afternoon = False
+    any_known = False
+    any_missing = False
+    active_count = 0
+    working_count = 0
+
+    for meta in employee_metas:
+        start = meta.get("active_start")
+        if start is None or day < start:
+            continue
+        active_count += 1
+        tokens = meta.get("tokens", [])
+        token = tokens[day - 1] if 0 <= day - 1 < len(tokens) else ""
+        if token == "":
+            any_missing = True
+            continue
+        if token in VALID_SCHEDULE_TOKENS:
+            any_known = True
+        if token == "FULL":
+            morning = afternoon = True
+            working_count += 1
+        elif token == "S":
+            morning = True
+            working_count += 1
+        elif token == "C":
+            afternoon = True
+            working_count += 1
+
+    shifts = int(morning) + int(afternoon)
+    return {
+        "shifts": shifts,
+        "effective_day": shifts / 2.0,
+        "known": any_known,
+        "has_missing": any_missing,
+        "active_count": active_count,
+        "working_count": working_count,
+    }
+
+
+def _status_from_metrics(actual, target, pace, pressure, completed_day):
+    if target <= 0:
+        return "⚪", "Không target", 0
+    if actual >= target:
+        return "🟢", "Vượt/đạt target", 0
+    if completed_day < 3:
+        return "⚪", "Chưa đủ dữ liệu", 1
+
+    p = pace if pace is not None else 0.0
+    pr = pressure if pressure is not None else float("inf")
+    if p >= 0.95 and pr <= 1.35:
+        return "🟢", "Đúng tiến độ", 1
+    if p >= 0.80 and pr <= 1.75:
+        return "🟡", "Chậm nhẹ", 2
+    if p >= 0.60 or pr <= 2.50:
+        return "🟠", "Nguy cơ", 3
+    return "🔴", "Báo động", 4
+
+
+def _analyze_store(store, year, month, days_in_month, completed_day):
+    employee_metas = []
+    employee_results = []
+    for emp in store.get("employees", []):
+        meta = _employee_schedule_meta(emp, days_in_month, completed_day)
+        employee_metas.append(meta)
+        employee_results.append({
+            "name": emp.get("name"),
+            "target": emp.get("target", 0),
+            **meta,
+        })
+
+    coverage = [_coverage_for_day(employee_metas, day) for day in range(1, days_in_month + 1)]
+    known_schedule_days = sum(1 for c in coverage if c["known"] or c["has_missing"])
+    planned_known_days = sum(1 for c in coverage if c["known"])
+    elapsed_eff = sum(c["effective_day"] for c in coverage[:completed_day])
+    total_eff = sum(c["effective_day"] for c in coverage)
+
+    # Nếu lịch cả tháng đủ đáng tin, dùng tiến độ theo chính lịch hoạt động của điểm.
+    # Nếu lịch chưa được nhập đủ, dùng tiến độ ngày lịch để không vô tình "thưởng" cho việc bỏ trống lịch.
+    schedule_plan_usable = (
+        bool(employee_metas)
+        and planned_known_days >= max(7, int(days_in_month * 0.60))
+        and total_eff > 0
+    )
+    if schedule_plan_usable:
+        expected_ratio = min(1.0, elapsed_eff / total_eff) if total_eff else 0.0
+        remaining_eff = max(0.0, total_eff - elapsed_eff)
+        pace_basis = "lịch ca điểm"
+        elapsed_basis = elapsed_eff
+    else:
+        expected_ratio = min(1.0, completed_day / days_in_month) if days_in_month else 0.0
+        remaining_eff = max(0.0, days_in_month - completed_day)
+        pace_basis = "ngày trong tháng"
+        elapsed_basis = float(max(completed_day, 0))
+
+    target = float(store.get("target") or 0)
+    actual = float(store.get("actual") or 0)
+    actual_ratio = actual / target if target > 0 else 0.0
+    pace = actual_ratio / expected_ratio if expected_ratio > 0 else None
+
+    avg_per_eff_day = actual / elapsed_basis if elapsed_basis > 0 else 0.0
+    remaining_target = max(0.0, target - actual)
+    required_per_day = remaining_target / remaining_eff if remaining_eff > 0 else (0.0 if remaining_target <= 0 else float("inf"))
+    if avg_per_eff_day > 0:
+        pressure = required_per_day / avg_per_eff_day
+    elif remaining_target <= 0:
+        pressure = 0.0
+    else:
+        pressure = float("inf")
+    forecast = actual + avg_per_eff_day * remaining_eff
+    if actual >= target:
+        forecast = max(forecast, actual)
+
+    missing_schedule = {}
+    total_missing_schedule = 0
+    total_work_units = 0
+    for emp in employee_results:
+        if emp["missing_days"]:
+            missing_schedule[emp["name"]] = list(emp["missing_days"])
+            total_missing_schedule += len(emp["missing_days"])
+        total_work_units += emp.get("work_units_elapsed", 0)
+
+    sales_cells = list(store.get("daily", []))[:days_in_month]
+    if len(sales_cells) < days_in_month:
+        sales_cells += [None] * (days_in_month - len(sales_cells))
+
+    missing_sales = []
+    explicit_zero_sales = []
+    daily_sales_values = []
+    for day in range(1, days_in_month + 1):
+        raw = sales_cells[day - 1]
+        val = _parse_sheet_number(raw)
+        daily_sales_values.append(val)
+        if day > completed_day:
+            continue
+        cov = coverage[day - 1]
+        if _is_blank_cell(raw):
+            # Chỉ buộc doanh số khi điểm có người làm hoặc lịch người đang hoạt động bị bỏ trống.
+            if cov["shifts"] > 0 or (cov["active_count"] > 0 and cov["has_missing"]):
+                missing_sales.append(day)
+        else:
+            txt = _clean_cell_text(raw).upper()
+            if val == 0 and txt in {"0", "0.0", "-", "–", "—"}:
+                explicit_zero_sales.append(day)
+
+    data_incomplete = bool(missing_sales or total_missing_schedule)
+    icon, label, severity = _status_from_metrics(actual, target, pace, pressure, completed_day)
+
+    # Xu hướng 7 ngày so với 7 ngày ngay trước đó. Chỉ lấy ngày đã hoàn tất.
+    end = completed_day
+    cur_start = max(1, end - 6)
+    prev_end = cur_start - 1
+    prev_start = max(1, prev_end - 6)
+    last7 = sum(daily_sales_values[cur_start - 1:end]) if end >= cur_start else 0.0
+    prev7 = sum(daily_sales_values[prev_start - 1:prev_end]) if prev_end >= prev_start else 0.0
+    trend_pct = None
+    if prev7 > 0:
+        trend_pct = (last7 - prev7) / prev7
+
+    return {
+        **store,
+        "target": target,
+        "actual": actual,
+        "actual_ratio": actual_ratio,
+        "expected_ratio": expected_ratio,
+        "pace": pace,
+        "pace_basis": pace_basis,
+        "elapsed_effective_days": elapsed_eff,
+        "total_effective_days": total_eff,
+        "remaining_effective_days": remaining_eff,
+        "avg_per_day": avg_per_eff_day,
+        "required_per_day": required_per_day,
+        "pressure": pressure,
+        "forecast": forecast,
+        "status_icon": icon,
+        "status_label": label,
+        "severity": severity,
+        "employees_detail": employee_results,
+        "coverage": coverage,
+        "work_units_elapsed": total_work_units,
+        "missing_schedule": missing_schedule,
+        "missing_schedule_count": total_missing_schedule,
+        "missing_sales_days": missing_sales,
+        "explicit_zero_sales_days": explicit_zero_sales,
+        "data_incomplete": data_incomplete,
+        "schedule_plan_usable": schedule_plan_usable,
+        "last7_sales": last7,
+        "prev7_sales": prev7,
+        "trend_pct": trend_pct,
+    }
+
+
+def get_sales_analysis(target_dt=None, force=False):
+    target_dt = target_dt or _sales_now()
+    sheet_name, df = _load_sales_sheet(target_dt=target_dt, force=force)
+    parsed = _parse_sales_sheet(df, target_dt.year, target_dt.month, sheet_name)
+    completed_day = _analysis_completed_day(target_dt.year, target_dt.month, _sales_now())
+    analyzed = [
+        _analyze_store(s, target_dt.year, target_dt.month, parsed["days_in_month"], completed_day)
+        for s in parsed["stores"]
+        if float(s.get("target") or 0) > 0
+    ]
+    parsed["stores"] = analyzed
+    parsed["completed_day"] = completed_day
+    parsed["generated_at"] = _sales_now().isoformat(timespec="minutes")
+    return parsed
+
+
+def _fmt_sales_amount(value):
+    try:
+        v = float(value)
+    except Exception:
+        return "0"
+    if v == float("inf"):
+        return "∞"
+    sign = "-" if v < 0 else ""
+    v = abs(v)
+    # Sheet đang dùng đơn vị nghìn đồng: 220.000 = 220 triệu; 10.940.000 = 10,94 tỷ.
+    if v >= 1_000_000:
+        n = v / 1_000_000
+        txt = f"{n:.2f}".rstrip("0").rstrip(".").replace(".", ",")
+        return f"{sign}{txt} tỷ"
+    if v >= 1_000:
+        n = v / 1_000
+        txt = f"{n:.1f}".rstrip("0").rstrip(".").replace(".", ",")
+        return f"{sign}{txt}tr"
+    txt = f"{v:.0f}".replace(".", ",")
+    return f"{sign}{txt}k"
+
+
+def _fmt_pct(value, digits=0):
+    if value is None:
+        return "—"
+    try:
+        return f"{float(value) * 100:.{digits}f}%".replace(".", ",")
+    except Exception:
+        return "—"
+
+
+def _fmt_pressure(value):
+    if value is None:
+        return "—"
+    try:
+        if value == float("inf") or value > 99:
+            return ">99x"
+        return f"{value:.1f}x".replace(".", ",")
+    except Exception:
+        return "—"
+
+
+def _compact_day_ranges(days):
+    vals = sorted({int(d) for d in days if d})
+    if not vals:
+        return ""
+    parts = []
+    start = prev = vals[0]
+    for d in vals[1:]:
+        if d == prev + 1:
+            prev = d
+            continue
+        parts.append(str(start) if start == prev else f"{start}–{prev}")
+        start = prev = d
+    parts.append(str(start) if start == prev else f"{start}–{prev}")
+    return ", ".join(parts)
+
+
+def _progress_bar(ratio, width=12):
+    try:
+        r = max(0.0, min(float(ratio), 1.0))
+    except Exception:
+        r = 0.0
+    filled = int(round(r * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _sales_buttons():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📊 Tổng quan", callback_data="sales:summary"),
+            InlineKeyboardButton("🚨 Điểm yếu", callback_data="sales:weak"),
+        ],
+        [
+            InlineKeyboardButton("⚠️ Thiếu dữ liệu", callback_data="sales:missing"),
+            InlineKeyboardButton("🔄 Làm mới", callback_data="sales:refresh"),
+        ],
+    ])
+
+
+def build_sales_summary(analysis):
+    branch = analysis.get("branch") or {}
+    stores = analysis.get("stores") or []
+    day = analysis.get("completed_day", 0)
+    days_in_month = analysis.get("days_in_month", 30)
+    target = float(branch.get("target") or sum(s["target"] for s in stores))
+    actual = float(branch.get("actual") or sum(s["actual"] for s in stores))
+    ratio = actual / target if target > 0 else 0.0
+    expected = day / days_in_month if days_in_month else 0.0
+    pace = ratio / expected if expected > 0 else None
+
+    counts = {"🔴": 0, "🟠": 0, "🟡": 0, "🟢": 0, "⚪": 0}
+    incomplete = 0
+    for s in stores:
+        counts[s.get("status_icon", "⚪")] = counts.get(s.get("status_icon", "⚪"), 0) + 1
+        if s.get("data_incomplete"):
+            incomplete += 1
+
+    weak_reliable = sorted(
+        [s for s in stores if s.get("severity", 0) >= 3 and not s.get("data_incomplete")],
+        key=lambda x: (x.get("severity", 0), -(x.get("pace") or 0)),
+        reverse=True,
+    )[:3]
+
+    lines = [
+        f"📊 DOANH SỐ | {analysis['sheet_name']} | chốt đến ngày {day:02d}/{analysis['month']:02d}",
+        f"🏢 Toàn CN: {_fmt_sales_amount(actual)} / {_fmt_sales_amount(target)} · {_fmt_pct(ratio,1)}",
+        f"⏱ Tiến độ tháng: {_fmt_pct(expected,1)} · Pace: {_fmt_pct(pace,0)}",
+        f"📍 Điểm bán: 🔴 {counts.get('🔴',0)} · 🟠 {counts.get('🟠',0)} · 🟡 {counts.get('🟡',0)} · 🟢 {counts.get('🟢',0)}",
+    ]
+    if incomplete:
+        lines.append(f"⚠️ {incomplete} điểm còn thiếu dữ liệu → kết quả các điểm đó chỉ tạm tính.")
+    if weak_reliable:
+        lines.append("\nCần chú ý:")
+        for s in weak_reliable:
+            lines.append(
+                f"{s['status_icon']} {s['name']}: {_fmt_pct(s['actual_ratio'],0)} target · "
+                f"Pace {_fmt_pct(s['pace'],0)} · cần {_fmt_sales_amount(s['required_per_day'])}/ngày"
+            )
+    return "\n".join(lines)
+
+
+def _weak_store_sort_key(s):
+    pressure = s.get("pressure")
+    if pressure is None or pressure == float("inf"):
+        pressure_val = 999.0
+    else:
+        pressure_val = float(pressure)
+    return (s.get("severity", 0), 1.0 - min(s.get("pace") or 0, 1.0), min(pressure_val, 999.0))
+
+
+def build_weak_sales_report(analysis, max_points=SALES_MAX_ALERT_POINTS):
+    stores = analysis.get("stores") or []
+    reliable = [s for s in stores if s.get("severity", 0) >= 3 and not s.get("data_incomplete")]
+    provisional = [s for s in stores if s.get("severity", 0) >= 3 and s.get("data_incomplete")]
+    reliable = sorted(reliable, key=_weak_store_sort_key, reverse=True)
+    provisional = sorted(provisional, key=_weak_store_sort_key, reverse=True)
+
+    lines = [f"🚨 CẢNH BÁO DOANH SỐ | {analysis['sheet_name']} | đến ngày {analysis['completed_day']:02d}"]
+    if not reliable and not provisional:
+        lines.append("✅ Chưa có điểm nào ở mức Nguy cơ/Báo động theo dữ liệu hiện tại.")
+        return "\n".join(lines)
+
+    if reliable:
+        lines.append(f"\nĐiểm cần xử lý ({len(reliable)}):")
+        for s in reliable[:max_points]:
+            lines.append(
+                f"{s['status_icon']} {s['name']} · {_fmt_sales_amount(s['actual'])}/{_fmt_sales_amount(s['target'])} ({_fmt_pct(s['actual_ratio'],0)})\n"
+                f"   Pace {_fmt_pct(s['pace'],0)} · TB {_fmt_sales_amount(s['avg_per_day'])}/ngày · "
+                f"cần {_fmt_sales_amount(s['required_per_day'])}/ngày ({_fmt_pressure(s['pressure'])})"
+            )
+        if len(reliable) > max_points:
+            lines.append(f"… còn {len(reliable)-max_points} điểm. Dùng /canhbao để xem lại sau khi dữ liệu cập nhật.")
+
+    if provisional:
+        lines.append(f"\n⚠️ {len(provisional)} điểm đang yếu nhưng thiếu dữ liệu, chưa kết luận chính thức:")
+        for s in provisional[:3]:
+            miss = len(s.get("missing_sales_days", [])) + s.get("missing_schedule_count", 0)
+            lines.append(f"• {s['name']}: {_fmt_pct(s['actual_ratio'],0)} target · thiếu {miss} ô/ngày dữ liệu")
+    return "\n".join(lines)
+
+
+def build_missing_data_report(analysis, max_points=8):
+    stores = [s for s in analysis.get("stores", []) if s.get("data_incomplete")]
+    lines = [f"⚠️ THIẾU DỮ LIỆU | {analysis['sheet_name']} | kiểm tra đến ngày {analysis['completed_day']:02d}"]
+    if not stores:
+        lines.append("✅ Doanh số và lịch ca của các điểm đang đầy đủ theo phạm vi kiểm tra.")
+        return "\n".join(lines)
+
+    total_sales_days = sum(len(s.get("missing_sales_days", [])) for s in stores)
+    total_schedule = sum(s.get("missing_schedule_count", 0) for s in stores)
+    lines.append(f"Tổng: {len(stores)} điểm · {total_sales_days} ngày doanh số · {total_schedule} ô lịch ca còn thiếu.")
+
+    for s in stores[:max_points]:
+        parts = []
+        if s.get("missing_sales_days"):
+            parts.append("DS " + _compact_day_ranges(s["missing_sales_days"]))
+        if s.get("missing_schedule"):
+            emp_chunks = []
+            for emp_name, days in list(s["missing_schedule"].items())[:2]:
+                emp_chunks.append(f"{emp_name}: {_compact_day_ranges(days)}")
+            if len(s["missing_schedule"]) > 2:
+                emp_chunks.append(f"+{len(s['missing_schedule'])-2} NV")
+            parts.append("Lịch " + "; ".join(emp_chunks))
+        lines.append(f"• {s['name']}: " + " | ".join(parts))
+    if len(stores) > max_points:
+        lines.append(f"… còn {len(stores)-max_points} điểm chưa hiển thị để giữ tin nhắn ngắn gọn.")
+    lines.append("\nLưu ý: ô trống mới tính là thiếu; 0 hoặc '-' được coi là đã khai báo không phát sinh doanh số.")
+    return "\n".join(lines)
+
+
+def _find_store(analysis, query):
+    stores = analysis.get("stores") or []
+    if not stores:
+        return None, []
+    q = _normalize_name(query)
+    if not q:
+        return None, []
+
+    exactish = [s for s in stores if q in _normalize_name(s["name"]) or _normalize_name(s["name"]) in q]
+    if len(exactish) == 1:
+        return exactish[0], []
+    if len(exactish) > 1:
+        return exactish[0], [s["name"] for s in exactish[:5]]
+
+    names = {_normalize_name(s["name"]): s for s in stores}
+    close = difflib.get_close_matches(q, list(names.keys()), n=5, cutoff=0.40)
+    if not close:
+        return None, []
+    return names[close[0]], [names[x]["name"] for x in close]
+
+
+def build_store_detail(analysis, store):
+    reliable_note = "" if not store.get("data_incomplete") else "\n⚠️ Dữ liệu chưa đủ, các chỉ số hiệu suất đang là TẠM TÍNH."
+    lines = [
+        f"📍 {store['name']} | {analysis['sheet_name']}",
+        f"{store['status_icon']} {store['status_label']} · Target {_fmt_sales_amount(store['target'])}",
+        f"Thực tế : {_progress_bar(store['actual_ratio'])} {_fmt_pct(store['actual_ratio'],1)} · {_fmt_sales_amount(store['actual'])}",
+        f"Kỳ vọng : {_progress_bar(store['expected_ratio'])} {_fmt_pct(store['expected_ratio'],1)} ({store['pace_basis']})",
+        f"⚡ Pace {_fmt_pct(store['pace'],0)} · Áp lực còn lại {_fmt_pressure(store['pressure'])}",
+        f"📈 TB {_fmt_sales_amount(store['avg_per_day'])}/ngày · cần {_fmt_sales_amount(store['required_per_day'])}/ngày",
+        f"🔮 Dự báo cuối tháng ~{_fmt_sales_amount(store['forecast'])} · còn thiếu {_fmt_sales_amount(max(0, store['target']-store['actual']))}",
+    ]
+
+    if store.get("schedule_plan_usable"):
+        lines.append(
+            f"🗓 Phủ ca hiệu dụng: {store['elapsed_effective_days']:.1f}/{store['total_effective_days']:.1f} ngày · "
+            f"công NV đã ghi nhận: {store['work_units_elapsed']}"
+        )
+    else:
+        lines.append(
+            f"🗓 Lịch ca cả tháng chưa đủ để làm mẫu số đáng tin; Pace đang dùng ngày trong tháng. "
+            f"Công NV đã ghi nhận: {store['work_units_elapsed']}"
+        )
+
+    if store.get("employees_detail"):
+        emp_bits = []
+        for emp in store["employees_detail"][:4]:
+            emp_bits.append(f"{emp['name']}: {emp.get('work_units_elapsed',0)} công")
+        lines.append("👥 " + " · ".join(emp_bits))
+
+    if store.get("missing_sales_days"):
+        lines.append("⚠️ Thiếu doanh số ngày: " + _compact_day_ranges(store["missing_sales_days"]))
+    if store.get("missing_schedule"):
+        items = []
+        for emp_name, days in list(store["missing_schedule"].items())[:4]:
+            items.append(f"{emp_name} ({_compact_day_ranges(days)})")
+        lines.append("⚠️ Thiếu lịch: " + "; ".join(items))
+
+    trend = store.get("trend_pct")
+    if trend is not None:
+        arrow = "↗" if trend > 0.05 else ("↘" if trend < -0.05 else "→")
+        lines.append(
+            f"{arrow} 7 ngày gần nhất {_fmt_sales_amount(store['last7_sales'])} so với 7 ngày trước "
+            f"{_fmt_sales_amount(store['prev7_sales'])} ({trend*100:+.0f}%)"
+        )
+    return "\n".join(lines) + reliable_note
+
+
+def build_sales_trend_report(analysis, query=None):
+    if query:
+        store, suggestions = _find_store(analysis, query)
+        if not store:
+            return "❌ Không tìm thấy điểm bán phù hợp."
+        return build_store_detail(analysis, store)
+
+    stores = [s for s in analysis.get("stores", []) if s.get("trend_pct") is not None]
+    falling = sorted(stores, key=lambda x: x.get("trend_pct", 0))[:5]
+    rising = sorted(stores, key=lambda x: x.get("trend_pct", 0), reverse=True)[:3]
+    lines = [f"📉 XU HƯỚNG 7 NGÀY | {analysis['sheet_name']}"]
+    if falling:
+        lines.append("\nGiảm mạnh:")
+        for s in falling:
+            lines.append(f"↘ {s['name']}: {s['trend_pct']*100:+.0f}% · 7 ngày {_fmt_sales_amount(s['last7_sales'])}")
+    if rising:
+        lines.append("\nTăng tốt:")
+        for s in rising:
+            lines.append(f"↗ {s['name']}: {s['trend_pct']*100:+.0f}% · 7 ngày {_fmt_sales_amount(s['last7_sales'])}")
+    if not falling and not rising:
+        lines.append("Chưa đủ dữ liệu hai giai đoạn 7 ngày để so sánh.")
+    return "\n".join(lines)
+
+
+def _sales_monitor_state():
+    state = cloud_data.setdefault("sales_monitor", {})
+    state.setdefault("subscribers", [])
+    state.setdefault("last_state_fingerprint", "")
+    state.setdefault("last_close_report_date", "")
+    state.setdefault("last_weekly_check", "")
+    return state
+
+
+def _sales_subscribers():
+    raw = _sales_monitor_state().get("subscribers", [])
+    out = []
+    for cid in raw:
+        try:
+            out.append(int(cid))
+        except Exception:
+            out.append(cid)
+    return out
+
+
+def _sales_issue_fingerprint(analysis):
+    payload = []
+    for s in sorted(analysis.get("stores", []), key=lambda x: _normalize_name(x["name"])):
+        if s.get("severity", 0) >= 2 or s.get("data_incomplete"):
+            payload.append({
+                "name": s["name"],
+                "status": s.get("status_icon"),
+                "missing_sales": s.get("missing_sales_days", []),
+                "missing_schedule": s.get("missing_schedule", {}),
+            })
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+async def _send_sales_message(bot, chat_id, text, reply_markup=None):
+    chunks = _split_telegram_text(text, limit=3400)
+    for i, chunk in enumerate(chunks):
+        await bot.send_message(
+            chat_id=chat_id,
+            text=chunk,
+            reply_markup=reply_markup if i == len(chunks) - 1 else None,
+        )
+
+
+async def _get_sales_analysis_async(force=False):
+    return await asyncio.to_thread(get_sales_analysis, None, force)
+
+
+async def doanhso_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_chat_id(update.effective_chat.id)
+    msg = await update.message.reply_text("📊 Đang đọc Google Sheet và tính tiến độ...")
+    try:
+        analysis = await _get_sales_analysis_async(force=True)
+        await msg.edit_text(build_sales_summary(analysis), reply_markup=_sales_buttons())
+    except Exception as e:
+        logger.error(f"Lỗi /doanhso: {e}")
+        await msg.edit_text(f"❌ Không đọc được dữ liệu doanh số: {e}")
+
+
+async def canhbao_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_chat_id(update.effective_chat.id)
+    msg = await update.message.reply_text("🚨 Đang tính các điểm cần cảnh báo...")
+    try:
+        analysis = await _get_sales_analysis_async(force=True)
+        await msg.edit_text(build_weak_sales_report(analysis), reply_markup=_sales_buttons())
+    except Exception as e:
+        logger.error(f"Lỗi /canhbao: {e}")
+        await msg.edit_text(f"❌ Không đọc được dữ liệu doanh số: {e}")
+
+
+async def thieudulieu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_chat_id(update.effective_chat.id)
+    msg = await update.message.reply_text("⚠️ Đang rà soát ô trống doanh số và lịch ca...")
+    try:
+        analysis = await _get_sales_analysis_async(force=True)
+        await msg.edit_text(build_missing_data_report(analysis), reply_markup=_sales_buttons())
+    except Exception as e:
+        logger.error(f"Lỗi /thieudulieu: {e}")
+        await msg.edit_text(f"❌ Không đọc được dữ liệu doanh số: {e}")
+
+
+async def diemban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_chat_id(update.effective_chat.id)
+    query = " ".join(context.args).strip()
+    if not query:
+        await update.message.reply_text("Ví dụ: /diemban thanh hoa hoặc /diemban aeon long bien")
+        return
+    msg = await update.message.reply_text(f"📍 Đang phân tích điểm '{query}'...")
+    try:
+        analysis = await _get_sales_analysis_async(force=True)
+        store, suggestions = _find_store(analysis, query)
+        if not store:
+            await msg.edit_text("❌ Không tìm thấy điểm bán phù hợp trong sheet tháng hiện tại.")
+            return
+        text = build_store_detail(analysis, store)
+        if len(suggestions) > 1:
+            text += "\n\nGần khớp: " + "; ".join(suggestions[:4])
+        await msg.edit_text(text, reply_markup=_sales_buttons())
+    except Exception as e:
+        logger.error(f"Lỗi /diemban: {e}")
+        await msg.edit_text(f"❌ Không đọc được dữ liệu doanh số: {e}")
+
+
+async def xuhuong_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_chat_id(update.effective_chat.id)
+    query = " ".join(context.args).strip()
+    msg = await update.message.reply_text("📈 Đang tính xu hướng 7 ngày...")
+    try:
+        analysis = await _get_sales_analysis_async(force=True)
+        await msg.edit_text(build_sales_trend_report(analysis, query or None), reply_markup=_sales_buttons())
+    except Exception as e:
+        logger.error(f"Lỗi /xuhuong: {e}")
+        await msg.edit_text(f"❌ Không đọc được dữ liệu doanh số: {e}")
+
+
+async def theodoidoanhso_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_chat_id(update.effective_chat.id)
+    chat_id = str(update.effective_chat.id)
+    args = [str(x).strip().lower() for x in context.args]
+    state = _sales_monitor_state()
+    subscribers = [str(x) for x in state.get("subscribers", [])]
+
+    if not args:
+        enabled = chat_id in subscribers
+        await update.message.reply_text(
+            f"🔔 Cảnh báo doanh số tự động cho chat này: {'ĐANG BẬT' if enabled else 'ĐANG TẮT'}\n"
+            "Dùng /theodoidoanhso on hoặc /theodoidoanhso off."
+        )
+        return
+
+    action = args[0]
+    if action in {"on", "bat", "bật", "1"}:
+        if chat_id not in subscribers:
+            subscribers.append(chat_id)
+        state["subscribers"] = subscribers
+        await save_cloud_db(context, update.effective_chat.id)
+        await update.message.reply_text(
+            "✅ Đã bật theo dõi doanh số cho chat này.\n"
+            "Bot chỉ ĐỌC Google Sheet và sẽ gửi cảnh báo khi trạng thái thay đổi, cuối ngày hoặc khi thiếu dữ liệu."
+        )
+    elif action in {"off", "tat", "tắt", "0"}:
+        state["subscribers"] = [x for x in subscribers if x != chat_id]
+        await save_cloud_db(context, update.effective_chat.id)
+        await update.message.reply_text("✅ Đã tắt cảnh báo doanh số tự động cho chat này.")
+    else:
+        await update.message.reply_text("Dùng: /theodoidoanhso on hoặc /theodoidoanhso off")
+
+
+async def sales_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = (query.data or "").split(":", 1)[-1]
+    try:
+        analysis = await _get_sales_analysis_async(force=(action == "refresh"))
+        if action in {"summary", "refresh"}:
+            text = build_sales_summary(analysis)
+        elif action == "weak":
+            text = build_weak_sales_report(analysis)
+        elif action == "missing":
+            text = build_missing_data_report(analysis)
+        else:
+            return
+        await _send_sales_message(context.bot, query.message.chat_id, text, _sales_buttons())
+    except Exception as e:
+        logger.error(f"Lỗi sales callback: {e}")
+        await context.bot.send_message(chat_id=query.message.chat_id, text=f"❌ Không đọc được dữ liệu doanh số: {e}")
+
+
+def _build_auto_sales_report(analysis, include_summary=False):
+    weak = build_weak_sales_report(analysis)
+    missing = build_missing_data_report(analysis)
+    if include_summary:
+        summary = build_sales_summary(analysis)
+        return f"{summary}\n\n{weak}\n\n{missing}"
+    # Giữ gọn cho cảnh báo giữa ngày.
+    if any(s.get("data_incomplete") for s in analysis.get("stores", [])):
+        return f"{weak}\n\n{missing}"
+    return weak
+
+
+async def sales_auto_monitor_job(context: ContextTypes.DEFAULT_TYPE):
+    subscribers = _sales_subscribers()
+    if not subscribers:
+        return
+    try:
+        analysis = await _get_sales_analysis_async(force=True)
+        now = _sales_now()
+        state = _sales_monitor_state()
+        fingerprint = _sales_issue_fingerprint(analysis)
+        is_close = (now.hour, now.minute) >= (SALES_CLOSE_HOUR, SALES_CLOSE_MINUTE)
+        today_key = now.strftime("%Y-%m-%d")
+
+        should_send = False
+        include_summary = False
+        if is_close and state.get("last_close_report_date") != today_key:
+            should_send = True
+            include_summary = True
+            state["last_close_report_date"] = today_key
+        elif fingerprint != state.get("last_state_fingerprint"):
+            should_send = True
+
+        state["last_state_fingerprint"] = fingerprint
+        if not should_send:
+            return
+
+        text = _build_auto_sales_report(analysis, include_summary=include_summary)
+        for cid in subscribers:
+            try:
+                await _send_sales_message(context.bot, cid, text, _sales_buttons())
+            except Exception as e:
+                logger.error(f"Lỗi gửi cảnh báo doanh số cho {cid}: {e}")
+        await save_cloud_db()
+    except Exception as e:
+        logger.error(f"Lỗi job theo dõi doanh số: {e}")
+
+
+def _collect_weekly_missing(analysis, day_set):
+    items = []
+    for s in analysis.get("stores", []):
+        sales_days = sorted(set(s.get("missing_sales_days", [])) & set(day_set))
+        schedules = {}
+        for emp, days in s.get("missing_schedule", {}).items():
+            matched = sorted(set(days) & set(day_set))
+            if matched:
+                schedules[emp] = matched
+        if sales_days or schedules:
+            items.append({"name": s["name"], "sales": sales_days, "schedules": schedules})
+    return items
+
+
+def build_weekly_missing_report(now=None):
+    now = now or _sales_now()
+    this_monday = (now - timedelta(days=now.weekday())).date()
+    prev_monday = this_monday - timedelta(days=7)
+    prev_sunday = this_monday - timedelta(days=1)
+
+    dates = []
+    d = prev_monday
+    while d <= prev_sunday:
+        dates.append(d)
+        d += timedelta(days=1)
+
+    by_month = {}
+    for d in dates:
+        by_month.setdefault((d.year, d.month), []).append(d.day)
+
+    all_items = []
+    for (year, month), days in sorted(by_month.items()):
+        target_dt = SALES_TZ.localize(datetime(year, month, 1, 12, 0))
+        try:
+            analysis = get_sales_analysis(target_dt=target_dt, force=False)
+        except Exception as e:
+            all_items.append({"name": f"T{month}.{year}", "error": str(e)})
+            continue
+        for item in _collect_weekly_missing(analysis, days):
+            item["sheet"] = analysis["sheet_name"]
+            all_items.append(item)
+
+    lines = [f"📅 KIỂM TRA DỮ LIỆU TUẦN {prev_monday.strftime('%d/%m')}–{prev_sunday.strftime('%d/%m')}"]
+    valid = [x for x in all_items if not x.get("error")]
+    errors = [x for x in all_items if x.get("error")]
+    if not valid and not errors:
+        lines.append("✅ Không phát hiện dữ liệu còn thiếu trong tuần trước.")
+        return "\n".join(lines)
+
+    if valid:
+        lines.append(f"⚠️ {len(valid)} điểm còn thiếu dữ liệu:")
+        for item in valid[:10]:
+            parts = []
+            if item.get("sales"):
+                parts.append("DS " + _compact_day_ranges(item["sales"]))
+            if item.get("schedules"):
+                schedule_count = sum(len(v) for v in item["schedules"].values())
+                parts.append(f"lịch {schedule_count} ô")
+            lines.append(f"• {item['name']} ({item.get('sheet','')}): " + " · ".join(parts))
+        if len(valid) > 10:
+            lines.append(f"… còn {len(valid)-10} điểm.")
+    for err in errors:
+        lines.append(f"❌ {err['name']}: {err['error']}")
+    return "\n".join(lines)
+
+
+async def sales_weekly_missing_job(context: ContextTypes.DEFAULT_TYPE):
+    subscribers = _sales_subscribers()
+    if not subscribers:
+        return
+    now = _sales_now()
+    week_key = f"{now.isocalendar().year}-W{now.isocalendar().week:02d}"
+    state = _sales_monitor_state()
+    if state.get("last_weekly_check") == week_key:
+        return
+    try:
+        text = await asyncio.to_thread(build_weekly_missing_report, now)
+        for cid in subscribers:
+            try:
+                await _send_sales_message(context.bot, cid, text, _sales_buttons())
+            except Exception as e:
+                logger.error(f"Lỗi gửi kiểm tra tuần cho {cid}: {e}")
+        state["last_weekly_check"] = week_key
+        await save_cloud_db()
+    except Exception as e:
+        logger.error(f"Lỗi job kiểm tra dữ liệu tuần: {e}")
+
 # ---------------- MAIN INITIALIZATION ----------------
 def main():
     if not TELEGRAM_TOKEN or not ODOO_URL_RAW or not ODOO_DB or not ODOO_USERNAME or not ODOO_PASSWORD:
@@ -4109,6 +5300,15 @@ def main():
     application.add_handler(CommandHandler("baocaongay", daily_report_command))
     application.add_handler(CommandHandler("dotonkho", dotonkho_command))  
     application.add_handler(CommandHandler("baodanh", baodanh_command))  
+
+    # --- SALES PERFORMANCE MONITOR (CHỈ ĐỌC GOOGLE SHEET) ---
+    application.add_handler(CommandHandler("doanhso", doanhso_command))
+    application.add_handler(CommandHandler("canhbao", canhbao_command))
+    application.add_handler(CommandHandler("diemban", diemban_command))
+    application.add_handler(CommandHandler("xuhuong", xuhuong_command))
+    application.add_handler(CommandHandler("thieudulieu", thieudulieu_command))
+    application.add_handler(CommandHandler("theodoidoanhso", theodoidoanhso_command))
+    application.add_handler(CallbackQueryHandler(sales_callback_handler, pattern=r"^sales:"))
     
     application.add_handler(MessageHandler(filters.Document.ALL, handle_po_file))
     
@@ -4134,8 +5334,18 @@ def main():
         # cũng được giữ lại qua lần sleep/restart của Render Free mà không làm
         # chậm từng nghiệp vụ bằng một request JSONBin ngay tại mỗi lệnh.
         application.job_queue.run_repeating(flush_ai_memory_job, interval=600, first=120)
+
+        # Cảnh báo doanh số theo giờ Việt Nam.
+        # 11:00 và 16:00 chỉ gửi khi trạng thái/missing thay đổi; 20:30 gửi báo cáo cuối ngày.
+        application.job_queue.run_daily(sales_auto_monitor_job, time=dt_time(hour=11, minute=0, tzinfo=SALES_TZ))
+        application.job_queue.run_daily(sales_auto_monitor_job, time=dt_time(hour=16, minute=0, tzinfo=SALES_TZ))
+        application.job_queue.run_daily(sales_auto_monitor_job, time=dt_time(hour=20, minute=30, tzinfo=SALES_TZ))
+        # Thứ Hai 09:00 quét lại dữ liệu tuần trước (python-telegram-bot v20+: 1 = Monday).
+        application.job_queue.run_daily(sales_weekly_missing_job, time=dt_time(hour=9, minute=0, tzinfo=SALES_TZ), days=(1,))
+
         logger.info("Đã kích hoạt chế độ Auto Troll mỗi 2 tiếng (Tỷ lệ 30%).")
         logger.info("Đã kích hoạt đồng bộ AI memory lên JSONBin mỗi 10 phút.")
+        logger.info("Đã kích hoạt Sales Monitor READ-ONLY lúc 11:00, 16:00, 20:30 và kiểm tra tuần vào Thứ Hai 09:00.")
     else:
         logger.warning("JobQueue chưa khả dụng. Cần cài đặt python-telegram-bot[job-queue]")
 
