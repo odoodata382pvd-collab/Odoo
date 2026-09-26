@@ -214,7 +214,8 @@ JSONBIN_BIN_ID = os.environ.get('JSONBIN_BIN_ID')
 cloud_data = {
     "sales_mapping": {},
     "ai_memory": {},
-    "sales_monitor": {}
+    "sales_monitor": {},
+    "odoo_daily_report": {}
 }
 
 # ---------------- AI MEMORY (KHÔNG THAY ĐỔI NGHIỆP VỤ ODOO) ----------------
@@ -246,6 +247,7 @@ def load_cloud_db():
                     cloud_data.setdefault("sales_mapping", {})
                     cloud_data.setdefault("ai_memory", {})
                     cloud_data.setdefault("sales_monitor", {})
+                    cloud_data.setdefault("odoo_daily_report", {})
                     if "price_cache" in cloud_data:
                         with open("price_cache.json", 'w', encoding='utf-8') as f:
                             json.dump(cloud_data["price_cache"], f, ensure_ascii=False, indent=4)
@@ -3100,6 +3102,7 @@ def _sales_menu_keyboard():
     return ReplyKeyboardMarkup(
         [
             ["📊 Tổng quan doanh số", "🚨 Điểm yếu"],
+            ["🧾 Odoo hôm nay", "🔔 Báo cáo Odoo ngày"],
             ["📍 Chọn điểm bán", "📈 Xu hướng 7 ngày"],
             ["⚠️ Thiếu dữ liệu", "🔔 Theo dõi cảnh báo"],
             [MENU_BACK],
@@ -3156,20 +3159,20 @@ def _clear_menu_input_mode(context):
 
 
 async def _menu_sales_store_picker(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mở thẳng danh sách điểm bán bằng inline buttons."""
-    msg = await update.message.reply_text("📍 Đang tải danh sách điểm bán...")
+    """Mở danh sách điểm từ snapshot; chỉ lần đầu mới cần đọc/parse Sheet."""
+    msg = await update.message.reply_text("📍 Đang mở doanh số các điểm...")
     try:
-        analysis = await _get_sales_analysis_async(force=True)
-        markup, page, max_page, total = _sales_store_list_buttons(analysis, page=0)
+        analysis = await _get_sales_ui_analysis(context, force=False)
+        text, markup = build_sales_store_page(analysis, page=0)
         await msg.edit_text(
-            f"📍 <b>CHỌN ĐIỂM BÁN — {_tg_html(analysis['sheet_name'])}</b>\n"
-            f"Có <b>{total}</b> điểm · Trang {page+1}/{max_page+1}\n\n"
-            "Bấm vào điểm muốn xem để bot phân tích chi tiết.",
+            text,
             reply_markup=markup,
             parse_mode="HTML",
+            disable_web_page_preview=True,
         )
     except Exception as e:
         logger.error(f"Lỗi menu chọn điểm bán: {e}")
+        await msg.edit_text(f"❌ Không đọc được dữ liệu doanh số: {e}")
         await msg.edit_text(f"❌ Không đọc được dữ liệu doanh số: {e}")
 
 
@@ -3260,6 +3263,12 @@ async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if text == "🚨 Điểm yếu":
         await canhbao_command(update, context)
+        return
+    if text == "🧾 Odoo hôm nay":
+        await baocaoodoo_command(update, context)
+        return
+    if text == "🔔 Báo cáo Odoo ngày":
+        await _menu_odoo_daily_monitor(update, context)
         return
     if text == "📍 Chọn điểm bán":
         await _menu_sales_store_picker(update, context)
@@ -4407,13 +4416,36 @@ async def cancel_chuyenkho_conversation(update: Update, context: ContextTypes.DE
 
 SALES_SPREADSHEET_ID = (os.environ.get('SALES_SPREADSHEET_ID') or '1b1oWOxzuo044l93gXlOUBD_7XTbYhwKaFNu38gv_BQg').strip()
 SALES_EXPORT_URL = f"https://docs.google.com/spreadsheets/d/{SALES_SPREADSHEET_ID}/export?format=xlsx"
-SALES_CACHE_SECONDS = 180
+SALES_CACHE_SECONDS = 300
+# Cache phân tích hoàn chỉnh để không phải parse lại toàn bộ workbook mỗi lần bấm 1 điểm.
+SALES_ANALYSIS_CACHE_SECONDS = 300
+# Một dashboard đang mở giữ snapshot lâu hơn để chuyển trang/xem điểm gần như tức thì.
+# Người dùng luôn có nút 🔄 Làm mới để lấy dữ liệu mới ngay lập tức.
+SALES_UI_SNAPSHOT_SECONDS = 900
 SALES_CLOSE_HOUR = 20
 SALES_CLOSE_MINUTE = 30
 SALES_MAX_ALERT_POINTS = 5
 SALES_TZ = pytz.timezone("Asia/Ho_Chi_Minh")
+
+# Báo cáo đơn Odoo hằng ngày. Đây là báo cáo các đơn ĐÃ XÁC NHẬN trên Odoo,
+# không thay thế sell-out ký gửi của các chuỗi điện máy. Chỉ READ từ Odoo.
+try:
+    ODOO_DAILY_WAREHOUSE_ID = int((os.environ.get("ODOO_DAILY_WAREHOUSE_ID") or "201").strip())
+except Exception:
+    ODOO_DAILY_WAREHOUSE_ID = 201
+try:
+    ODOO_DAILY_REPORT_HOUR = max(0, min(23, int((os.environ.get("ODOO_DAILY_REPORT_HOUR") or "21").strip())))
+except Exception:
+    ODOO_DAILY_REPORT_HOUR = 21
+try:
+    ODOO_DAILY_REPORT_MINUTE = max(0, min(59, int((os.environ.get("ODOO_DAILY_REPORT_MINUTE") or "15").strip())))
+except Exception:
+    ODOO_DAILY_REPORT_MINUTE = 15
+
 SALES_CACHE_LOCK = threading.Lock()
 SALES_CACHE = {"fetched_at": 0.0, "bytes": None, "sheet_names": []}
+SALES_ANALYSIS_CACHE_LOCK = threading.Lock()
+SALES_ANALYSIS_CACHE = {}
 
 VALID_SCHEDULE_TOKENS = {"S", "C", "FULL", "N", "NT", "OFF"}
 SCHEDULE_WORK_UNITS = {"S": 1, "C": 1, "FULL": 2, "N": 0, "NT": 0, "OFF": 0}
@@ -5077,10 +5109,29 @@ def _analyze_store(store, year, month, days_in_month, completed_day):
 
 
 def get_sales_analysis(target_dt=None, force=False):
+    """Load + parse + analyze một lần rồi cache kết quả hoàn chỉnh.
+
+    Trước đây chỉ cache bytes XLSX, nên mỗi lần bấm điểm bán vẫn phải chạy
+    pd.read_excel + parse toàn bộ sheet. Cache này loại bỏ phần tốn thời gian đó.
+    """
     target_dt = target_dt or _sales_now()
+    now_dt = _sales_now()
+    completed_day = _analysis_completed_day(target_dt.year, target_dt.month, now_dt)
+    cache_key = (int(target_dt.year), int(target_dt.month), int(completed_day))
+    now_ts = time.time()
+
+    if not force:
+        with SALES_ANALYSIS_CACHE_LOCK:
+            cached = SALES_ANALYSIS_CACHE.get(cache_key)
+            if (
+                cached
+                and cached.get("analysis") is not None
+                and now_ts - float(cached.get("fetched_at") or 0) < SALES_ANALYSIS_CACHE_SECONDS
+            ):
+                return cached["analysis"]
+
     sheet_name, df = _load_sales_sheet(target_dt=target_dt, force=force)
     parsed = _parse_sales_sheet(df, target_dt.year, target_dt.month, sheet_name)
-    completed_day = _analysis_completed_day(target_dt.year, target_dt.month, _sales_now())
     analyzed = [
         _analyze_store(s, target_dt.year, target_dt.month, parsed["days_in_month"], completed_day)
         for s in parsed["stores"]
@@ -5089,7 +5140,31 @@ def get_sales_analysis(target_dt=None, force=False):
     ]
     parsed["stores"] = analyzed
     parsed["completed_day"] = completed_day
-    parsed["generated_at"] = _sales_now().isoformat(timespec="minutes")
+    parsed["generated_at"] = now_dt.isoformat(timespec="minutes")
+
+    # Precompute các index dùng nhiều lần trong dashboard.
+    visible = [
+        st for st in analyzed
+        if float(st.get("target") or 0) > 0
+        and not _looks_like_employee_name(st.get("name", ""))
+    ]
+    sorted_stores = sorted(visible, key=lambda x: _normalize_name(x.get("name", "")))
+    parsed["_sorted_stores"] = sorted_stores
+    parsed["_store_name_index"] = {
+        _normalize_name(st.get("name", "")): st for st in sorted_stores
+        if _normalize_name(st.get("name", ""))
+    }
+
+    with SALES_ANALYSIS_CACHE_LOCK:
+        # Chỉ giữ vài snapshot gần nhất để RAM không tăng theo thời gian.
+        SALES_ANALYSIS_CACHE[cache_key] = {"fetched_at": now_ts, "analysis": parsed}
+        if len(SALES_ANALYSIS_CACHE) > 4:
+            oldest = sorted(
+                SALES_ANALYSIS_CACHE.items(),
+                key=lambda kv: float(kv[1].get("fetched_at") or 0)
+            )[:-4]
+            for key, _ in oldest:
+                SALES_ANALYSIS_CACHE.pop(key, None)
     return parsed
 
 
@@ -5198,7 +5273,11 @@ def _sales_buttons():
             InlineKeyboardButton("🔄 Làm mới", callback_data="sales:refresh"),
         ],
         [
-            InlineKeyboardButton("🔔 Theo dõi tự động", callback_data="sales:monitor"),
+            InlineKeyboardButton("🧾 Odoo hôm nay", callback_data="odoo:today"),
+            InlineKeyboardButton("🔔 Odoo mỗi ngày", callback_data="odoo:monitor"),
+        ],
+        [
+            InlineKeyboardButton("🔔 Theo dõi Sheet", callback_data="sales:monitor"),
         ],
     ])
 
@@ -5214,10 +5293,15 @@ def _sales_visible_stores(analysis):
 
 
 def _sales_sorted_stores(analysis):
-    return sorted(_sales_visible_stores(analysis), key=lambda x: _normalize_name(x.get("name", "")))
+    cached = analysis.get("_sorted_stores")
+    if isinstance(cached, list):
+        return cached
+    stores = sorted(_sales_visible_stores(analysis), key=lambda x: _normalize_name(x.get("name", "")))
+    analysis["_sorted_stores"] = stores
+    return stores
 
 
-def _sales_store_list_buttons(analysis, page=0, per_page=8):
+def _sales_store_list_buttons(analysis, page=0, per_page=10):
     stores = _sales_sorted_stores(analysis)
     total = len(stores)
     max_page = max(0, (total - 1) // per_page) if total else 0
@@ -5228,10 +5312,14 @@ def _sales_store_list_buttons(analysis, page=0, per_page=8):
     rows = []
     for idx in range(start, end):
         store = stores[idx]
-        label = str(store.get("name") or "Điểm bán")
-        if len(label) > 42:
-            label = label[:39] + "..."
-        rows.append([InlineKeyboardButton(f"📍 {label}", callback_data=f"sales:store:{idx}")])
+        name = str(store.get("name") or "Điểm bán")
+        if len(name) > 31:
+            name = name[:28] + "..."
+        pct = _fmt_pct(store.get("actual_ratio"), 0)
+        icon = store.get("status_icon") or "📍"
+        # Nhìn ngay % target trên nút, không cần mở từng điểm chỉ để xem tiến độ.
+        label = f"{icon} {name} · {pct}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"sales:store:{idx}")])
 
     nav = []
     if page > 0:
@@ -5240,8 +5328,50 @@ def _sales_store_list_buttons(analysis, page=0, per_page=8):
         nav.append(InlineKeyboardButton("Sau ➡️", callback_data=f"sales:stores:{page+1}"))
     if nav:
         rows.append(nav)
-    rows.append([InlineKeyboardButton("🏠 Menu doanh số", callback_data="sales:summary")])
+    rows.append([
+        InlineKeyboardButton("🏠 Menu doanh số", callback_data="sales:summary"),
+        InlineKeyboardButton("🔄 Cập nhật", callback_data="sales:refresh"),
+    ])
     return InlineKeyboardMarkup(rows), page, max_page, total
+
+
+def build_sales_store_page(analysis, page=0, per_page=10):
+    """Trang xem nhanh nhiều điểm; mở chi tiết chỉ khi thật sự cần."""
+    stores = _sales_sorted_stores(analysis)
+    total = len(stores)
+    max_page = max(0, (total - 1) // per_page) if total else 0
+    page = max(0, min(int(page or 0), max_page))
+    start = page * per_page
+    end = min(start + per_page, total)
+    generated = str(analysis.get("generated_at") or "")
+    generated_time = generated[11:16] if len(generated) >= 16 else "—"
+
+    lines = [
+        f"📍 <b>DOANH SỐ TỪNG ĐIỂM — {_tg_html(analysis['sheet_name'])}</b>",
+        f"<i>Trang {page+1}/{max_page+1} · {total} điểm · dữ liệu {generated_time}</i>",
+        "",
+    ]
+    if not stores:
+        lines.append("Không có điểm bán phù hợp trong sheet tháng hiện tại.")
+    else:
+        for idx in range(start, end):
+            st = stores[idx]
+            temp = " · ⚠️ tạm tính" if st.get("data_incomplete") else ""
+            lines.append(
+                f"{st.get('status_icon','⚪')} <b>{idx+1}. {_tg_html(st.get('name','Điểm bán'))}</b>"
+            )
+            lines.append(
+                f"   {_tg_html(_fmt_sales_amount(st.get('actual',0)))} / "
+                f"{_tg_html(_fmt_sales_amount(st.get('target',0)))} · "
+                f"<b>{_tg_html(_fmt_pct(st.get('actual_ratio'),0))}</b>{temp}"
+            )
+
+    lines += [
+        "",
+        "<i>Bấm tên điểm bên dưới nếu cần phân tích sâu. Chuyển trang/mở điểm dùng snapshot đã tải, không đọc lại Google Sheet mỗi lần.</i>",
+    ]
+    markup, page, max_page, total = _sales_store_list_buttons(analysis, page=page, per_page=per_page)
+    return "\n".join(lines), markup
 
 
 def _sales_monitor_buttons(chat_id):
@@ -5401,7 +5531,7 @@ def build_missing_data_report(analysis, max_points=8):
     return "\n".join(lines)
 
 def _find_store(analysis, query):
-    stores = analysis.get("stores") or []
+    stores = _sales_sorted_stores(analysis)
     if not stores:
         return None, []
     q = _normalize_name(query)
@@ -5414,7 +5544,10 @@ def _find_store(analysis, query):
     if len(exactish) > 1:
         return exactish[0], [s["name"] for s in exactish[:5]]
 
-    names = {_normalize_name(s["name"]): s for s in stores}
+    names = analysis.get("_store_name_index")
+    if not isinstance(names, dict):
+        names = {_normalize_name(s["name"]): s for s in stores}
+        analysis["_store_name_index"] = names
     close = difflib.get_close_matches(q, list(names.keys()), n=5, cutoff=0.40)
     if not close:
         return None, []
@@ -5577,11 +5710,458 @@ async def _get_sales_analysis_async(force=False):
     return await asyncio.to_thread(get_sales_analysis, None, force)
 
 
+def _sales_ui_snapshot_is_valid(context):
+    try:
+        snap = context.chat_data.get("_sales_ui_snapshot") or {}
+        analysis = snap.get("analysis")
+        if not analysis:
+            return False
+        if time.time() - float(snap.get("saved_at") or 0) > SALES_UI_SNAPSHOT_SECONDS:
+            return False
+        now = _sales_now()
+        if int(analysis.get("year") or 0) != now.year or int(analysis.get("month") or 0) != now.month:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+async def _get_sales_ui_analysis(context, force=False):
+    """Snapshot cho UI Telegram: bấm qua lại không load/parsing lại Sheet."""
+    if not force and _sales_ui_snapshot_is_valid(context):
+        return context.chat_data["_sales_ui_snapshot"]["analysis"]
+    analysis = await _get_sales_analysis_async(force=force)
+    context.chat_data["_sales_ui_snapshot"] = {
+        "saved_at": time.time(),
+        "analysis": analysis,
+    }
+    return analysis
+
+
+
+# =====================================================================
+# ---> DAILY ODOO CONFIRMED-SALES REPORT (READ ONLY) <---
+# =====================================================================
+# Định nghĩa trong module này:
+# - "Đơn thật trên Odoo" = sale.order có state sale/done.
+# - draft/sent/cancel KHÔNG cộng vào giá trị bán.
+# - Mặc định lọc warehouse_id=201 (có thể đổi bằng ODOO_DAILY_WAREHOUSE_ID).
+# - Không create/write/unlink bất kỳ dữ liệu nào.
+
+
+def _odoo_daily_state():
+    state = cloud_data.setdefault("odoo_daily_report", {})
+    state.setdefault("subscribers", [])
+    state.setdefault("last_sent_date", "")
+    return state
+
+
+def _odoo_daily_subscribers():
+    out = []
+    for cid in _odoo_daily_state().get("subscribers", []):
+        try:
+            out.append(int(cid))
+        except Exception:
+            out.append(cid)
+    return out
+
+
+def _odoo_value_name(value, fallback="Không xác định"):
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        return str(value[1] or fallback)
+    if isinstance(value, dict):
+        return str(value.get("display_name") or value.get("name") or fallback)
+    if value not in (None, False, ""):
+        return str(value)
+    return fallback
+
+
+def _fmt_odoo_money(value):
+    try:
+        amount = float(value or 0)
+    except Exception:
+        amount = 0.0
+    sign = "-" if amount < 0 else ""
+    amount = abs(amount)
+    if amount >= 1_000_000_000:
+        txt = f"{amount/1_000_000_000:.2f}".rstrip("0").rstrip(".") + " tỷ"
+    elif amount >= 1_000_000:
+        txt = f"{amount/1_000_000:.1f}".rstrip("0").rstrip(".") + "tr"
+    elif amount >= 1_000:
+        txt = f"{amount/1_000:.0f}k"
+    else:
+        txt = f"{amount:,.0f}đ"
+    return sign + txt
+
+
+def _odoo_local_day_utc_bounds(report_date):
+    local_start = SALES_TZ.localize(datetime(report_date.year, report_date.month, report_date.day, 0, 0, 0))
+    local_end = local_start + timedelta(days=1)
+    utc_start = local_start.astimezone(pytz.UTC).strftime("%Y-%m-%d %H:%M:%S")
+    utc_end = local_end.astimezone(pytz.UTC).strftime("%Y-%m-%d %H:%M:%S")
+    return utc_start, utc_end
+
+
+def _odoo_datetime_to_local_text(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        dt = datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S")
+        dt = pytz.UTC.localize(dt).astimezone(SALES_TZ)
+        return dt.strftime("%H:%M")
+    except Exception:
+        return raw
+
+
+def _read_odoo_daily_orders_sync(report_date, warehouse_id=None):
+    uid, models, err = connect_odoo()
+    if not uid:
+        raise RuntimeError(err or "Không kết nối được Odoo")
+
+    warehouse_id = ODOO_DAILY_WAREHOUSE_ID if warehouse_id is None else warehouse_id
+    start_utc, end_utc = _odoo_local_day_utc_bounds(report_date)
+
+    # Đọc schema trước để field custom thiếu/khác giữa các DB không làm hỏng báo cáo.
+    field_info = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        'sale.order', 'fields_get', [],
+        {'attributes': ['string', 'type']}
+    ) or {}
+
+    required = ['id', 'name', 'partner_id', 'state', 'date_order', 'amount_total']
+    optional = ['amount_untaxed', 'user_id', 'warehouse_id', 'currency_id',
+                'x_pos_branch', 'x_channel', 'client_order_ref', 'invoice_status']
+    fields = [f for f in required + optional if f in field_info or f == 'id']
+    for f in required:
+        if f != 'id' and f not in fields:
+            fields.append(f)
+
+    domain = [
+        ('date_order', '>=', start_utc),
+        ('date_order', '<', end_utc),
+    ]
+    if warehouse_id:
+        if 'warehouse_id' not in field_info:
+            raise RuntimeError("Model sale.order không có field warehouse_id; dừng để tránh báo cáo sai phạm vi.")
+        domain.append(('warehouse_id', '=', int(warehouse_id)))
+
+    orders = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        'sale.order', 'search_read',
+        [domain],
+        {'fields': fields, 'order': 'date_order asc', 'limit': 5000}
+    )
+    if orders is None:
+        raise RuntimeError("Odoo không trả dữ liệu sale.order. Kiểm tra quyền đọc của tài khoản bot.")
+
+    warehouse_name = f"Kho Odoo ID {warehouse_id}" if warehouse_id else "Tất cả kho"
+    if warehouse_id:
+        try:
+            wh = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD,
+                'stock.warehouse', 'search_read',
+                [[('id', '=', int(warehouse_id))]],
+                {'fields': ['id', 'name', 'code'], 'limit': 1}
+            ) or []
+            if not wh:
+                raise RuntimeError(f"Không tìm thấy stock.warehouse ID {warehouse_id}; dừng để tránh cộng nhầm kho.")
+            warehouse_name = wh[0].get('name') or warehouse_name
+            if wh[0].get('code'):
+                warehouse_name = f"{warehouse_name} ({wh[0]['code']})"
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Không xác minh được kho Odoo ID {warehouse_id}: {e}")
+
+    confirmed = [o for o in orders if str(o.get('state') or '').lower() in {'sale', 'done'}]
+    quotations = [o for o in orders if str(o.get('state') or '').lower() in {'draft', 'sent'}]
+    cancelled = [o for o in orders if str(o.get('state') or '').lower() == 'cancel']
+    other = [o for o in orders if str(o.get('state') or '').lower() not in {'sale','done','draft','sent','cancel'}]
+
+    total = sum(float(o.get('amount_total') or 0) for o in confirmed)
+    untaxed = sum(float(o.get('amount_untaxed') or 0) for o in confirmed if 'amount_untaxed' in o)
+    customers = { _odoo_value_name(o.get('partner_id')) for o in confirmed if o.get('partner_id') }
+
+    by_pos = {}
+    by_user = {}
+    by_channel = {}
+    for o in confirmed:
+        amount = float(o.get('amount_total') or 0)
+        if 'x_pos_branch' in o and o.get('x_pos_branch') not in (None, False, ''):
+            pos = _odoo_value_name(o.get('x_pos_branch'))
+            by_pos[pos] = by_pos.get(pos, 0.0) + amount
+        if o.get('user_id'):
+            user = _odoo_value_name(o.get('user_id'))
+            by_user[user] = by_user.get(user, 0.0) + amount
+        if 'x_channel' in o and o.get('x_channel') not in (None, False, ''):
+            channel = _odoo_value_name(o.get('x_channel'))
+            by_channel[channel] = by_channel.get(channel, 0.0) + amount
+
+    return {
+        'date': report_date,
+        'warehouse_id': warehouse_id,
+        'warehouse_name': warehouse_name,
+        'all_orders': orders,
+        'confirmed': confirmed,
+        'quotations': quotations,
+        'cancelled': cancelled,
+        'other': other,
+        'total': total,
+        'untaxed': untaxed,
+        'customer_count': len(customers),
+        'by_pos': by_pos,
+        'by_user': by_user,
+        'by_channel': by_channel,
+    }
+
+
+async def _get_odoo_daily_report_async(report_date=None, warehouse_id=None):
+    report_date = report_date or _sales_now().date()
+    return await asyncio.to_thread(_read_odoo_daily_orders_sync, report_date, warehouse_id)
+
+
+def build_odoo_daily_report(data):
+    d = data['date']
+    confirmed = data['confirmed']
+    quotations = data['quotations']
+    cancelled = data['cancelled']
+    total = float(data.get('total') or 0)
+    avg = total / len(confirmed) if confirmed else 0.0
+
+    lines = [
+        f"🧾 <b>ĐƠN BÁN ODOO — {d.strftime('%d/%m/%Y')}</b>",
+        f"<i>Nguồn trực tiếp Odoo · {_tg_html(data['warehouse_name'])}</i>",
+        "",
+        "✅ <b>ĐÃ XÁC NHẬN — TÍNH VÀO BÁO CÁO</b>",
+        f"• Số đơn: <b>{len(confirmed)}</b>",
+        f"• Tổng giá trị đơn: <b>{_tg_html(_fmt_odoo_money(total))}</b>",
+        f"• Khách hàng: <b>{data.get('customer_count', 0)}</b>",
+        f"• Trung bình/đơn: {_tg_html(_fmt_odoo_money(avg))}",
+        "",
+        "🚫 <b>KHÔNG CỘNG VÀO SỐ BÁN</b>",
+        f"• Nháp / Báo giá: <b>{len(quotations)}</b>",
+        f"• Đã hủy: <b>{len(cancelled)}</b>",
+    ]
+
+    if data.get('by_pos'):
+        lines += ["", "📍 <b>THEO ĐIỂM / POS ODOO</b>"]
+        for name, amount in sorted(data['by_pos'].items(), key=lambda x: x[1], reverse=True)[:6]:
+            lines.append(f"• {_tg_html(name)}: <b>{_tg_html(_fmt_odoo_money(amount))}</b>")
+
+    if data.get('by_channel'):
+        lines += ["", "🏷 <b>THEO KÊNH</b>"]
+        for name, amount in sorted(data['by_channel'].items(), key=lambda x: x[1], reverse=True)[:5]:
+            lines.append(f"• {_tg_html(name)}: <b>{_tg_html(_fmt_odoo_money(amount))}</b>")
+
+    if data.get('by_user'):
+        lines += ["", "👤 <b>THEO NHÂN VIÊN ODOO</b>"]
+        for name, amount in sorted(data['by_user'].items(), key=lambda x: x[1], reverse=True)[:6]:
+            lines.append(f"• {_tg_html(name)}: <b>{_tg_html(_fmt_odoo_money(amount))}</b>")
+
+    if confirmed:
+        lines += ["", "🧾 <b>ĐƠN GIÁ TRỊ LỚN NHẤT</b>"]
+        top_orders = sorted(confirmed, key=lambda o: float(o.get('amount_total') or 0), reverse=True)[:6]
+        for idx, o in enumerate(top_orders, 1):
+            partner = _odoo_value_name(o.get('partner_id'))
+            order_name = o.get('name') or f"#{o.get('id','')}"
+            t = _odoo_datetime_to_local_text(o.get('date_order'))
+            suffix = f" · {t}" if t else ""
+            lines.append(
+                f"{idx}. <b>{_tg_html(order_name)}</b> · {_tg_html(partner)}\n"
+                f"   {_tg_html(_fmt_odoo_money(o.get('amount_total')))}{_tg_html(suffix)}"
+            )
+    else:
+        lines += ["", "ℹ️ <i>Không có đơn sale/done trong ngày này theo phạm vi kho đang theo dõi.</i>"]
+
+    lines += [
+        "",
+        "ℹ️ <i>“Số bán Odoo” ở đây là tổng amount_total của sale.order đã xác nhận (sale/done). "
+        "Nó không đại diện sell-out ký gửi tại HC/Aeon/... nếu giao dịch đó chưa được ghi thành đơn bán trên Odoo.</i>",
+    ]
+    return "\n".join(lines)
+
+
+def _odoo_daily_buttons(chat_id):
+    enabled = str(chat_id) in {str(x) for x in _odoo_daily_state().get('subscribers', [])}
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🧾 Hôm nay", callback_data="odoo:today"),
+            InlineKeyboardButton("↩️ Hôm qua", callback_data="odoo:yesterday"),
+        ],
+        [InlineKeyboardButton(
+            "🔕 Tắt báo cáo hằng ngày" if enabled else "🔔 Bật báo cáo hằng ngày",
+            callback_data="odoo:monitor:off" if enabled else "odoo:monitor:on"
+        )],
+        [InlineKeyboardButton("📊 Về doanh số Sheet", callback_data="sales:summary")],
+    ])
+
+
+async def _send_odoo_daily_message(bot, chat_id, text, reply_markup=None):
+    # Report được thiết kế ngắn; fallback text thường nếu Telegram HTML gặp dữ liệu lạ.
+    try:
+        await bot.send_message(chat_id=chat_id, text=text[:4000], parse_mode="HTML", reply_markup=reply_markup)
+    except Exception as e:
+        logger.warning(f"Gửi Odoo report HTML lỗi, fallback text thường: {e}")
+        plain = re.sub(r"<[^>]+>", "", text)
+        await bot.send_message(chat_id=chat_id, text=plain[:4000], reply_markup=reply_markup)
+
+
+async def baocaoodoo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_chat_id(update.effective_chat.id)
+    report_date = _sales_now().date()
+    args = [str(x).strip().lower() for x in (context.args or [])]
+    if args:
+        raw = " ".join(args)
+        if raw in {"homqua", "hôm qua", "yesterday"}:
+            report_date = report_date - timedelta(days=1)
+        else:
+            for fmt in ("%d/%m/%Y", "%d-%m-%Y"):
+                try:
+                    report_date = datetime.strptime(raw, fmt).date()
+                    break
+                except Exception:
+                    pass
+    msg = await update.message.reply_text("🧾 Đang đọc các đơn bán đã xác nhận trực tiếp từ Odoo...")
+    try:
+        data = await _get_odoo_daily_report_async(report_date)
+        await msg.edit_text(
+            build_odoo_daily_report(data),
+            parse_mode="HTML",
+            reply_markup=_odoo_daily_buttons(update.effective_chat.id),
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.error(f"Lỗi /baocaoodoo: {e}")
+        await msg.edit_text(f"❌ Không đọc được báo cáo đơn Odoo: {e}")
+
+
+async def theodoiodoo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    args = [str(x).strip().lower() for x in (context.args or [])]
+    state = _odoo_daily_state()
+    subscribers = [str(x) for x in state.get('subscribers', [])]
+    if not args:
+        enabled = chat_id in subscribers
+        await update.message.reply_text(
+            f"🔔 <b>BÁO CÁO ODOO HẰNG NGÀY</b>\n\n"
+            f"Trạng thái: <b>{'ĐANG BẬT' if enabled else 'ĐANG TẮT'}</b>\n"
+            f"Giờ gửi mặc định: <b>{ODOO_DAILY_REPORT_HOUR:02d}:{ODOO_DAILY_REPORT_MINUTE:02d}</b> (Việt Nam)",
+            parse_mode="HTML",
+            reply_markup=_odoo_daily_buttons(update.effective_chat.id),
+        )
+        return
+    action = args[0]
+    if action in {"on", "bat", "bật", "1"}:
+        if chat_id not in subscribers:
+            subscribers.append(chat_id)
+        state['subscribers'] = subscribers
+        await save_cloud_db(context, update.effective_chat.id)
+        await update.message.reply_text("✅ Đã bật báo cáo đơn Odoo hằng ngày cho chat này.")
+    elif action in {"off", "tat", "tắt", "0"}:
+        state['subscribers'] = [x for x in subscribers if x != chat_id]
+        await save_cloud_db(context, update.effective_chat.id)
+        await update.message.reply_text("✅ Đã tắt báo cáo đơn Odoo hằng ngày cho chat này.")
+    else:
+        await update.message.reply_text("Dùng: /theodoiodoo on hoặc /theodoiodoo off")
+
+
+async def _menu_odoo_daily_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    enabled = str(chat_id) in {str(x) for x in _odoo_daily_state().get('subscribers', [])}
+    await update.message.reply_text(
+        "🔔 <b>BÁO CÁO ODOO HẰNG NGÀY</b>\n\n"
+        f"Trạng thái chat này: <b>{'ĐANG BẬT' if enabled else 'ĐANG TẮT'}</b>\n"
+        f"Bot đọc Odoo lúc <b>{ODOO_DAILY_REPORT_HOUR:02d}:{ODOO_DAILY_REPORT_MINUTE:02d}</b> mỗi ngày và chỉ tính đơn <code>sale/done</code>.",
+        parse_mode="HTML",
+        reply_markup=_odoo_daily_buttons(chat_id),
+    )
+
+
+async def odoo_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    chat_id = query.message.chat_id
+    try:
+        if data.startswith("odoo:monitor:"):
+            action = data.rsplit(":", 1)[-1]
+            state = _odoo_daily_state()
+            subscribers = [str(x) for x in state.get('subscribers', [])]
+            cid = str(chat_id)
+            if action == "on":
+                if cid not in subscribers:
+                    subscribers.append(cid)
+                state['subscribers'] = subscribers
+                text = (
+                    "🔔 <b>BÁO CÁO ODOO HẰNG NGÀY: ĐANG BẬT</b>\n\n"
+                    f"Bot sẽ gửi báo cáo lúc <b>{ODOO_DAILY_REPORT_HOUR:02d}:{ODOO_DAILY_REPORT_MINUTE:02d}</b> mỗi ngày."
+                )
+            else:
+                state['subscribers'] = [x for x in subscribers if x != cid]
+                text = "🔕 <b>BÁO CÁO ODOO HẰNG NGÀY: ĐANG TẮT</b>"
+            await save_cloud_db(context, chat_id)
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=_odoo_daily_buttons(chat_id))
+            return
+
+        if data == "odoo:monitor":
+            enabled = str(chat_id) in {str(x) for x in _odoo_daily_state().get('subscribers', [])}
+            text = (
+                "🔔 <b>BÁO CÁO ODOO HẰNG NGÀY</b>\n\n"
+                f"Trạng thái: <b>{'ĐANG BẬT' if enabled else 'ĐANG TẮT'}</b>\n"
+                f"Giờ gửi: <b>{ODOO_DAILY_REPORT_HOUR:02d}:{ODOO_DAILY_REPORT_MINUTE:02d}</b>"
+            )
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=_odoo_daily_buttons(chat_id))
+            return
+
+        report_date = _sales_now().date()
+        if data == "odoo:yesterday":
+            report_date -= timedelta(days=1)
+        elif data != "odoo:today":
+            return
+        await query.edit_message_text("🧾 Đang đọc đơn đã xác nhận từ Odoo...")
+        report = await _get_odoo_daily_report_async(report_date)
+        await query.edit_message_text(
+            build_odoo_daily_report(report),
+            parse_mode="HTML",
+            reply_markup=_odoo_daily_buttons(chat_id),
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.error(f"Lỗi Odoo daily callback: {e}")
+        try:
+            await query.edit_message_text(f"❌ Không đọc được báo cáo Odoo: {e}")
+        except Exception:
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ Không đọc được báo cáo Odoo: {e}")
+
+
+async def odoo_daily_report_job(context: ContextTypes.DEFAULT_TYPE):
+    subscribers = _odoo_daily_subscribers()
+    if not subscribers:
+        return
+    now = _sales_now()
+    today_key = now.strftime("%Y-%m-%d")
+    state = _odoo_daily_state()
+    if state.get('last_sent_date') == today_key:
+        return
+    try:
+        data = await _get_odoo_daily_report_async(now.date())
+        text = build_odoo_daily_report(data)
+        for cid in subscribers:
+            try:
+                await _send_odoo_daily_message(context.bot, cid, text, _odoo_daily_buttons(cid))
+            except Exception as e:
+                logger.error(f"Lỗi gửi Odoo daily report cho {cid}: {e}")
+        state['last_sent_date'] = today_key
+        await save_cloud_db()
+    except Exception as e:
+        logger.error(f"Lỗi job báo cáo Odoo hằng ngày: {e}")
+
 async def doanhso_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_chat_id(update.effective_chat.id)
     msg = await update.message.reply_text("📊 Đang đọc Google Sheet và tính tiến độ...")
     try:
-        analysis = await _get_sales_analysis_async(force=True)
+        analysis = await _get_sales_ui_analysis(context, force=False)
         await msg.edit_text(build_sales_summary(analysis), reply_markup=_sales_buttons(), parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Lỗi /doanhso: {e}")
@@ -5592,7 +6172,7 @@ async def canhbao_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_chat_id(update.effective_chat.id)
     msg = await update.message.reply_text("🚨 Đang tính các điểm cần cảnh báo...")
     try:
-        analysis = await _get_sales_analysis_async(force=True)
+        analysis = await _get_sales_ui_analysis(context, force=False)
         await msg.edit_text(build_weak_sales_report(analysis), reply_markup=_sales_buttons(), parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Lỗi /canhbao: {e}")
@@ -5603,7 +6183,7 @@ async def thieudulieu_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     register_chat_id(update.effective_chat.id)
     msg = await update.message.reply_text("⚠️ Đang rà soát ô trống doanh số và lịch ca...")
     try:
-        analysis = await _get_sales_analysis_async(force=True)
+        analysis = await _get_sales_ui_analysis(context, force=False)
         await msg.edit_text(build_missing_data_report(analysis), reply_markup=_sales_buttons(), parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Lỗi /thieudulieu: {e}")
@@ -5618,7 +6198,7 @@ async def diemban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg = await update.message.reply_text(f"📍 Đang phân tích điểm '{query}'...")
     try:
-        analysis = await _get_sales_analysis_async(force=True)
+        analysis = await _get_sales_ui_analysis(context, force=False)
         store, suggestions = _find_store(analysis, query)
         if not store:
             await msg.edit_text("❌ Không tìm thấy điểm bán phù hợp trong sheet tháng hiện tại.")
@@ -5637,7 +6217,7 @@ async def xuhuong_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = " ".join(context.args).strip()
     msg = await update.message.reply_text("📈 Đang tính xu hướng 7 ngày...")
     try:
-        analysis = await _get_sales_analysis_async(force=True)
+        analysis = await _get_sales_ui_analysis(context, force=False)
         await msg.edit_text(build_sales_trend_report(analysis, query or None), reply_markup=_sales_buttons(), parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Lỗi /xuhuong: {e}")
@@ -5731,7 +6311,7 @@ async def sales_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             return
 
         force = data == "sales:refresh"
-        analysis = await _get_sales_analysis_async(force=force)
+        analysis = await _get_sales_ui_analysis(context, force=force)
 
         if data in {"sales:summary", "sales:refresh"}:
             text = build_sales_summary(analysis)
@@ -5750,12 +6330,7 @@ async def sales_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
                 page = int(data.rsplit(":", 1)[-1])
             except Exception:
                 page = 0
-            markup, page, max_page, total = _sales_store_list_buttons(analysis, page=page)
-            text = (
-                f"📍 <b>CHỌN ĐIỂM BÁN — {_tg_html(analysis['sheet_name'])}</b>\n"
-                f"Có <b>{total}</b> điểm · Trang {page+1}/{max_page+1}\n\n"
-                "Bấm vào điểm muốn xem để bot phân tích chi tiết."
-            )
+            text, markup = build_sales_store_page(analysis, page=page)
         elif data.startswith("sales:storetrend:"):
             try:
                 idx = int(data.rsplit(":", 1)[-1])
@@ -6006,6 +6581,10 @@ def main():
     application.add_handler(CommandHandler("xuhuong", xuhuong_command))
     application.add_handler(CommandHandler("thieudulieu", thieudulieu_command))
     application.add_handler(CommandHandler("theodoidoanhso", theodoidoanhso_command))
+    application.add_handler(CommandHandler("baocaoodoo", baocaoodoo_command))
+    application.add_handler(CommandHandler("odoo", baocaoodoo_command))
+    application.add_handler(CommandHandler("theodoiodoo", theodoiodoo_command))
+    application.add_handler(CallbackQueryHandler(odoo_callback_handler, pattern=r"^odoo:"))
     application.add_handler(CallbackQueryHandler(sales_callback_handler, pattern=r"^sales:"))
     
     application.add_handler(MessageHandler(filters.Document.ALL, handle_po_file))
@@ -6042,10 +6621,19 @@ def main():
         application.job_queue.run_daily(sales_auto_monitor_job, time=dt_time(hour=20, minute=30, tzinfo=SALES_TZ))
         # Thứ Hai 09:00 quét lại dữ liệu tuần trước (python-telegram-bot v20+: 1 = Monday).
         application.job_queue.run_daily(sales_weekly_missing_job, time=dt_time(hour=9, minute=0, tzinfo=SALES_TZ), days=(1,))
+        # Báo cáo đơn bán Odoo đã xác nhận (sale/done) - độc lập với Google Sheet.
+        application.job_queue.run_daily(
+            odoo_daily_report_job,
+            time=dt_time(hour=ODOO_DAILY_REPORT_HOUR, minute=ODOO_DAILY_REPORT_MINUTE, tzinfo=SALES_TZ),
+        )
 
         logger.info("Đã kích hoạt chế độ Auto Troll mỗi 2 tiếng (Tỷ lệ 30%).")
         logger.info("Đã kích hoạt đồng bộ AI memory lên JSONBin mỗi 10 phút.")
         logger.info("Đã kích hoạt Sales Monitor READ-ONLY lúc 11:00, 16:00, 20:30 và kiểm tra tuần vào Thứ Hai 09:00.")
+        logger.info(
+            "Đã kích hoạt Odoo Daily Report READ-ONLY lúc %02d:%02d (warehouse_id=%s).",
+            ODOO_DAILY_REPORT_HOUR, ODOO_DAILY_REPORT_MINUTE, ODOO_DAILY_WAREHOUSE_ID
+        )
     else:
         logger.warning("JobQueue chưa khả dụng. Cần cài đặt python-telegram-bot[job-queue]")
 
